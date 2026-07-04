@@ -344,8 +344,8 @@ fn main() {
 
     // Deps mode
     if cli.deps {
-        let path = resolve_query_path(&query, &scopes);
         let result = run_query_for_scopes(&scopes, &query, |scope| {
+            let path = resolve_query_path(&query, scope);
             tilth::run_deps(&path, scope, cli.budget)
         });
         emit_result(result, &query, cli.json, is_tty);
@@ -406,16 +406,14 @@ fn resolve_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn resolve_query_path(query: &str, scopes: &[PathBuf]) -> PathBuf {
+fn resolve_query_path(query: &str, scope: &Path) -> PathBuf {
     if Path::new(query).is_absolute() {
         return PathBuf::from(query);
     }
 
-    for scope in scopes {
-        let scoped = scope.join(query);
-        if scoped.exists() {
-            return scoped;
-        }
+    let scoped = scope.join(query);
+    if scoped.exists() {
+        return scoped;
     }
 
     let cwd_path = std::env::current_dir().unwrap_or_default().join(query);
@@ -423,9 +421,7 @@ fn resolve_query_path(query: &str, scopes: &[PathBuf]) -> PathBuf {
         return cwd_path;
     }
 
-    scopes
-        .first()
-        .map_or_else(|| PathBuf::from(query), |scope| scope.join(query))
+    scoped
 }
 
 fn run_for_scopes<F>(scopes: &[PathBuf], mut run: F) -> String
@@ -656,5 +652,19 @@ mod tests {
             cli.scope,
             vec![PathBuf::from("src"), PathBuf::from("tests")]
         );
+    }
+
+    #[test]
+    fn relative_query_path_resolves_per_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("foo.rs"), "fn first() {}\n").unwrap();
+        std::fs::write(second.join("foo.rs"), "fn second() {}\n").unwrap();
+
+        assert_eq!(resolve_query_path("foo.rs", &first), first.join("foo.rs"));
+        assert_eq!(resolve_query_path("foo.rs", &second), second.join("foo.rs"));
     }
 }

@@ -108,7 +108,7 @@ fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> Wa
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
         .ignore(respect_gitignore)
-        .parents(respect_gitignore)
+        .parents(true)
         .add_custom_ignore_filename(".tilthignore")
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -1657,6 +1657,33 @@ mod tests {
         assert!(
             !rels.contains("ignored/hidden.rs"),
             ".tilthignore file should not be walked: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn walker_respects_parent_tilthignore_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let ignored = src.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(tmp.path().join(".tilthignore"), "src/ignored/\n").unwrap();
+        std::fs::write(src.join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(ignored.join("hidden.rs"), "fn hidden() {}\n").unwrap();
+
+        let paths = walk_paths_with_gitignore(&src, false);
+        let rels: HashSet<String> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(&src).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            rels.contains("visible.rs"),
+            "non-ignored file should be walked: {rels:?}"
+        );
+        assert!(
+            !rels.contains("ignored/hidden.rs"),
+            "parent .tilthignore file should not be walked: {rels:?}"
         );
     }
 
