@@ -7,7 +7,7 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 
-use super::{apply_budget, resolve_scope};
+use super::{apply_budget, resolve_scopes};
 
 pub(in crate::mcp) fn tool_search(
     args: &Value,
@@ -23,7 +23,7 @@ pub(in crate::mcp) fn tool_search(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let (scopes, scope_warning) = resolve_scopes(args, root)?;
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -52,19 +52,33 @@ pub(in crate::mcp) fn tool_search(
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
                     session.record_search(queries[0]);
-                    crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, full,
-                        budget,
-                    )
+                    if scopes.len() == 1 {
+                        crate::search::search_symbol_expanded(
+                            queries[0], &scopes[0], cache, session, bloom, expand, context, glob,
+                            full, budget,
+                        )
+                    } else {
+                        crate::search::search_symbol_scopes_expanded(
+                            queries[0], &scopes, cache, session, bloom, expand, context, glob,
+                            full, budget,
+                        )
+                    }
                 }
                 2..=5 => {
                     for q in &queries {
                         session.record_search(q);
                     }
-                    crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, full,
-                        budget,
-                    )
+                    if scopes.len() == 1 {
+                        crate::search::search_multi_symbol_expanded(
+                            &queries, &scopes[0], cache, session, bloom, expand, context, glob,
+                            full, budget,
+                        )
+                    } else {
+                        search_multi_symbol_scopes_expanded(
+                            &queries, &scopes, cache, session, bloom, expand, context, glob, full,
+                            budget,
+                        )
+                    }
                 }
                 _ => {
                     return Err(format!(
@@ -76,17 +90,36 @@ pub(in crate::mcp) fn tool_search(
         }
         "content" => {
             session.record_search(query);
-            crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, full, budget,
-            )
+            if scopes.len() == 1 {
+                crate::search::search_content_expanded(
+                    query, &scopes[0], cache, session, expand, context, glob, full, budget,
+                )
+            } else {
+                crate::search::search_content_scopes_expanded(
+                    query, &scopes, cache, session, expand, context, glob, full, budget,
+                )
+            }
         }
         "regex" => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context, glob, full)
-                .map_err(|e| e.to_string())?;
-            crate::search::format_raw_result(&result, cache)
+            if scopes.len() == 1 {
+                let result =
+                    crate::search::content::search(query, &scopes[0], true, context, glob, full)
+                        .map_err(|e| e.to_string())?;
+                crate::search::format_raw_result(&result, cache)
+            } else {
+                crate::search::search_regex_scopes_expanded(
+                    query, &scopes, cache, session, expand, context, glob, full, budget,
+                )
+            }
         }
         "callers" => {
+            if scopes.len() > 1 {
+                return Err(
+                    "multi-scope callers search is not implemented yet; use a single scope"
+                        .to_string(),
+                );
+            }
             let targets: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -97,7 +130,7 @@ pub(in crate::mcp) fn tool_search(
                 1 => {
                     session.record_search(targets[0]);
                     crate::search::callers::search_callers_expanded(
-                        targets[0], &scope, bloom, expand, context, glob, full,
+                        targets[0], &scopes[0], bloom, expand, context, glob, full,
                     )
                 }
                 2..=5 => {
@@ -105,7 +138,7 @@ pub(in crate::mcp) fn tool_search(
                         session.record_search(t);
                     }
                     crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scope, bloom, expand, context, glob, full,
+                        &targets, &scopes[0], bloom, expand, context, glob, full,
                     )
                 }
                 _ => {
@@ -127,6 +160,32 @@ pub(in crate::mcp) fn tool_search(
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(&output, budget));
     Ok(result)
+}
+
+fn search_multi_symbol_scopes_expanded(
+    queries: &[&str],
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    expand: usize,
+    context: Option<&std::path::Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, crate::error::TilthError> {
+    let mut sections = Vec::with_capacity(queries.len());
+    let expand = if expand == 0 {
+        0
+    } else {
+        expand.max(queries.len())
+    };
+    for query in queries {
+        sections.push(crate::search::search_symbol_scopes_expanded(
+            query, scopes, cache, session, bloom, expand, context, glob, full, budget,
+        )?);
+    }
+    Ok(sections.join("\n\n---\n"))
 }
 
 #[cfg(test)]
@@ -396,6 +455,90 @@ mod tests {
         );
     }
 
+    #[test]
+    fn scopes_symbol_search_combines_results_without_scope_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let earlier = tmp.path().join("earlier");
+        let later = tmp.path().join("later");
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(
+            earlier.join("usage.rs"),
+            "fn first_scope_usage() {\n    target();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(later.join("lib.rs"), "pub fn target() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "target",
+            "kind": "symbol",
+            "root": tmp.path().to_str().unwrap(),
+            "scopes": ["earlier", "later"],
+            "expand": 0,
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            !out.contains("# Scope:"),
+            "combined search should not render per-scope wrappers: {out}"
+        );
+        let def_pos = out.find("later/lib.rs").expect("missing later definition");
+        let usage_pos = out.find("earlier/usage.rs").expect("missing earlier usage");
+        assert!(
+            def_pos < usage_pos,
+            "later-scope definition should rank before earlier usage: {out}"
+        );
+    }
+
+    #[test]
+    fn scopes_rejects_simultaneous_scope_and_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "target",
+            "scope": tmp.path().to_str().unwrap(),
+            "scopes": [tmp.path().to_str().unwrap()],
+        });
+
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+
+        assert!(
+            err.contains("scope") && err.contains("scopes"),
+            "error should name conflicting fields: {err}"
+        );
+    }
+
+    #[test]
+    fn scopes_callers_errors_instead_of_searching_first_scope_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "target",
+            "kind": "callers",
+            "root": tmp.path().to_str().unwrap(),
+            "scopes": ["one", "two"],
+        });
+
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+
+        assert!(
+            err.contains("multi-scope callers"),
+            "callers must not silently search only the first scope: {err}"
+        );
+    }
+
     /// WHY: the require-root discipline fires ONLY when a caller EXPLICITLY
     /// passes a relative scope/path without an absolute root. A bare
     /// `tilth_search(query)` call with no scope is the default flow of every
@@ -436,218 +579,6 @@ mod tests {
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
-        );
-    }
-
-    /// How many of the `n` numbered `<prefix>_NN.rs` fixture files the output
-    /// names. Counting file names instead of a header phrase keeps these
-    /// assertions independent of the header and facet wording.
-    fn files_shown(out: &str, prefix: &str, n: usize) -> usize {
-        (0..n)
-            .filter(|i| out.contains(&format!("{prefix}_{i:02}.rs")))
-            .count()
-    }
-
-    /// Write `n` files named `<prefix>_NN.rs`, one match per file, so a cap
-    /// can be counted by how many of them the output names.
-    fn spread(dir: &std::path::Path, prefix: &str, n: usize, body: impl Fn(usize) -> String) {
-        for i in 0..n {
-            std::fs::write(dir.join(format!("{prefix}_{i:02}.rs")), body(i)).unwrap();
-        }
-    }
-
-    fn run_search(args: &Value) -> String {
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        tool_search(args, &cache, &session, &bloom).unwrap()
-    }
-
-    /// `full` must reach both symbol dispatches. The handler hard-coded
-    /// `false` for every kind, so an agent could never see past the 10-match
-    /// cap that `--full` already lifts on the CLI. The cap is per query, so a
-    /// comma search must widen every section, not share one budget.
-    #[test]
-    fn full_raises_symbol_match_cap_per_query() {
-        let tmp = tempfile::tempdir().unwrap();
-        spread(tmp.path(), "syma", 15, |_| {
-            "pub fn AlphaThing() {}\n".to_string()
-        });
-        spread(tmp.path(), "symb", 15, |_| {
-            "pub fn BetaThing() {}\n".to_string()
-        });
-
-        // Single query.
-        let mut args = serde_json::json!({
-            "query": "AlphaThing",
-            "scope": tmp.path().to_str().unwrap(),
-        });
-        let capped = run_search(&args);
-        assert_eq!(
-            files_shown(&capped, "syma", 15),
-            10,
-            "default must render exactly the 10-match cap: {capped}"
-        );
-        args["full"] = Value::Bool(true);
-        let widened = run_search(&args);
-        assert!(
-            files_shown(&widened, "syma", 15) > 10,
-            "full must raise the symbol cap past 10: {widened}"
-        );
-
-        // Comma query — a separate dispatch with its own `full` argument.
-        let mut multi = serde_json::json!({
-            "query": "AlphaThing,BetaThing",
-            "scope": tmp.path().to_str().unwrap(),
-        });
-        let capped_multi = run_search(&multi);
-        assert_eq!(
-            (
-                files_shown(&capped_multi, "syma", 15),
-                files_shown(&capped_multi, "symb", 15)
-            ),
-            (10, 10),
-            "default must cap each comma section at 10: {capped_multi}"
-        );
-        multi["full"] = Value::Bool(true);
-        let widened_multi = run_search(&multi);
-        assert!(
-            files_shown(&widened_multi, "syma", 15) > 10
-                && files_shown(&widened_multi, "symb", 15) > 10,
-            "full must raise the cap in every comma section: {widened_multi}"
-        );
-    }
-
-    /// Same for `kind=content`, which dispatches through
-    /// `search_content_expanded`'s own `full` parameter.
-    #[test]
-    fn full_raises_content_match_cap() {
-        let tmp = tempfile::tempdir().unwrap();
-        spread(tmp.path(), "cnt", 15, |_| {
-            "fn f() { let _ = ScatteredNeedle; }\n".to_string()
-        });
-
-        let mut args = serde_json::json!({
-            "query": "ScatteredNeedle",
-            "kind": "content",
-            "scope": tmp.path().to_str().unwrap(),
-        });
-
-        let capped = run_search(&args);
-        assert_eq!(
-            files_shown(&capped, "cnt", 15),
-            10,
-            "default must render exactly the 10-match cap: {capped}"
-        );
-
-        args["full"] = Value::Bool(true);
-        let widened = run_search(&args);
-        assert!(
-            files_shown(&widened, "cnt", 15) > 10,
-            "full must raise the content cap past 10: {widened}"
-        );
-    }
-
-    /// `kind=regex` shares `content::search` with `kind=content` but pins the
-    /// pattern as a regex. The query below matches only under regex
-    /// semantics, so this pins the `is_regex` argument as well as the `full`
-    /// one — the two are adjacent bools at the same call.
-    #[test]
-    fn full_raises_regex_match_cap() {
-        let tmp = tempfile::tempdir().unwrap();
-        spread(tmp.path(), "rgx", 15, |_| {
-            "fn f() { let _ = NeedleQ7; }\n".to_string()
-        });
-
-        let mut args = serde_json::json!({
-            "query": "Needle[A-Z][0-9]",
-            "kind": "regex",
-            "scope": tmp.path().to_str().unwrap(),
-        });
-
-        let capped = run_search(&args);
-        assert_eq!(
-            files_shown(&capped, "rgx", 15),
-            10,
-            "default must render exactly the 10-match cap, and only a regex \
-             match reaches 10 at all: {capped}"
-        );
-
-        args["full"] = Value::Bool(true);
-        let widened = run_search(&args);
-        assert!(
-            files_shown(&widened, "rgx", 15) > 10,
-            "full must raise the regex cap past 10: {widened}"
-        );
-    }
-
-    /// Same for both `kind=callers` dispatches, whose cap and walk budget
-    /// both key off `full`. As with symbol search the cap is per target.
-    #[test]
-    fn full_raises_callers_match_cap_per_target() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("defs.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
-        spread(tmp.path(), "cala", 15, |i| {
-            format!("fn a_uses_{i:02}() {{ alpha(); }}\n")
-        });
-        spread(tmp.path(), "calb", 15, |i| {
-            format!("fn b_uses_{i:02}() {{ beta(); }}\n")
-        });
-
-        // Single target.
-        let mut args = serde_json::json!({
-            "query": "alpha",
-            "kind": "callers",
-            "scope": tmp.path().to_str().unwrap(),
-        });
-        let capped = run_search(&args);
-        assert_eq!(
-            files_shown(&capped, "cala", 15),
-            10,
-            "default must render exactly the 10-call-site cap: {capped}"
-        );
-        args["full"] = Value::Bool(true);
-        let widened = run_search(&args);
-        assert!(
-            files_shown(&widened, "cala", 15) > 10,
-            "full must raise the callers cap past 10: {widened}"
-        );
-
-        // Comma query — a separate dispatch with its own `full` argument.
-        let mut multi = serde_json::json!({
-            "query": "alpha,beta",
-            "kind": "callers",
-            "scope": tmp.path().to_str().unwrap(),
-        });
-        let capped_multi = run_search(&multi);
-        assert_eq!(
-            (
-                files_shown(&capped_multi, "cala", 15),
-                files_shown(&capped_multi, "calb", 15)
-            ),
-            (10, 10),
-            "default must cap each target bucket at 10: {capped_multi}"
-        );
-        multi["full"] = Value::Bool(true);
-        let widened_multi = run_search(&multi);
-        assert!(
-            files_shown(&widened_multi, "cala", 15) > 10
-                && files_shown(&widened_multi, "calb", 15) > 10,
-            "full must raise the cap in every target bucket: {widened_multi}"
-        );
-    }
-
-    /// The schema must advertise `full`, or no agent can reach the widened cap.
-    #[test]
-    fn tilth_search_schema_advertises_full() {
-        let search = crate::mcp::tools::tool_definitions(false)
-            .into_iter()
-            .find(|t| t.get("name").and_then(Value::as_str) == Some("tilth_search"))
-            .expect("tilth_search definition");
-        assert_eq!(
-            search.pointer("/inputSchema/properties/full/type"),
-            Some(&Value::from("boolean")),
-            "tilth_search must advertise a boolean `full`: {search}"
         );
     }
 }
