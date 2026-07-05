@@ -7,7 +7,7 @@ use crate::cache::OutlineCache;
 use crate::index::bloom::BloomFilterCache;
 use crate::session::Session;
 
-use super::{apply_budget, resolve_scope};
+use super::{apply_budget, resolve_scopes};
 
 pub(in crate::mcp) fn tool_search(
     args: &Value,
@@ -23,7 +23,7 @@ pub(in crate::mcp) fn tool_search(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let (scopes, scope_warning) = resolve_scopes(args, root)?;
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -51,19 +51,32 @@ pub(in crate::mcp) fn tool_search(
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
                     session.record_search(queries[0]);
-                    crate::search::search_symbol_expanded(
-                        queries[0], &scope, cache, session, bloom, expand, context, glob, false,
-                        budget,
-                    )
+                    if scopes.len() == 1 {
+                        crate::search::search_symbol_expanded(
+                            queries[0], &scopes[0], cache, session, bloom, expand, context, glob,
+                            false, budget,
+                        )
+                    } else {
+                        crate::search::search_symbol_scopes_expanded(
+                            queries[0], &scopes, cache, session, bloom, expand, context, glob,
+                            false, budget,
+                        )
+                    }
                 }
                 2..=5 => {
                     for q in &queries {
                         session.record_search(q);
                     }
-                    crate::search::search_multi_symbol_expanded(
-                        &queries, &scope, cache, session, bloom, expand, context, glob, false,
-                        budget,
-                    )
+                    if scopes.len() == 1 {
+                        crate::search::search_multi_symbol_expanded(
+                            &queries, &scopes[0], cache, session, bloom, expand, context, glob,
+                            false, budget,
+                        )
+                    } else {
+                        search_multi_symbol_scopes_expanded(
+                            &queries, &scopes, cache, session, bloom, expand, context, glob, budget,
+                        )
+                    }
                 }
                 _ => {
                     return Err(format!(
@@ -75,17 +88,36 @@ pub(in crate::mcp) fn tool_search(
         }
         "content" => {
             session.record_search(query);
-            crate::search::search_content_expanded(
-                query, &scope, cache, session, expand, context, glob, false, budget,
-            )
+            if scopes.len() == 1 {
+                crate::search::search_content_expanded(
+                    query, &scopes[0], cache, session, expand, context, glob, false, budget,
+                )
+            } else {
+                crate::search::search_content_scopes_expanded(
+                    query, &scopes, cache, session, expand, context, glob, false, budget,
+                )
+            }
         }
         "regex" => {
             session.record_search(query);
-            let result = crate::search::content::search(query, &scope, true, context, glob, false)
-                .map_err(|e| e.to_string())?;
-            crate::search::format_raw_result(&result, cache)
+            if scopes.len() == 1 {
+                let result =
+                    crate::search::content::search(query, &scopes[0], true, context, glob, false)
+                        .map_err(|e| e.to_string())?;
+                crate::search::format_raw_result(&result, cache)
+            } else {
+                crate::search::search_regex_scopes_expanded(
+                    query, &scopes, cache, session, expand, context, glob, false, budget,
+                )
+            }
         }
         "callers" => {
+            if scopes.len() > 1 {
+                return Err(
+                    "multi-scope callers search is not implemented yet; use a single scope"
+                        .to_string(),
+                );
+            }
             let targets: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -96,7 +128,7 @@ pub(in crate::mcp) fn tool_search(
                 1 => {
                     session.record_search(targets[0]);
                     crate::search::callers::search_callers_expanded(
-                        targets[0], &scope, bloom, expand, context, glob, false,
+                        targets[0], &scopes[0], bloom, expand, context, glob, false,
                     )
                 }
                 2..=5 => {
@@ -104,7 +136,7 @@ pub(in crate::mcp) fn tool_search(
                         session.record_search(t);
                     }
                     crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scope, bloom, expand, context, glob, false,
+                        &targets, &scopes[0], bloom, expand, context, glob, false,
                     )
                 }
                 _ => {
@@ -126,6 +158,31 @@ pub(in crate::mcp) fn tool_search(
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(&output, budget));
     Ok(result)
+}
+
+fn search_multi_symbol_scopes_expanded(
+    queries: &[&str],
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+    expand: usize,
+    context: Option<&std::path::Path>,
+    glob: Option<&str>,
+    budget: Option<u64>,
+) -> Result<String, crate::error::TilthError> {
+    let mut sections = Vec::with_capacity(queries.len());
+    let expand = if expand == 0 {
+        0
+    } else {
+        expand.max(queries.len())
+    };
+    for query in queries {
+        sections.push(crate::search::search_symbol_scopes_expanded(
+            query, scopes, cache, session, bloom, expand, context, glob, false, budget,
+        )?);
+    }
+    Ok(sections.join("\n\n---\n"))
 }
 
 #[cfg(test)]
@@ -392,6 +449,90 @@ mod tests {
             out.contains("uses_beta"),
             "beta call site starved by alpha's hit-rich budget consumption \
              (early-quit budget was not scaled by target count): {out}"
+        );
+    }
+
+    #[test]
+    fn scopes_symbol_search_combines_results_without_scope_wrappers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let earlier = tmp.path().join("earlier");
+        let later = tmp.path().join("later");
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(
+            earlier.join("usage.rs"),
+            "fn first_scope_usage() {\n    target();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(later.join("lib.rs"), "pub fn target() {}\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "target",
+            "kind": "symbol",
+            "root": tmp.path().to_str().unwrap(),
+            "scopes": ["earlier", "later"],
+            "expand": 0,
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+
+        assert!(
+            !out.contains("# Scope:"),
+            "combined search should not render per-scope wrappers: {out}"
+        );
+        let def_pos = out.find("later/lib.rs").expect("missing later definition");
+        let usage_pos = out.find("earlier/usage.rs").expect("missing earlier usage");
+        assert!(
+            def_pos < usage_pos,
+            "later-scope definition should rank before earlier usage: {out}"
+        );
+    }
+
+    #[test]
+    fn scopes_rejects_simultaneous_scope_and_scopes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "target",
+            "scope": tmp.path().to_str().unwrap(),
+            "scopes": [tmp.path().to_str().unwrap()],
+        });
+
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+
+        assert!(
+            err.contains("scope") && err.contains("scopes"),
+            "error should name conflicting fields: {err}"
+        );
+    }
+
+    #[test]
+    fn scopes_callers_errors_instead_of_searching_first_scope_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "target",
+            "kind": "callers",
+            "root": tmp.path().to_str().unwrap(),
+            "scopes": ["one", "two"],
+        });
+
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+
+        assert!(
+            err.contains("multi-scope callers"),
+            "callers must not silently search only the first scope: {err}"
         );
     }
 

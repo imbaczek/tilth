@@ -352,39 +352,17 @@ fn main() {
         return;
     }
 
-    let result = run_query_for_scopes(&scopes, &query, |scope| {
-        if expand > 0 {
-            tilth::run_expanded(
-                &query,
-                scope,
-                cli.section.as_deref(),
-                cli.budget,
-                full,
-                expand,
-                cli.glob.as_deref(),
-                &cache,
-                cli.full,
-            )
-        } else if full {
-            tilth::run_full(
-                &query,
-                scope,
-                cli.section.as_deref(),
-                cli.budget,
-                cli.glob.as_deref(),
-                &cache,
-            )
-        } else {
-            tilth::run(
-                &query,
-                scope,
-                cli.section.as_deref(),
-                cli.budget,
-                cli.glob.as_deref(),
-                &cache,
-            )
-        }
-    });
+    let result = tilth::run_expanded_scopes(
+        &query,
+        &scopes,
+        cli.section.as_deref(),
+        cli.budget,
+        full,
+        expand,
+        cli.glob.as_deref(),
+        &cache,
+        cli.full,
+    );
 
     emit_result(result, &query, cli.json, is_tty);
 }
@@ -475,6 +453,10 @@ where
             }),
         )
     } else {
+        // TODO(scope-ranking): when this sequential helper is used by callers/deps
+        // with multiple scopes, reapply the caller's budget after joining. Each
+        // per-scope run currently receives the full budget, so final output can
+        // exceed --budget by roughly the number of successful scopes.
         Ok(outputs.join("\n\n---\n"))
     }
 }

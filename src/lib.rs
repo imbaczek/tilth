@@ -60,7 +60,7 @@ pub mod __fuzz {
     }
 }
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cache::OutlineCache;
 use classify::classify;
@@ -150,6 +150,43 @@ pub fn run_expanded(
     run_inner(
         query,
         scope,
+        section,
+        budget_tokens,
+        full,
+        expand,
+        glob,
+        cache,
+        cli_full,
+    )
+}
+
+pub fn run_expanded_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    full: bool,
+    expand: usize,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    cli_full: bool,
+) -> Result<String, TilthError> {
+    if scopes.len() == 1 {
+        return run_expanded(
+            query,
+            &scopes[0],
+            section,
+            budget_tokens,
+            full,
+            expand,
+            glob,
+            cache,
+            cli_full,
+        );
+    }
+    run_inner_scopes(
+        query,
+        scopes,
         section,
         budget_tokens,
         full,
@@ -312,6 +349,152 @@ fn run_inner(
     }
 }
 
+fn run_inner_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    full: bool,
+    expand: usize,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    cli_full: bool,
+) -> Result<String, TilthError> {
+    let query_type = if scopes
+        .iter()
+        .any(|scope| matches!(classify(query, scope), QueryType::FilePath(_)))
+    {
+        QueryType::FilePath(PathBuf::from(query))
+    } else {
+        classify(query, &scopes[0])
+    };
+    let use_expanded =
+        expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
+
+    if query.contains(',')
+        && !matches!(
+            query_type,
+            QueryType::Regex(_) | QueryType::Glob(_) | QueryType::FilePath(_)
+        )
+    {
+        let parts: Vec<&str> = query
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
+        if parts.len() > 5 && all_identifiers {
+            return Err(TilthError::InvalidQuery {
+                query: query.to_string(),
+                reason: "multi-symbol search supports 2-5 symbols".to_string(),
+            });
+        }
+        if parts.len() >= 2 && parts.len() <= 5 && all_identifiers {
+            let session = session::Session::new();
+            let bloom = index::bloom::BloomFilterCache::new();
+            let expand = if expand > 0 { expand } else { 2 };
+            let mut sections = Vec::with_capacity(parts.len());
+            for part in parts {
+                sections.push(search::search_symbol_scopes_expanded(
+                    part,
+                    scopes,
+                    cache,
+                    &session,
+                    &bloom,
+                    expand,
+                    None,
+                    glob,
+                    cli_full,
+                    budget_tokens,
+                )?);
+            }
+            let output = sections.join("\n\n---\n");
+            return match budget_tokens {
+                Some(b) => Ok(budget::apply(&output, b)),
+                None => Ok(output),
+            };
+        }
+    }
+
+    let output = match query_type {
+        QueryType::FilePath(_) => {
+            let mut outputs = Vec::new();
+            let mut first_err = None;
+            for scope in scopes {
+                if !matches!(classify(query, scope), QueryType::FilePath(_)) {
+                    continue;
+                }
+                match run_inner(
+                    query,
+                    scope,
+                    section,
+                    budget_tokens,
+                    full,
+                    expand,
+                    glob,
+                    cache,
+                    cli_full,
+                ) {
+                    Ok(output) => outputs.push(format!("# Scope: {}\n\n{output}", scope.display())),
+                    Err(err) if first_err.is_none() => first_err = Some(err),
+                    Err(_) => {}
+                }
+            }
+            if outputs.is_empty() {
+                return Err(first_err.unwrap_or_else(|| TilthError::NotFound {
+                    path: PathBuf::from(query),
+                    suggestion: None,
+                }));
+            }
+            outputs.join("\n\n---\n")
+        }
+        QueryType::Glob(_) => {
+            let mut outputs = Vec::new();
+            let mut first_err = None;
+            for scope in scopes {
+                match run_inner(
+                    query,
+                    scope,
+                    section,
+                    budget_tokens,
+                    full,
+                    expand,
+                    glob,
+                    cache,
+                    cli_full,
+                ) {
+                    Ok(output) => outputs.push(format!("# Scope: {}\n\n{output}", scope.display())),
+                    Err(err) if first_err.is_none() => first_err = Some(err),
+                    Err(_) => {}
+                }
+            }
+            if outputs.is_empty() {
+                return Err(first_err.unwrap_or_else(|| TilthError::NotFound {
+                    path: PathBuf::from(query),
+                    suggestion: None,
+                }));
+            }
+            outputs.join("\n\n---\n")
+        }
+        _ if use_expanded => {
+            let ctx = ExpandedCtx {
+                session: session::Session::new(),
+                bloom: index::bloom::BloomFilterCache::new(),
+                expand,
+                full_search: cli_full,
+                budget: budget_tokens,
+            };
+            run_query_expanded_scopes(&query_type, scopes, cache, &ctx, glob)?
+        }
+        _ => run_query_basic_scopes(&query_type, scopes, cache, glob)?,
+    };
+
+    match budget_tokens {
+        Some(b) => Ok(budget::apply(&output, b)),
+        None => Ok(output),
+    }
+}
+
 /// Dispatch search queries in expanded mode (inline source for top N matches).
 /// Only called for search query types — FilePath/Glob are handled before this.
 fn run_query_expanded(
@@ -420,6 +603,111 @@ fn run_query_basic(
     }
 }
 
+fn run_query_expanded_scopes(
+    query_type: &QueryType,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    ctx: &ExpandedCtx,
+    glob: Option<&str>,
+) -> Result<String, TilthError> {
+    match query_type {
+        QueryType::Symbol(name) => search::search_symbol_scopes_expanded(
+            name,
+            scopes,
+            cache,
+            &ctx.session,
+            &ctx.bloom,
+            ctx.expand,
+            None,
+            glob,
+            ctx.full_search,
+            ctx.budget,
+        ),
+        QueryType::Concept(text) if text.contains(' ') => search::search_content_scopes_expanded(
+            text,
+            scopes,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            None,
+            glob,
+            ctx.full_search,
+            ctx.budget,
+        ),
+        QueryType::Concept(text) | QueryType::Fallthrough(text) => {
+            search::search_symbol_scopes_expanded(
+                text,
+                scopes,
+                cache,
+                &ctx.session,
+                &ctx.bloom,
+                ctx.expand,
+                None,
+                glob,
+                ctx.full_search,
+                ctx.budget,
+            )
+        }
+        QueryType::Content(text) => search::search_content_scopes_expanded(
+            text,
+            scopes,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            None,
+            glob,
+            ctx.full_search,
+            ctx.budget,
+        ),
+        QueryType::Regex(pattern) => search::search_regex_scopes_expanded(
+            pattern,
+            scopes,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            None,
+            glob,
+            ctx.full_search,
+            ctx.budget,
+        ),
+        QueryType::FilePath(_) | QueryType::Glob(_) => {
+            unreachable!("non-search query type in expanded path")
+        }
+    }
+}
+
+fn run_query_basic_scopes(
+    query_type: &QueryType,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    glob: Option<&str>,
+) -> Result<String, TilthError> {
+    match query_type {
+        QueryType::Symbol(name) => {
+            let result = search::search_symbol_raw_scopes(name, scopes, glob, false)?;
+            search::format_raw_result(&result, cache)
+        }
+        QueryType::Concept(text) if text.contains(' ') => {
+            multi_word_concept_search_scopes(text, scopes, cache, glob)
+        }
+        QueryType::Concept(text) => single_query_search_scopes(text, scopes, cache, true, glob),
+        QueryType::Content(text) => {
+            let result = search::search_content_raw_scopes(text, scopes, glob, false)?;
+            search::format_raw_result(&result, cache)
+        }
+        QueryType::Regex(pattern) => {
+            let result = search::search_regex_raw_scopes(pattern, scopes, glob, false)?;
+            search::format_raw_result(&result, cache)
+        }
+        QueryType::Fallthrough(text) => {
+            single_query_search_scopes(text, scopes, cache, false, glob)
+        }
+        QueryType::FilePath(_) | QueryType::Glob(_) => {
+            unreachable!("non-search query type in basic path")
+        }
+    }
+}
+
 /// Shared cascade for single-word queries: symbol → content → not found.
 ///
 /// When `prefer_definitions` is true (Concept path), only accept symbol results
@@ -456,6 +744,41 @@ fn single_query_search(
     Err(error::TilthError::NotFound {
         path: scope.join(text),
         suggestion: read::suggest_similar_file(scope, text),
+    })
+}
+
+fn single_query_search_scopes(
+    text: &str,
+    scopes: &[PathBuf],
+    cache: &cache::OutlineCache,
+    prefer_definitions: bool,
+    glob: Option<&str>,
+) -> Result<String, error::TilthError> {
+    let sym_result = search::search_symbol_raw_scopes(text, scopes, glob, false)?;
+    let accept_sym = if prefer_definitions {
+        sym_result.definitions > 0
+    } else {
+        sym_result.total_found > 0
+    };
+
+    if accept_sym {
+        return search::format_raw_result(&sym_result, cache);
+    }
+
+    let content_result = search::search_content_raw_scopes(text, scopes, glob, false)?;
+    if content_result.total_found > 0 {
+        return search::format_raw_result(&content_result, cache);
+    }
+
+    if prefer_definitions && sym_result.total_found > 0 {
+        return search::format_raw_result(&sym_result, cache);
+    }
+
+    Err(error::TilthError::NotFound {
+        path: scopes
+            .first()
+            .map_or_else(|| PathBuf::from(text), |scope| scope.join(text)),
+        suggestion: None,
     })
 }
 
@@ -503,4 +826,133 @@ fn multi_word_concept_search(
         path: scope.join(text),
         suggestion: read::suggest_similar_file(scope, first_word),
     })
+}
+
+fn multi_word_concept_search_scopes(
+    text: &str,
+    scopes: &[PathBuf],
+    cache: &cache::OutlineCache,
+    glob: Option<&str>,
+) -> Result<String, error::TilthError> {
+    let mut content_result = search::search_content_raw_scopes(text, scopes, glob, false)?;
+    content_result.query = text.to_string();
+    if content_result.total_found > 0 {
+        return search::format_raw_result(&content_result, cache);
+    }
+
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let relaxed = if words.len() == 2 {
+        format!(
+            "{}.*{}|{}.*{}",
+            regex_syntax::escape(words[0]),
+            regex_syntax::escape(words[1]),
+            regex_syntax::escape(words[1]),
+            regex_syntax::escape(words[0]),
+        )
+    } else {
+        words
+            .iter()
+            .map(|w| regex_syntax::escape(w))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+
+    let mut relaxed_result = search::search_regex_raw_scopes(&relaxed, scopes, glob, false)?;
+    relaxed_result.query = text.to_string();
+    if relaxed_result.total_found > 0 {
+        return search::format_raw_result(&relaxed_result, cache);
+    }
+
+    Err(error::TilthError::NotFound {
+        path: scopes
+            .first()
+            .map_or_else(|| PathBuf::from(text), |scope| scope.join(text)),
+        suggestion: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multi_scope_file_path_can_resolve_in_later_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("empty");
+        let has_file = tmp.path().join("has_file");
+        std::fs::create_dir_all(&empty).unwrap();
+        std::fs::create_dir_all(&has_file).unwrap();
+        std::fs::write(
+            has_file.join("only_later.txt"),
+            "content from the later scope\n",
+        )
+        .unwrap();
+        std::fs::write(
+            empty.join("noise.rs"),
+            "fn unrelated() {\n    // only_later.txt should not be searched here\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run_expanded_scopes(
+            "only_later.txt",
+            &[empty, has_file],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &cache,
+            false,
+        )
+        .expect("later-scope file path should be read");
+
+        assert!(
+            out.contains("content from the later scope"),
+            "expected file contents from later scope, got: {out}"
+        );
+        assert!(
+            !out.contains("noise.rs"),
+            "missing-scope file path must not be reclassified as a search: {out}"
+        );
+    }
+
+    #[test]
+    fn multi_scope_multi_symbol_applies_budget_after_joining_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(
+            one.join("alpha.rs"),
+            "pub fn alpha() {\n    let alpha_value = 1;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            two.join("beta.rs"),
+            "pub fn beta() {\n    let beta_value = 2;\n}\n",
+        )
+        .unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run_expanded_scopes(
+            "alpha,beta",
+            &[one, two],
+            None,
+            Some(80),
+            false,
+            2,
+            None,
+            &cache,
+            false,
+        )
+        .expect("multi-symbol search should succeed");
+
+        assert_eq!(
+            out,
+            budget::apply(&out, 80),
+            "multi-symbol multi-scope output must be globally budgeted after sections are joined"
+        );
+    }
 }

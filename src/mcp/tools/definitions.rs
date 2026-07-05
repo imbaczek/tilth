@@ -34,6 +34,11 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
                     },
+                    "scopes": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Search multiple explicit subdirectories as one combined result set. Do not provide both `scope` and `scopes`; relative scopes require an absolute `root`."
+                    },
                     "kind": {
                         "type": "string",
                         "enum": ["symbol", "content", "regex", "callers"],
@@ -403,6 +408,25 @@ mod tests {
         assert!(
             !names.contains(&"tilth_edit"),
             "tilth_edit must be renamed away"
+        );
+    }
+
+    #[test]
+    fn tilth_search_schema_exposes_scopes_argument() {
+        let tools = tool_definitions(false);
+        let search = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("tilth_search"))
+            .expect("tilth_search tool definition present");
+
+        let scopes = &search["inputSchema"]["properties"]["scopes"];
+        assert_eq!(scopes["type"], "array");
+        assert_eq!(scopes["items"]["type"], "string");
+        assert!(
+            scopes["description"]
+                .as_str()
+                .is_some_and(|desc| desc.contains("scope") && desc.contains("scopes")),
+            "description should explain mutual exclusion with scope: {scopes}"
         );
     }
 

@@ -7,6 +7,7 @@ pub mod deps;
 pub mod facets;
 pub mod glob;
 pub mod grok;
+pub mod merge;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
@@ -329,6 +330,16 @@ pub fn search_symbol_raw(
     symbol::search(query, scope, None, glob, false)
 }
 
+/// Raw symbol search over several explicit scopes, merged before display caps.
+pub fn search_symbol_raw_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    merge::symbol_raw_scopes(query, scopes, None, glob, full)
+}
+
 /// Raw content search — returns structured result for programmatic inspection.
 pub fn search_content_raw(
     query: &str,
@@ -348,6 +359,44 @@ pub fn search_regex_raw(
     content::search(pattern, scope, true, None, glob, false)
 }
 
+fn search_content_raw_scopes_with_context(
+    query: &str,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    merge::content_raw_scopes(query, scopes, context, glob, full)
+}
+
+pub fn search_content_raw_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    search_content_raw_scopes_with_context(query, scopes, None, glob, full)
+}
+
+fn search_regex_raw_scopes_with_context(
+    pattern: &str,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    merge::regex_raw_scopes(pattern, scopes, context, glob, full)
+}
+
+pub fn search_regex_raw_scopes(
+    pattern: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    search_regex_raw_scopes_with_context(pattern, scopes, None, glob, full)
+}
+
 /// Format a raw search result (symbol or content — both use the same pipeline).
 pub fn format_raw_result(
     result: &SearchResult,
@@ -355,6 +404,54 @@ pub fn format_raw_result(
 ) -> Result<String, TilthError> {
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(result, cache, None, &bloom, 0, None)
+}
+
+pub fn search_symbol_scopes_expanded(
+    query: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let result = merge::symbol_raw_scopes(query, scopes, context, glob, full)?;
+    format_search_result(&result, cache, Some(session), bloom, expand, budget)
+}
+
+pub fn search_content_scopes_expanded(
+    query: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let result = search_content_raw_scopes_with_context(query, scopes, context, glob, full)?;
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
+}
+
+pub fn search_regex_scopes_expanded(
+    pattern: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let result = search_regex_raw_scopes_with_context(pattern, scopes, context, glob, full)?;
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
@@ -1896,6 +1993,38 @@ mod tests {
                 m.path.display()
             );
         }
+    }
+
+    #[test]
+    fn combined_symbol_search_ranks_definition_in_later_scope_before_earlier_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let earlier = tmp.path().join("earlier");
+        let later = tmp.path().join("later");
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(
+            earlier.join("usage.rs"),
+            "fn first_scope_usage() {\n    target();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(later.join("lib.rs"), "pub fn target() {}\n").unwrap();
+
+        let result = search_symbol_raw_scopes("target", &[earlier, later], None, false)
+            .expect("combined search failed");
+
+        assert_eq!(result.total_found, 2, "unexpected matches: {result:#?}");
+        assert_eq!(result.definitions, 1);
+        assert_eq!(result.usages, 1);
+        let first = result.matches.first().expect("missing first match");
+        assert!(
+            first.is_definition,
+            "later-scope definition should outrank earlier usage: {result:#?}"
+        );
+        assert!(
+            first.path.ends_with("later/lib.rs"),
+            "first match should come from later scope: {}",
+            first.path.display()
+        );
     }
 
     #[test]
