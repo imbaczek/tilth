@@ -16,7 +16,8 @@ struct Cli {
     /// File path, symbol name, glob pattern, or text to search.
     query: Option<String>,
 
-    /// Directory to search within or resolve relative paths against.
+    /// Directory to search within or resolve relative paths against. Can be
+    /// repeated to search in multiple directories.
     #[arg(long, default_value = ".")]
     scope: Vec<PathBuf>,
 
