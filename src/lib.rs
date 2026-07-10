@@ -67,6 +67,11 @@ use classify::classify;
 use error::TilthError;
 use types::QueryType;
 
+#[must_use]
+pub fn apply_output_budget(output: &str, budget_tokens: u64) -> String {
+    budget::apply(output, budget_tokens)
+}
+
 /// Holds expanded search dependencies, allocated once.
 /// Avoids scattered `Option<T>` + `unwrap()` throughout dispatch.
 struct ExpandedCtx {

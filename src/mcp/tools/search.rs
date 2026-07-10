@@ -73,8 +73,9 @@ pub(in crate::mcp) fn tool_search(
                             false, budget,
                         )
                     } else {
-                        search_multi_symbol_scopes_expanded(
-                            &queries, &scopes, cache, session, bloom, expand, context, glob, budget,
+                        crate::search::search_multi_symbol_scopes_expanded(
+                            &queries, &scopes, cache, session, bloom, expand, context, glob, false,
+                            budget,
                         )
                     }
                 }
@@ -158,31 +159,6 @@ pub(in crate::mcp) fn tool_search(
     let mut result = scope_warning.unwrap_or_default();
     result.push_str(&apply_budget(&output, budget));
     Ok(result)
-}
-
-fn search_multi_symbol_scopes_expanded(
-    queries: &[&str],
-    scopes: &[PathBuf],
-    cache: &OutlineCache,
-    session: &Session,
-    bloom: &Arc<BloomFilterCache>,
-    expand: usize,
-    context: Option<&std::path::Path>,
-    glob: Option<&str>,
-    budget: Option<u64>,
-) -> Result<String, crate::error::TilthError> {
-    let mut sections = Vec::with_capacity(queries.len());
-    let expand = if expand == 0 {
-        0
-    } else {
-        expand.max(queries.len())
-    };
-    for query in queries {
-        sections.push(crate::search::search_symbol_scopes_expanded(
-            query, scopes, cache, session, bloom, expand, context, glob, false, budget,
-        )?);
-    }
-    Ok(sections.join("\n\n---\n"))
 }
 
 #[cfg(test)]
@@ -483,6 +459,15 @@ mod tests {
             !out.contains("# Scope:"),
             "combined search should not render per-scope wrappers: {out}"
         );
+        let scope_header = format!(
+            "in scopes [{}, {}]",
+            earlier.canonicalize().unwrap().display(),
+            later.canonicalize().unwrap().display()
+        );
+        assert!(
+            out.contains(&scope_header),
+            "combined search should report the requested scopes: {out}"
+        );
         let def_pos = out.find("later/lib.rs").expect("missing later definition");
         let usage_pos = out.find("earlier/usage.rs").expect("missing earlier usage");
         assert!(
@@ -533,6 +518,39 @@ mod tests {
         assert!(
             err.contains("multi-scope callers"),
             "callers must not silently search only the first scope: {err}"
+        );
+    }
+
+    #[test]
+    fn scopes_multi_symbol_shares_expand_budget_across_queries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let source = "pub fn alpha() {}\nfn use_alpha() { alpha(); }\npub fn beta() {}\nfn use_beta() { beta(); }\n";
+        std::fs::write(one.join("lib.rs"), source).unwrap();
+        std::fs::write(two.join("lib.rs"), source).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "alpha,beta",
+            "kind": "symbol",
+            "root": tmp.path().to_str().unwrap(),
+            "scopes": ["one", "two"],
+            "expand": 1,
+        });
+
+        let out = tool_search(&args, &cache, &session, &bloom).unwrap();
+        let expanded_blocks = out
+            .lines()
+            .filter(|line| line.starts_with("```") && *line != "```")
+            .count();
+        assert_eq!(
+            expanded_blocks, 2,
+            "expand slots should be shared across query sections: {out}"
         );
     }
 

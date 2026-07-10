@@ -21,7 +21,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5).",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Searches always honor .tilthignore; .gitignore, .ignore, and git excludes are honored only when the MCP server is started with TILTH_RESPECT_GITIGNORE=1.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -37,7 +37,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "scopes": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Search multiple explicit subdirectories as one combined result set. Do not provide both `scope` and `scopes`; relative scopes require an absolute `root`."
+                        "description": "Search multiple explicit directories as one combined result set for symbol, content, and regex searches. Multi-scope callers search is not supported. Do not provide both `scope` and `scopes`; relative scopes require an absolute `root`."
                     },
                     "kind": {
                         "type": "string",
@@ -427,6 +427,19 @@ mod tests {
                 .as_str()
                 .is_some_and(|desc| desc.contains("scope") && desc.contains("scopes")),
             "description should explain mutual exclusion with scope: {scopes}"
+        );
+        assert!(
+            scopes["description"]
+                .as_str()
+                .is_some_and(|desc| desc.contains("callers") && desc.contains("not supported")),
+            "description should disclose the callers limitation: {scopes}"
+        );
+        assert!(
+            search["description"]
+                .as_str()
+                .is_some_and(|desc| desc.contains(".tilthignore")
+                    && desc.contains("TILTH_RESPECT_GITIGNORE")),
+            "tool help should disclose ignore behavior: {search}"
         );
     }
 

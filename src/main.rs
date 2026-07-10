@@ -294,6 +294,7 @@ fn main() {
         let output = run_for_scopes(&scopes, |scope| {
             Ok(tilth::map::generate(scope, 3, cli.budget, &cache))
         });
+        let output = apply_optional_budget(output, cli.budget);
         emit_output(&output, is_tty);
         return;
     }
@@ -329,7 +330,7 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = run_query_for_scopes(&scopes, &query, |scope| {
+        let result = run_query_for_scopes(&scopes, &query, cli.budget, |scope| {
             tilth::run_callers(
                 &query,
                 scope,
@@ -345,7 +346,7 @@ fn main() {
 
     // Deps mode
     if cli.deps {
-        let result = run_query_for_scopes(&scopes, &query, |scope| {
+        let result = run_query_for_scopes(&scopes, &query, cli.budget, |scope| {
             let path = resolve_query_path(&query, scope);
             tilth::run_deps(&path, scope, cli.budget)
         });
@@ -424,6 +425,7 @@ where
 fn run_query_for_scopes<F>(
     scopes: &[PathBuf],
     query: &str,
+    budget: Option<u64>,
     mut run: F,
 ) -> Result<String, tilth::error::TilthError>
 where
@@ -454,11 +456,14 @@ where
             }),
         )
     } else {
-        // TODO(scope-ranking): when this sequential helper is used by callers/deps
-        // with multiple scopes, reapply the caller's budget after joining. Each
-        // per-scope run currently receives the full budget, so final output can
-        // exceed --budget by roughly the number of successful scopes.
-        Ok(outputs.join("\n\n---\n"))
+        Ok(apply_optional_budget(outputs.join("\n\n---\n"), budget))
+    }
+}
+
+fn apply_optional_budget(output: String, budget: Option<u64>) -> String {
+    match budget {
+        Some(budget) => tilth::apply_output_budget(&output, budget),
+        None => output,
     }
 }
 
@@ -649,5 +654,19 @@ mod tests {
 
         assert_eq!(resolve_query_path("foo.rs", &first), first.join("foo.rs"));
         assert_eq!(resolve_query_path("foo.rs", &second), second.join("foo.rs"));
+    }
+
+    #[test]
+    fn multi_scope_query_reapplies_budget_after_joining() {
+        let scopes = vec![PathBuf::from("one"), PathBuf::from("two")];
+        let output = run_query_for_scopes(&scopes, "target", Some(80), |_| {
+            Ok(format!("# Search\n\n{}", "result line\n".repeat(200)))
+        })
+        .unwrap();
+
+        assert!(
+            output.contains("... truncated"),
+            "joined output was not capped: {output}"
+        );
     }
 }
