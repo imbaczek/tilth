@@ -70,11 +70,13 @@ where
         });
     }
 
+    let scopes = minimal_scopes(scopes);
+
     if scopes.len() == 1 {
         return search(&scopes[0]);
     }
 
-    let display_scope = common_display_root(scopes);
+    let display_scope = common_display_root(&scopes);
     let mut query = String::new();
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
@@ -84,7 +86,7 @@ where
     let mut hidden_definitions = 0usize;
     let mut hidden_usages = 0usize;
 
-    for scope in scopes {
+    for scope in &scopes {
         match search(scope) {
             Ok(result) => {
                 any_ok = true;
@@ -154,6 +156,24 @@ where
         usages,
         facet_totals,
     })
+}
+
+fn minimal_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
+    let canonical: Vec<PathBuf> = scopes
+        .iter()
+        .map(|scope| scope.canonicalize().unwrap_or_else(|_| scope.clone()))
+        .collect();
+    canonical
+        .iter()
+        .enumerate()
+        .filter(|(index, scope)| {
+            !canonical.iter().enumerate().any(|(other_index, other)| {
+                (scope != &other && scope.starts_with(other))
+                    || (scope == &other && other_index < *index)
+            })
+        })
+        .map(|(_, scope)| scope.clone())
+        .collect()
 }
 
 fn common_display_root(scopes: &[PathBuf]) -> PathBuf {
@@ -236,14 +256,24 @@ mod tests {
         let file = nested.join("lib.rs");
         std::fs::write(&file, "pub fn target() {}\n").unwrap();
 
+        let mut searches = 0;
         let combined = combine_scoped_results(&[root.clone(), nested.clone()], false, |scope| {
+            searches += 1;
             Ok(result(scope, vec![test_match(file.clone(), 1, true)]))
         })
         .expect("combine should succeed");
 
+        assert_eq!(searches, 1, "nested scopes should be searched only once");
         assert_eq!(combined.total_found, 1);
         assert_eq!(combined.definitions, 1);
         assert_eq!(combined.matches.len(), 1);
+    }
+
+    #[test]
+    fn minimal_scopes_keeps_one_copy_of_duplicate_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scope = tmp.path().to_path_buf();
+        assert_eq!(minimal_scopes(&[scope.clone(), scope.clone()]), vec![scope]);
     }
 
     #[test]
