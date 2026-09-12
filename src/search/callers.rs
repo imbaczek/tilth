@@ -56,6 +56,10 @@ pub struct CallerMatch {
     pub call_text: String,
     /// Line range of the calling function (for expand).
     pub caller_range: Option<(u32, u32)>,
+    /// The call sits in test code that only the source says is test code: a
+    /// Rust `#[test]` function, a `#[cfg(test)]` module, or a file under a
+    /// crate's `tests/` directory. `is_test_file` sees only path conventions.
+    pub in_test: bool,
     /// File content, already read during `find_callers_batch` — avoids re-reading during expand.
     /// Shared across all call sites in the same file via reference counting.
     pub content: Arc<String>,
@@ -168,7 +172,7 @@ pub(crate) fn find_callers_batch(
             };
 
             let file_callers =
-                find_callers_treesitter_batch(path, targets, &ts_lang, &content, lang);
+                find_callers_treesitter_batch(path, scope, targets, &ts_lang, &content, lang);
 
             if !file_callers.is_empty() {
                 found_count.fetch_add(file_callers.len(), Ordering::Relaxed);
@@ -191,6 +195,7 @@ pub(crate) fn find_callers_batch(
 /// Returns tuples of (`matched_target_name`, `CallerMatch`).
 fn find_callers_treesitter_batch(
     path: &Path,
+    scope: &Path,
     targets: &HashSet<String>,
     ts_lang: &tree_sitter::Language,
     content: &str,
@@ -217,6 +222,8 @@ fn find_callers_treesitter_batch(
     let shared_content: Arc<String> = Arc::new(content.to_string());
 
     let callee_filter = crate::lang::spec::spec(lang).callee_filter;
+    // Test code the path alone does not reveal (see `test_site`).
+    let test_site = crate::lang::spec::spec(lang).test_site;
 
     let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
@@ -280,6 +287,8 @@ fn find_callers_treesitter_batch(
                         calling_function,
                         call_text,
                         caller_range,
+                        in_test: test_site
+                            .is_some_and(|in_test| in_test(&cap.node, content_bytes, path, scope)),
                         content: Arc::clone(&shared_content),
                     },
                 ));

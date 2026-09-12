@@ -486,7 +486,7 @@ pub fn grok(
 
     let (prod_callers, test_callers): (Vec<_>, Vec<_>) = prod_and_test
         .into_iter()
-        .partition(|m| !is_test_file(&m.path));
+        .partition(|m| !is_test_file(&m.path) && !m.in_test);
     let total_callers = prod_callers.len();
     let total_tests = test_callers.len();
 
@@ -1491,6 +1491,101 @@ fn test_calls_target() {
                 "test file leaked into callers section"
             );
         }
+    }
+
+    /// Rust calls inside macro arguments are call sites. tree-sitter-rust parses
+    /// a macro's arguments as an opaque `token_tree`, so `assert!(target_fn())`
+    /// held no `call_expression` and the caller went unreported.
+    #[test]
+    fn grok_finds_rust_callers_inside_macro_arguments() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "src/lib.rs",
+            "pub fn target_fn() -> bool { true }\n",
+        );
+        let caller = "\
+use crate::target_fn;
+
+pub fn caller_fn() {
+    assert!(target_fn());
+}
+";
+        write_fixture(tmp.path(), "src/caller.rs", caller);
+
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+
+        let caller_names: Vec<&str> = result
+            .callers
+            .iter()
+            .map(|c| c.calling_function.as_str())
+            .collect();
+        assert_eq!(caller_names, ["caller_fn"]);
+    }
+
+    /// Rust tests live in `tests/` and in `#[test]` functions, not in
+    /// `.test.`/`.spec.` files: both are tests, not callers.
+    #[test]
+    fn grok_counts_rust_test_dirs_and_test_functions_as_tests() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = "\
+pub fn target_fn() -> u32 { 1 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_calls_target() {
+        let _ = target_fn();
+    }
+}
+";
+        write_fixture(tmp.path(), "src/lib.rs", lib);
+        let integration = "\
+use crate::target_fn;
+
+#[test]
+fn integration_calls_target() {
+    let _ = target_fn();
+}
+";
+        write_fixture(tmp.path(), "tests/target.rs", integration);
+
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            "target_fn",
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+
+        let mut test_names: Vec<&str> = result.tests.iter().map(|t| t.test_name.as_str()).collect();
+        test_names.sort_unstable();
+        let caller_names: Vec<&str> = result
+            .callers
+            .iter()
+            .map(|c| c.calling_function.as_str())
+            .collect();
+        assert_eq!(
+            (test_names, caller_names),
+            (
+                vec!["integration_calls_target", "tests.unit_calls_target"],
+                vec![]
+            )
+        );
     }
 
     #[test]
