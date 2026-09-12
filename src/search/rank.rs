@@ -57,6 +57,52 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
     });
 }
 
+/// Keep the `k` highest-ranked matches and drop the rest, preserving nothing
+/// else. Scores every match once — `sort`'s comparator re-scores O(n log n)
+/// times — and orders by the same (score, path, line) key, so the survivors are
+/// exactly the first `k` a full `sort` of the same slice would have produced.
+pub(crate) fn retain_top_k(
+    matches: &mut Vec<Match>,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    k: usize,
+) {
+    if matches.len() <= k {
+        return;
+    }
+
+    let ctx_parent = context.and_then(|c| c.parent());
+    let ctx_pkg_root = context
+        .and_then(crate::lang::package_root)
+        .map(std::path::Path::to_path_buf);
+    let mut pkg_cache: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
+    let now = SystemTime::now();
+
+    let mut scored: Vec<(i32, Match)> = std::mem::take(matches)
+        .into_iter()
+        .map(|m| {
+            let s = score(
+                &m,
+                query,
+                scope,
+                ctx_parent,
+                ctx_pkg_root.as_ref(),
+                &mut pkg_cache,
+                now,
+            );
+            (s, m)
+        })
+        .collect();
+    scored.sort_unstable_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    scored.truncate(k);
+    matches.extend(scored.into_iter().map(|(_, m)| m));
+}
+
 /// Ranking function. Each match gets a score — no floating point, no randomness.
 /// All boosts are positive (added), all penalties are positive (subtracted).
 fn score(
@@ -470,7 +516,7 @@ fn recency(mtime: SystemTime, now: SystemTime) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::sort;
+    use super::{retain_top_k, sort};
     use crate::types::Match;
     use std::path::PathBuf;
     use std::time::SystemTime;
@@ -869,5 +915,58 @@ mod tests {
         // `examples/guide.md` has "examples" as a path component AND a doc ext.
         let path = PathBuf::from("/repo/examples/guide.md");
         assert!(super::non_code_penalty(&path) > 0);
+    }
+
+    /// `retain_top_k` is the per-file collection bound in content search, and
+    /// it is only safe there because it keeps exactly what a full `sort` would
+    /// have kept. Lines in one file score differently (comment penalty vs
+    /// `pub fn` boost), so "the first k" is not the same set.
+    #[test]
+    fn retain_top_k_keeps_exactly_what_a_full_sort_keeps() {
+        let scope = PathBuf::from("/repo/src");
+        let build = || {
+            let mut v: Vec<Match> = (1..=12)
+                .map(|i| {
+                    let mut m =
+                        make_match("/repo/src/auth.rs", "// handleAuth mentioned", false, None);
+                    m.line = i;
+                    m.exact = false;
+                    m
+                })
+                .collect();
+            // The highest-ranked line is the LAST one — a first-k bound drops it.
+            v[11].text = "pub fn handleAuth(req: Request) -> Response {".to_string();
+            v
+        };
+
+        let mut bounded = build();
+        retain_top_k(&mut bounded, "handleAuth", &scope, None, 4);
+
+        let mut sorted = build();
+        sort(&mut sorted, "handleAuth", &scope, None);
+        sorted.truncate(4);
+
+        let key = |v: &[Match]| -> Vec<(u32, String)> {
+            v.iter().map(|m| (m.line, m.text.clone())).collect()
+        };
+        assert_eq!(bounded.len(), 4, "must drop everything past k");
+        assert_eq!(
+            key(&bounded),
+            key(&sorted),
+            "must match a full sort + truncate"
+        );
+        assert_eq!(
+            bounded[0].line, 12,
+            "the late pub fn line outranks the comments"
+        );
+
+        // Under the cap it is a no-op, order included.
+        let mut untouched = build();
+        retain_top_k(&mut untouched, "handleAuth", &scope, None, 99);
+        assert_eq!(
+            key(&untouched),
+            key(&build()),
+            "no reordering below the cap"
+        );
     }
 }

@@ -217,6 +217,7 @@ pub fn search_multi_symbol_expanded(
             &result.query,
             &result.scope,
             result.matches.len(),
+            result.total_found,
             result.definitions,
             result.usages,
         );
@@ -1030,6 +1031,7 @@ fn format_search_result(
         &result.query,
         &result.scope,
         result.matches.len(),
+        result.total_found,
         result.definitions,
         result.usages,
     );
@@ -1055,7 +1057,8 @@ fn format_search_result(
         // facet's entries, emit a per-facet hidden-count line (`write_hidden_tail`)
         // so the reader sees which facet got cut. The global tail used to live
         // at the end of `format_search_result`; on the facet path we suppress
-        // it to avoid double-counting hidden matches across two surfaces.
+        // it to avoid double-counting hidden matches across two surfaces —
+        // unless there are no per-facet totals to disclose (see below).
         if !faceted.definitions.is_empty() {
             let _ = write!(
                 out,
@@ -1174,6 +1177,23 @@ fn format_search_result(
                 "usages",
             );
         }
+
+        // Content/regex results carry no per-facet totals (all-zero), so the
+        // per-facet hidden tails above cannot disclose the display cap — emit
+        // the global tail for them. Faceted symbol results disclose per-facet.
+        let facet_totals_present = totals.definitions
+            + totals.implementations
+            + totals.tests
+            + totals.usages_local
+            + totals.usages_cross
+            > 0;
+        if !facet_totals_present && result.total_found > result.matches.len() {
+            let omitted = result.total_found - result.matches.len();
+            let _ = write!(
+                out,
+                "\n\n... and {omitted} more matches. Narrow with scope."
+            );
+        }
     } else {
         // Linear display for ≤5 matches
         format_matches(
@@ -1188,9 +1208,9 @@ fn format_search_result(
             &mut segments,
         );
 
-        // Global hidden-tail only on the linear path. The faceted path emits
-        // a per-facet line for each truncated facet above; printing both
-        // would double-count the same hidden matches.
+        // The faceted path emits a per-facet line for each truncated facet
+        // above; printing both there would double-count the same hidden
+        // matches.
         if result.total_found > result.matches.len() {
             let omitted = result.total_found - result.matches.len();
             let _ = write!(
@@ -2743,6 +2763,111 @@ mod tests {
         assert_eq!(
             with_none, with_explicit_default,
             "omitting budget must be identical to explicitly passing DEFAULT_BUDGET"
+        );
+    }
+
+    /// Content/regex results carry no per-facet totals, so on the faceted
+    /// path (>5 matches) neither the facet headings nor their per-facet
+    /// hidden tails can disclose the display cap. 15 hits must render as
+    /// "10 of 15 matches" plus the global tail — not a bare "10" that reads
+    /// as the whole truth.
+    #[test]
+    fn content_search_discloses_the_display_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            let mut body = String::new();
+            for i in 0..5 {
+                let _ = writeln!(body, "let v{i} = needle_alpha;");
+            }
+            std::fs::write(tmp.path().join(name), body).unwrap();
+        }
+
+        let out = search_content_expanded(
+            "needle_alpha",
+            tmp.path(),
+            &OutlineCache::new(),
+            &Session::new(),
+            0,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            out.contains("10 of 15 matches"),
+            "header must disclose the display cap: {out}"
+        );
+        assert!(
+            out.contains("... and 5 more matches"),
+            "faceted content results must emit the global hidden tail: {out}"
+        );
+    }
+    /// Two things the disclosure must get right on the SYMBOL path, which
+    /// carries real per-facet totals: every per-query section header states its
+    /// own cap (including the multi-symbol one), and the global "more matches"
+    /// tail stays off — a symbol facet already says "more usages", and printing
+    /// both would count the same hidden matches twice.
+    #[test]
+    fn capped_symbol_results_disclose_in_the_header_and_never_globally() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("def.rs"), "pub fn alpha_target() {}\n").unwrap();
+        for i in 0..14 {
+            std::fs::write(
+                tmp.path().join(format!("c{i:02}.rs")),
+                format!("fn caller{i}() {{\n    alpha_target();\n}}\n"),
+            )
+            .unwrap();
+        }
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let single = search_symbol_expanded(
+            "alpha_target",
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            single.contains("10 of 15 matches"),
+            "capped symbol header must disclose the cap: {single}"
+        );
+        assert!(
+            single.contains("more usages. Narrow with scope."),
+            "the truncated facet must still carry its own tail: {single}"
+        );
+        assert!(
+            !single.contains("more matches."),
+            "the global tail belongs to content/regex results only: {single}"
+        );
+
+        let session = Session::new();
+        let multi = search_multi_symbol_expanded(
+            &["alpha_target"],
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            0,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            multi.contains("10 of 15 matches"),
+            "each multi-symbol section header must disclose its own cap: {multi}"
         );
     }
 }

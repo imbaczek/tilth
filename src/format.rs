@@ -34,13 +34,21 @@ pub(crate) fn binary_summary(byte_len: u64, mime: &str) -> String {
 pub fn search_header(
     query: &str,
     scope: &Path,
+    shown: usize,
     total: usize,
     defs: usize,
     usages: usize,
 ) -> String {
+    // When the display cap bit, say so — a bare capped count reads as a
+    // complete result and silently under-reports (the #51 bug).
+    let count = if total > shown {
+        format!("{shown} of {total} matches")
+    } else {
+        format!("{total} matches")
+    };
     let parts = match (defs, usages) {
-        (0, _) => format!("{total} matches"),
-        (d, u) => format!("{total} matches ({d} definitions, {u} usages)"),
+        (0, _) => count,
+        (d, u) => format!("{count} ({d} definitions, {u} usages)"),
     };
     format!("# Search: \"{query}\" in {} — {parts}", scope.display())
 }
@@ -133,5 +141,26 @@ mod tests {
         assert_eq!(format_size(1024 * 1024 * 1024), "1.0GB");
         assert_eq!(format_size(3 * 1024 * 1024 * 1024 / 2), "1.5GB");
         assert_eq!(format_size(8 * 1024 * 1024 * 1024), "8.0GB");
+    }
+
+    #[test]
+    fn search_header_qualifies_only_a_capped_count() {
+        let scope = Path::new("src");
+        // Nothing hidden — the bare total, exactly as before.
+        assert_eq!(
+            search_header("handleAuth", scope, 6, 6, 2, 4),
+            "# Search: \"handleAuth\" in src — 6 matches (2 definitions, 4 usages)"
+        );
+        // Capped — the shown count is qualified by the real total, and the
+        // definition/usage breakdown still describes the whole result set.
+        assert_eq!(
+            search_header("handleAuth", scope, 10, 42, 2, 40),
+            "# Search: \"handleAuth\" in src — 10 of 42 matches (2 definitions, 40 usages)"
+        );
+        // Content/regex results report no definitions — count only.
+        assert_eq!(
+            search_header("needle", scope, 10, 15, 0, 15),
+            "# Search: \"needle\" in src — 10 of 15 matches"
+        );
     }
 }
