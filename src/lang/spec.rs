@@ -42,6 +42,9 @@ pub(crate) struct LangSpec {
     pub strip_family: Option<StripFamily>,
     /// Go-only: extract the method receiver name from file content.
     pub extract_receiver: Option<fn(&str, &tree_sitter::Language) -> Option<String>>,
+    /// Rust-only: reject a `@callee` capture that `callee_query` matched too
+    /// loosely. Consumers of the capture apply it when present.
+    pub callee_filter: Option<fn(&tree_sitter::Node) -> bool>,
     /// Definition-name extraction + weight (Elixir overrides the defaults).
     pub definitions: DefinitionOps,
 }
@@ -254,6 +257,18 @@ mod tests {
                 spec(lang).extract_receiver.is_some(),
                 matches!(lang, Lang::Go),
                 "{lang:?} receiver-extractor presence mismatch — only Go has method receivers"
+            );
+        }
+    }
+
+    #[test]
+    fn only_rust_filters_callee_captures() {
+        for &lang in mod_all_langs_for_test() {
+            assert_eq!(
+                spec(lang).callee_filter.is_some(),
+                matches!(lang, Lang::Rust),
+                "{lang:?} callee-filter presence mismatch — only Rust's callee \
+                 query has a pattern loose enough to need one"
             );
         }
     }
