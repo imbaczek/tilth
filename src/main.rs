@@ -32,9 +32,12 @@ struct Cli {
     ///
     /// File path: return the whole file instead of an outline (bypass smart view).
     ///
-    /// Symbol / text / regex: inline source for every match (equivalent to
-    /// `--expand=<all>`). Explicit `--expand=N` wins. Output stays bounded
-    /// by `--budget`.
+    /// Symbol / text / regex: raise the match cap from 10 to 100 and inline
+    /// source for the top 50 matches. Explicit `--expand=N` sets the
+    /// inline-source count only and leaves the raised cap in place, so
+    /// `--full --expand=0` lists up to 100 matches with no source — except
+    /// on comma-separated multi-symbol queries, which always expand at
+    /// least one match per symbol. Output stays bounded by `--budget`.
     ///
     /// Glob: no effect (glob queries already return a flat file list).
     #[arg(long)]
@@ -59,9 +62,10 @@ struct Cli {
     /// Inline source for top N search matches (default 2 when flag bare).
     ///
     /// Applies to symbol / text / regex queries. Without the flag the
-    /// result is just the outline summary. `--full` upgrades this to
-    /// expand every match (subject to `--budget`); explicit `--expand=N`
-    /// wins over `--full`. No effect on file-path or glob queries.
+    /// result is just the outline summary. `--full` upgrades this to the
+    /// top 50 matches (subject to `--budget`); explicit `--expand=N` wins
+    /// over `--full`, but only for the inline source — `--full`'s raised
+    /// match cap still stands. No effect on file-path or glob queries.
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
 
@@ -362,6 +366,9 @@ fn main() {
             cli.full,
         )
     } else if full {
+        // The last argument must stay `cli.full`, never the `full` above: a
+        // piped invocation reaches this branch with `full = !is_tty` and must
+        // not have its search match cap raised.
         tilth::run_full(
             &query,
             &scope,
@@ -369,6 +376,7 @@ fn main() {
             cli.budget,
             cli.glob.as_deref(),
             &cache,
+            cli.full,
         )
     } else {
         tilth::run(

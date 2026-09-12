@@ -30,7 +30,8 @@ tilth <symbol> --scope <dir>                # definitions + usages
 tilth "Foo,Bar,Baz" --scope <dir>           # multi-symbol (max 5)
 tilth <symbol> --expand                     # inline source for top 2 matches
 tilth <symbol> --expand=5                   # inline source for top 5
-tilth <symbol> --full                       # expand every match (capped at 50)
+tilth <symbol> --full                       # up to 100 matches, source for the top 50
+tilth <symbol> --full --expand=0            # up to 100 matches, no inline source
 tilth <symbol> --callers --scope <dir>      # call sites (structural, not text)
 tilth "TODO: fix" --scope <dir>             # content search (literal text)
 tilth "/regex/" --scope <dir>               # regex search
@@ -39,7 +40,7 @@ tilth <symbol> --glob "*.rs" --scope <dir>  # file pattern filter
 
 `--full` semantics depend on query type:
 - File path → return whole file (bypass smart-view outline).
-- Symbol / text / regex → expand every match (capped at 50). Explicit `--expand=N` wins.
+- Symbol / text / regex → raise the match cap from 10 to 100 and inline source for the top 50 matches. `--expand=N` sets the inline-source count only, so `--full --expand=0` still lists up to 100 matches. Multi-symbol (`"Foo,Bar"`) is the exception: it always expands at least one match per symbol.
 - Glob → no-op.
 
 Symbol search also surfaces **markdown headings as soft definitions** — `tilth StreamingResponse --scope docs/` finds `## StreamingResponse` headings ranked between code defs (60-80) and usages (0). Section body inlines automatically in the default preview (capped at 40 lines; pass `--expand` for the rest).
