@@ -117,7 +117,7 @@ mod tests {
         let mut matches = cursor.matches(&query, tree.root_node(), src.as_bytes());
         let mut names: Vec<&str> = Vec::new();
         while let Some(m) = matches.next() {
-            for cap in m.captures {
+            for cap in m.captures() {
                 if cap.index == callee_idx {
                     names.push(cap.node.utf8_text(src.as_bytes()).unwrap());
                 }
