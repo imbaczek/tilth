@@ -45,6 +45,11 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": 2,
                         "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
                     },
+                    "full": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Widen the match cap from 10 to 100 per query, for every kind. Costs tokens — use it when 10 matches cannot answer the question."
+                    },
                     "context": {
                         "type": "string",
                         "description": "Path to the file the agent is currently editing. Boosts ranking of matches in the same directory or package."
