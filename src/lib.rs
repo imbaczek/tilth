@@ -108,8 +108,12 @@ pub fn run(
 }
 
 /// Full variant — forces full file output, bypassing smart views.
-/// `full_file` covers piped-stdout promotion too; search cap bump never
-/// applies on this path (no expansion = no `run_query_expanded`).
+/// Forced full-file display covers piped-stdout promotion too, so it cannot
+/// gate the search match-cap bump; `cli_full` is the *parsed* `--full` flag
+/// and does that on its own (see `run_expanded`'s note). This is also the
+/// path `--full --expand=0` takes, so the cap has to be raised here even
+/// though the only branch that expands anything is the multi-symbol one,
+/// which carries its own floor of one match per symbol.
 pub fn run_full(
     query: &str,
     scope: &Path,
@@ -117,6 +121,7 @@ pub fn run_full(
     budget_tokens: Option<u64>,
     glob: Option<&str>,
     cache: &OutlineCache,
+    cli_full: bool,
 ) -> Result<String, TilthError> {
     run_inner(
         query,
@@ -127,7 +132,7 @@ pub fn run_full(
         0,
         glob,
         cache,
-        false,
+        cli_full,
     )
 }
 
@@ -299,7 +304,7 @@ fn run_inner(
             };
             run_query_expanded(&query_type, scope, cache, &ctx, glob)?
         }
-        _ => run_query_basic(&query_type, scope, cache, glob)?,
+        _ => run_query_basic(&query_type, scope, cache, glob, cli_full)?,
     };
 
     // For the expanded-search branch, fit_to_budget already applied
@@ -392,26 +397,31 @@ fn run_query_expanded(
 
 /// Dispatch search queries in basic mode (no expansion).
 /// Only called for search query types — FilePath/Glob are handled before this.
+/// `full_search` is the parsed `--full` flag. It is named apart from
+/// `run_inner`'s `full`, which means full-*file* display: this one raises the
+/// match cap and the walker's early-quit thresholds and expands nothing,
+/// which is exactly what `--full --expand=0` asks for.
 fn run_query_basic(
     query_type: &QueryType,
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    full_search: bool,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob),
+        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob, full_search),
         QueryType::Concept(text) if text.contains(' ') => {
-            multi_word_concept_search(text, scope, cache, glob)
+            multi_word_concept_search(text, scope, cache, glob, full_search)
         }
         QueryType::Concept(text) => {
             // Single-word concept: prefer definitions, then content, then any match.
-            single_query_search(text, scope, cache, true, glob)
+            single_query_search(text, scope, cache, true, glob, full_search)
         }
-        QueryType::Content(text) => search::search_content(text, scope, cache, glob),
-        QueryType::Regex(pattern) => search::search_regex(pattern, scope, cache, glob),
+        QueryType::Content(text) => search::search_content(text, scope, cache, glob, full_search),
+        QueryType::Regex(pattern) => search::search_regex(pattern, scope, cache, glob, full_search),
         QueryType::Fallthrough(text) => {
             // Accept any symbol match immediately (no definitions preference).
-            single_query_search(text, scope, cache, false, glob)
+            single_query_search(text, scope, cache, false, glob, full_search)
         }
         // FilePath/Glob never reach here
         QueryType::FilePath(_) | QueryType::Glob(_) => {
@@ -431,8 +441,9 @@ fn single_query_search(
     cache: &cache::OutlineCache,
     prefer_definitions: bool,
     glob: Option<&str>,
+    full_search: bool,
 ) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope, glob)?;
+    let sym_result = search::search_symbol_raw(text, scope, glob, full_search)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {
@@ -443,7 +454,7 @@ fn single_query_search(
         return search::format_raw_result(&sym_result, cache);
     }
 
-    let content_result = search::search_content_raw(text, scope, glob)?;
+    let content_result = search::search_content_raw(text, scope, glob, full_search)?;
     if content_result.total_found > 0 {
         return search::format_raw_result(&content_result, cache);
     }
@@ -465,9 +476,10 @@ fn multi_word_concept_search(
     scope: &Path,
     cache: &cache::OutlineCache,
     glob: Option<&str>,
+    full_search: bool,
 ) -> Result<String, error::TilthError> {
     // Try exact phrase match first
-    let mut content_result = search::search_content_raw(text, scope, glob)?;
+    let mut content_result = search::search_content_raw(text, scope, glob, full_search)?;
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
         return search::format_raw_result(&content_result, cache);
@@ -492,7 +504,7 @@ fn multi_word_concept_search(
             .join("|")
     };
 
-    let mut relaxed_result = search::search_regex_raw(&relaxed, scope, glob)?;
+    let mut relaxed_result = search::search_regex_raw(&relaxed, scope, glob, full_search)?;
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
         return search::format_raw_result(&relaxed_result, cache);
@@ -503,4 +515,134 @@ fn multi_word_concept_search(
         path: scope.join(text),
         suggestion: read::suggest_similar_file(scope, first_word),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 15 files, each carrying one instance of every query shape that reaches
+    /// `run_inner` with `expand == 0`, so one fixture covers them all.
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..15 {
+            std::fs::write(
+                dir.path().join(format!("file_{i:02}.rs")),
+                "// tag 424242\n\
+                 // 424242 marks widget, see src/widget.rs\n\
+                 pub fn widget() {}\n\
+                 pub fn WidgetThing() {}\n",
+            )
+            .expect("write fixture");
+        }
+        dir
+    }
+
+    /// Every query shape `run_inner` can dispatch with `expand == 0`, each
+    /// labelled with the route it takes, so a dropped forwarding names itself
+    /// in the failure message. "cascade" is `single_query_search`, reached
+    /// from two different arms and accepting at two different stages;
+    /// "phrase" is `multi_word_concept_search`, whose exact and relaxed
+    /// stages call different raw searches; the multi-symbol branch leaves
+    /// `run_query_basic` entirely.
+    const UNEXPANDED_QUERIES: &[(&str, &str)] = &[
+        ("WidgetThing", "Symbol arm -> search_symbol"),
+        ("widget", "Concept arm -> cascade, symbol stage"),
+        ("marks", "Concept arm -> cascade, content stage"),
+        ("424242", "Content arm -> search_content"),
+        ("/4242[0-9]{2}/", "Regex arm -> search_regex"),
+        ("tag 424242", "phrase -> search_content_raw"),
+        ("widget 424242", "phrase -> search_regex_raw"),
+        ("src/widget.rs", "Fallthrough arm -> cascade"),
+        ("widget,WidgetThing", "multi-symbol branch"),
+    ];
+
+    /// Every `# Search: ...` header count in the output. Each reports one
+    /// result's `matches.len()` after the cap; multi-symbol emits one header
+    /// per symbol, every other shape exactly one.
+    fn header_match_counts(output: &str) -> Vec<usize> {
+        let counts: Vec<usize> = output
+            .lines()
+            .filter(|line| line.starts_with("# Search:"))
+            .map(|line| {
+                let (_, tail) = line.rsplit_once("— ").expect("header count separator");
+                tail.split_whitespace()
+                    .next()
+                    .expect("count token")
+                    .parse()
+                    .expect("numeric match count")
+            })
+            .collect();
+        assert!(!counts.is_empty(), "no search header in output");
+        counts
+    }
+
+    /// Three fixture properties are load-bearing for the coverage above and
+    /// easy to break by editing the file body. Pin them here so such an edit
+    /// fails loudly instead of quietly collapsing three cascade stages into
+    /// one.
+    #[test]
+    fn fixture_keeps_the_cascade_stages_apart() {
+        let dir = fixture();
+        let scope = dir.path();
+
+        // "widget" is accepted at the symbol stage, so it never falls through.
+        let widget =
+            search::search_symbol_raw("widget", scope, None, false).expect("symbol search");
+        assert!(widget.definitions > 0, "widget must have definitions");
+
+        // "marks" has no definition but does have content hits, so it is the
+        // only query that exercises the content stage of the cascade.
+        let marks = search::search_symbol_raw("marks", scope, None, false).expect("symbol search");
+        assert_eq!(marks.definitions, 0, "marks must have no definition");
+        let marks_text = search::search_content_raw("marks", scope, None, false).expect("content");
+        assert!(marks_text.total_found > 0, "marks must have content hits");
+
+        // "widget 424242" must not appear verbatim, or the multi-word search
+        // stops at the exact-phrase stage and never reaches the relaxed regex.
+        let phrase =
+            search::search_content_raw("widget 424242", scope, None, false).expect("content");
+        assert_eq!(phrase.total_found, 0, "the phrase must not match verbatim");
+    }
+
+    /// `--full --expand=0` lands here: `expand == 0` keeps `run_inner` off the
+    /// expanded dispatch, and every entry point it reaches instead used to
+    /// receive a hardcoded `false`, handing back 10 of the up-to-100 matches
+    /// `--full` had asked for.
+    #[test]
+    fn run_full_raises_match_cap_on_every_unexpanded_path() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        for &(query, path) in UNEXPANDED_QUERIES {
+            let out = run_full(query, dir.path(), None, None, Some("*.rs"), &cache, true)
+                .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
+            for shown in header_match_counts(&out) {
+                assert!(
+                    shown > 10,
+                    "{path}: {query:?} with --full --expand=0 showed {shown} matches, want >10"
+                );
+            }
+        }
+    }
+
+    /// The other half of the contract: `run_full` is also the piped-stdout
+    /// promotion path (`full = !is_tty`, no `--full` typed), where `cli_full`
+    /// is false and the cap must stay at 10. This is the
+    /// `piped_invocation_does_not_auto_expand` rule one layer down, at the
+    /// place the cap is actually chosen.
+    #[test]
+    fn run_full_keeps_default_cap_without_cli_full() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        for &(query, path) in UNEXPANDED_QUERIES {
+            let out = run_full(query, dir.path(), None, None, Some("*.rs"), &cache, false)
+                .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
+            for shown in header_match_counts(&out) {
+                assert!(
+                    shown <= 10,
+                    "{path}: {query:?} piped without --full showed {shown} matches, want at most 10"
+                );
+            }
+        }
+    }
 }

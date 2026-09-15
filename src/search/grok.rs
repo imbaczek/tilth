@@ -122,7 +122,11 @@ fn resolve_def_by_query(
     query: &str,
     scope: &Path,
 ) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
-    let result = search_symbol_raw(query, scope, None)?;
+    // full=false keeps grok exactly as it was. It is not a free choice: `full`
+    // also raises the definitions early-quit threshold (50 -> 300), so it
+    // changes which definitions the walker collects and therefore which one
+    // ranks first here. Grok's own caps come from `GrokCaps`.
+    let result = search_symbol_raw(query, scope, None, false)?;
     let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
     let Some(top) = definitions.first() else {
         return Ok(None);

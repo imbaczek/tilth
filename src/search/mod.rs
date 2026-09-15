@@ -161,14 +161,18 @@ pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
     }
 }
 
-/// Dispatch search by query type.
+/// Dispatch search by query type. `full` is the caller's `--full`, with the
+/// same meaning here and in the five siblings below: it raises both the match
+/// cap and the walker's early-quit thresholds, so the reported totals move as
+/// well as the number of matches shown.
 pub fn search_symbol(
     query: &str,
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob, false)?;
+    let result = symbol::search(query, scope, None, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -254,9 +258,10 @@ pub fn search_content(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, glob, false)?;
+    let result = content::search(pattern, scope, is_regex, None, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -266,8 +271,9 @@ pub fn search_regex(
     scope: &Path,
     cache: &OutlineCache,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, glob, false)?;
+    let result = content::search(pattern, scope, true, None, glob, full)?;
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, None, &bloom, 0, None)
 }
@@ -311,8 +317,9 @@ pub fn search_symbol_raw(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
-    symbol::search(query, scope, None, glob, false)
+    symbol::search(query, scope, None, glob, full)
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
@@ -320,9 +327,10 @@ pub fn search_content_raw(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None, glob, false)
+    content::search(pattern, scope, is_regex, None, glob, full)
 }
 
 /// Raw regex search — returns structured result for programmatic inspection.
@@ -330,8 +338,9 @@ pub fn search_regex_raw(
     pattern: &str,
     scope: &Path,
     glob: Option<&str>,
+    full: bool,
 ) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None, glob, false)
+    content::search(pattern, scope, true, None, glob, full)
 }
 
 /// Format a raw search result (symbol or content — both use the same pipeline).
