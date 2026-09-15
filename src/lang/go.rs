@@ -78,6 +78,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     has_lifetimes: false,
     strip_family: Some(StripFamily::Go),
     extract_receiver: Some(extract_go_receiver_name),
+    callee_filter: None,
     definitions: DEFAULT_DEFS,
 };
 

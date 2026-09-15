@@ -54,6 +54,8 @@ pub fn extract_callee_names(
 
     let content_bytes = content.as_bytes();
 
+    let callee_filter = crate::lang::spec::spec(lang).callee_filter;
+
     let Some(names) = super::callee_query::with_callee_query(&ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
             return Vec::new();
@@ -77,6 +79,11 @@ pub fn extract_callee_names(
                     if line < start || line > end {
                         continue;
                     }
+                }
+
+                // Some patterns match more than a call (see `callee_filter`).
+                if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
+                    continue;
                 }
 
                 if let Ok(text) = cap.node.utf8_text(content_bytes) {
@@ -433,6 +440,65 @@ mod tests {
         assert!(
             names.contains(&"toString".to_string()),
             "expected toString, got: {names:?}"
+        );
+    }
+
+    /// tree-sitter parses a macro invocation's arguments as a `token_tree` of
+    /// raw tokens, so `alpha` has no `call_expression` node. The three names
+    /// that must NOT appear pin the two halves that keep the pattern honest:
+    /// `beta` needs `callee_filter` (only an anonymous comma stands between it
+    /// and the tuple), `idx` and `Lit` need the `"("` child, their trees being
+    /// `[..]` and `{..}`.
+    #[test]
+    fn extract_rust_callee_names_inside_macro_arguments() {
+        let rust = r#"fn uses(v: u32, out: &mut String) {
+    let _ = write!(out, "{}", alpha(1));
+    assert_eq!(beta, (1, 2));
+    println!("{:?}", idx[1]);
+    let _ = vec![Lit { a: 1 }];
+    gamma(v);
+}
+"#;
+        let names = extract_callee_names(rust, Lang::Rust, None);
+
+        assert!(
+            names.contains(&"alpha".to_string()),
+            "expected alpha called inside a macro argument, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"gamma".to_string()),
+            "plain calls must still be found, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"beta".to_string()),
+            "a bare token before a tuple is not a call, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"idx".to_string()),
+            "indexing is not a call, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"Lit".to_string()),
+            "a braced literal is not a call, got: {names:?}"
+        );
+    }
+
+    /// An attribute's argument list is a `token_tree` as well, and the
+    /// expressions in one do run — thiserror compiles `#[error(..)]` arguments
+    /// into `Display`. Reaching them is deliberate; the cost is that `cfg`
+    /// predicates, which are not calls, have the same shape.
+    #[test]
+    fn extract_rust_callee_names_inside_attribute_arguments() {
+        let rust = r#"#[derive(Debug)]
+#[cfg(not(any(unix, windows)))]
+#[error("{}: {reason}", path.display())]
+struct Failure;
+"#;
+        let names = extract_callee_names(rust, Lang::Rust, None);
+
+        assert!(
+            names.contains(&"display".to_string()),
+            "an expression inside an attribute is a real call, got: {names:?}"
         );
     }
 

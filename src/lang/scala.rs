@@ -26,5 +26,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     has_lifetimes: false,
     strip_family: Some(StripFamily::JavaKotlinCSharp),
     extract_receiver: None,
+    callee_filter: None,
     definitions: DEFAULT_DEFS,
 };

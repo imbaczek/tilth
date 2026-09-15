@@ -216,6 +216,8 @@ fn find_callers_treesitter_batch(
     // One Arc per file — all call sites share the same allocation.
     let shared_content: Arc<String> = Arc::new(content.to_string());
 
+    let callee_filter = crate::lang::spec::spec(lang).callee_filter;
+
     let Some(callers) = super::callee_query::with_callee_query(ts_lang, query_str, |query| {
         let Some(callee_idx) = query.capture_index_for_name("callee") else {
             return Vec::new();
@@ -240,24 +242,31 @@ fn find_callers_treesitter_batch(
                     continue;
                 }
 
+                // Some patterns match more than a call (see `callee_filter`).
+                if callee_filter.is_some_and(|keep| !keep(&cap.node)) {
+                    continue;
+                }
+
                 let matched_target = text.to_string();
 
                 // Found a call site! Now walk up to find the calling function
                 let line = cap.node.start_position().row as u32 + 1;
 
-                // Get the call text (the whole call expression, not just the callee)
+                // Get the call text (the whole call expression, not just the
+                // callee). When the parent spans lines no single line is the
+                // call, so show the callee's own line instead of the bare name.
+                // Applies to every language; a macro's token tree makes it the
+                // common case for Rust.
                 let call_node = cap.node.parent().unwrap_or(cap.node);
                 let same_line = call_node.start_position().row == call_node.end_position().row;
-                let call_text: String = if same_line {
-                    let row = call_node.start_position().row;
-                    if row < lines.len() {
-                        lines[row].trim().to_string()
-                    } else {
-                        matched_target.clone()
-                    }
+                let row = if same_line {
+                    call_node.start_position().row
                 } else {
-                    matched_target.clone()
+                    cap.node.start_position().row
                 };
+                let call_text: String = lines
+                    .get(row)
+                    .map_or_else(|| matched_target.clone(), |l| l.trim().to_string());
 
                 // Walk up the tree to find the enclosing function
                 let (calling_function, caller_range) =
@@ -756,6 +765,82 @@ mod tests {
             "glob-driven hint should appear when glob is Some: {msg}"
         );
     }
+    /// A call inside a macro's arguments is parsed as raw tokens in a
+    /// `token_tree`, not a `call_expression`, so the call-expression patterns
+    /// alone never saw it — `write!(out, "{}", alpha(1))` reported no caller at
+    /// all. The negative fixture is the shape the token-tree pattern matches
+    /// too loosely and `callee_filter` has to reject.
+    #[test]
+    fn callers_sees_calls_inside_macro_arguments() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn alpha(_n: u32) {}\n\
+             fn macro_arg_caller(out: &mut String) { let _ = write!(out, \"{}\", alpha(1)); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "fn tuple_not_a_call() { assert_eq!(alpha, (1, 2)); }\n",
+        )
+        .unwrap();
+
+        let result =
+            search_callers_expanded("alpha", dir.path(), &bloom, 0, None, None, false).unwrap();
+
+        assert!(
+            result.contains("[caller: macro_arg_caller]"),
+            "call site inside macro arguments not reported:\n{result}"
+        );
+        assert!(
+            !result.contains("tuple_not_a_call"),
+            "a bare token before a tuple must not count as a call:\n{result}"
+        );
+    }
+
+    /// `call_text` shows the call's source line. When the capture's parent
+    /// spans lines there is no one line that is the call, so it falls back to
+    /// the callee's own line — in every language, not only Rust. A macro's
+    /// token tree nearly always spans lines, so without this the call sites the
+    /// token-tree pattern finds would render as a bare echo of the query.
+    #[test]
+    fn call_text_falls_back_to_the_callee_line_across_languages() {
+        let dir = tempfile::tempdir().unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+
+        std::fs::write(
+            dir.path().join("wrapped.py"),
+            "def target(n):\n    return n\n\ndef py_multi():\n    return target(\n        1,\n    )\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("wrapped.rs"),
+            "fn target(n: u32) -> u32 { n }\n\
+             fn rs_macro(out: &mut String) {\n\
+             \x20   let _ = write!(\n\
+             \x20       out,\n\
+             \x20       \"{}\",\n\
+             \x20       target(1),\n\
+             \x20   );\n\
+             }\n",
+        )
+        .unwrap();
+
+        let result =
+            search_callers_expanded("target", dir.path(), &bloom, 0, None, None, false).unwrap();
+
+        assert!(
+            result.contains("-> return target("),
+            "a wrapped Python call should render its own line:\n{result}"
+        );
+        assert!(
+            result.contains("-> target(1),"),
+            "a call inside a multi-line macro should render its own line:\n{result}"
+        );
+    }
+
     /// Regression test: when there are more than `MAX_MATCHES` (10) hop-1 call
     /// sites but still <= `IMPACT_FANOUT_THRESHOLD` unique callers, the footer
     /// "N functions affected across 2 hops" must use the pre-truncation unique
