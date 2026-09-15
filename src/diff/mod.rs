@@ -193,8 +193,21 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
     if let Some(dir) = repo {
         cmd.current_dir(dir);
     }
+    // Pin the output shape. User git config can otherwise swap in an external
+    // diff tool, colour the patch, drop or rename the `a/` `b/` prefixes,
+    // make paths cwd-relative, or blank out empty context lines — every one
+    // of which the parser misreads as "no changes" or a wrong path (#208).
     cmd.args(["-c", "core.quotePath=false"]);
+    cmd.args(["-c", "diff.suppressBlankEmpty=false"]);
     cmd.arg("diff");
+    cmd.args([
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-relative",
+        "--src-prefix=a/",
+        "--dst-prefix=b/",
+    ]);
 
     match source {
         DiffSource::GitUncommitted => {
@@ -218,9 +231,21 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
 
-    // git diff --no-index exits 1 when there are differences; that is normal.
-    // For all other variants, a non-zero exit is unexpected but we still return
-    // whatever stdout was produced so the caller can decide.
+    // `git diff --no-index` exits 1 when the files differ; every other variant
+    // exits 0 on success. Anything else is a git error, and parsing its empty
+    // stdout would report "No changes." for a diff that was never produced.
+    let ok = match source {
+        DiffSource::Files(..) => matches!(output.status.code(), Some(0 | 1)),
+        _ => output.status.success(),
+    };
+    if !ok {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "git diff failed ({}): {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -1119,6 +1144,119 @@ diff --git a/src/main.rs b/src/main.rs
             resolve_source(Some("staged"), None, None, Some("x.patch"), None).unwrap(),
             DiffSource::Patch(_)
         ));
+    }
+
+    // ── git config must not change the shape of what we parse (#208) ─────────
+
+    /// Stage one change inside `goodbye`, so the patch has a symbol to
+    /// attribute the hunk to and a blank context line (the gap between
+    /// `hello` and `goodbye`) three lines above it.
+    fn stage_goodbye_change(dir: &Path) {
+        let main_rs = dir.join("src/main.rs");
+        let content = fs::read_to_string(&main_rs).unwrap();
+        fs::write(
+            &main_rs,
+            content.replace("println!(\"bye\")", "println!(\"farewell\")"),
+        )
+        .unwrap();
+        git(dir, &["add", "-A"]);
+    }
+
+    fn staged_diff(dir: &Path) -> String {
+        run_diff_in(dir, &DiffSource::GitStaged, None, None, false, None).unwrap()
+    }
+
+    /// `diff.external` replaces the unified patch with whatever the tool
+    /// prints. With `true` that is nothing, which used to read as "No changes.".
+    #[test]
+    fn staged_diff_bypasses_diff_external() {
+        let dir = setup_test_repo();
+        git(dir.path(), &["config", "diff.external", "true"]);
+        stage_goodbye_change(dir.path());
+        let result = staged_diff(dir.path());
+        assert!(
+            result.contains("goodbye"),
+            "external diff tool must be bypassed:\n{result}"
+        );
+    }
+
+    /// `color.ui=always` wraps the patch in escape codes the parser cannot read.
+    #[test]
+    fn staged_diff_ignores_color_ui_always() {
+        let dir = setup_test_repo();
+        git(dir.path(), &["config", "color.ui", "always"]);
+        stage_goodbye_change(dir.path());
+        let result = staged_diff(dir.path());
+        assert!(
+            result.contains("goodbye"),
+            "colour codes must not reach the parser:\n{result}"
+        );
+    }
+
+    /// `diff.noprefix` and `diff.mnemonicPrefix` change the `a/` `b/` prefixes
+    /// the parser keys on; the file came out as `src/main.rs src/main.rs` or
+    /// `c/src/main.rs i/src/main.rs`.
+    #[test]
+    fn staged_diff_pins_path_prefixes() {
+        for (key, value) in [("diff.noprefix", "true"), ("diff.mnemonicPrefix", "true")] {
+            let dir = setup_test_repo();
+            git(dir.path(), &["config", key, value]);
+            stage_goodbye_change(dir.path());
+            let result = staged_diff(dir.path());
+            assert!(
+                result.contains("## src/main.rs")
+                    && !result.contains("src/main.rs src/main.rs")
+                    && !result.contains("i/src/main.rs"),
+                "{key}={value}: path must be unprefixed and repo-relative:\n{result}"
+            );
+        }
+    }
+
+    /// `diff.suppressBlankEmpty` emits a blank context line as "" instead of
+    /// " ". The parser drops such lines, shifting every line after them.
+    #[test]
+    fn run_git_diff_keeps_blank_context_lines() {
+        let dir = setup_test_repo();
+        git(dir.path(), &["config", "diff.suppressBlankEmpty", "true"]);
+        stage_goodbye_change(dir.path());
+        let raw = run_git_diff(&DiffSource::GitStaged, Some(dir.path())).unwrap();
+        assert!(
+            raw.lines().any(|l| l == " "),
+            "blank context line must survive as a single space:\n{raw}"
+        );
+    }
+
+    /// `diff.relative` rewrites paths relative to the cwd; the overlay reads
+    /// files by repo-root path.
+    #[test]
+    fn run_git_diff_keeps_repo_relative_paths() {
+        let dir = setup_test_repo();
+        git(dir.path(), &["config", "diff.relative", "true"]);
+        stage_goodbye_change(dir.path());
+        let raw = run_git_diff(&DiffSource::GitStaged, Some(&dir.path().join("src"))).unwrap();
+        assert!(
+            raw.contains("diff --git a/src/main.rs b/src/main.rs"),
+            "paths must stay repo-relative when git runs in a subdirectory:\n{raw}"
+        );
+    }
+
+    /// A git failure used to parse as an empty patch and report "No changes.".
+    #[test]
+    fn bad_ref_is_an_error_not_no_changes() {
+        let dir = setup_test_repo();
+        let err = run_diff_in(
+            dir.path(),
+            &DiffSource::GitRef("no-such-ref".to_string()),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("no-such-ref"),
+            "error must carry git's own message: {err}"
+        );
     }
 }
 // test
