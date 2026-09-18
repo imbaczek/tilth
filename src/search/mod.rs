@@ -2617,6 +2617,42 @@ mod tests {
     }
 
     #[test]
+    fn content_and_regex_hidden_counts_exclude_displayed_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        for count in [5usize, 6, 15] {
+            std::fs::write(tmp.path().join("data.txt"), "123\n".repeat(count)).unwrap();
+            for is_regex in [false, true] {
+                let result =
+                    content::search("123", tmp.path(), is_regex, None, None, false).unwrap();
+                assert_eq!(result.total_found, count);
+                assert_eq!(result.matches.len(), count.min(10));
+                assert_eq!(
+                    hidden_beyond_facets(&result),
+                    0,
+                    "is_regex={is_regex}, total={}, displayed={}, facets={:?}",
+                    result.total_found,
+                    result.matches.len(),
+                    result.facet_totals,
+                );
+                let output = format_raw_result(&result, &cache).unwrap();
+                if count > 10 {
+                    assert!(
+                        output.contains(format!("{} more usages", count - 10).as_str()),
+                        "{output}"
+                    );
+                    assert!(!output.contains("additional matches"), "{output}");
+                } else {
+                    assert!(
+                        !output.contains("more usages") && !output.contains("additional matches"),
+                        "{output}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hidden_beyond_facets_reports_uncategorized_collected_cap_hits() {
         let result = SearchResult {
             query: "target".to_string(),
@@ -3231,8 +3267,8 @@ mod tests {
             "header must disclose the display cap: {out}"
         );
         assert!(
-            out.contains("... and 5 more matches"),
-            "faceted content results must emit the global hidden tail: {out}"
+            out.contains("... and 5 more usages"),
+            "faceted content results must disclose the per-facet display cap: {out}"
         );
     }
     /// Two things the disclosure must get right on the SYMBOL path, which

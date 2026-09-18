@@ -403,22 +403,18 @@ fn run_inner_scopes(
             let session = session::Session::new();
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
-            let mut sections = Vec::with_capacity(parts.len());
-            for part in parts {
-                sections.push(search::search_symbol_scopes_expanded(
-                    part,
-                    scopes,
-                    cache,
-                    &session,
-                    &bloom,
-                    expand,
-                    None,
-                    glob,
-                    cli_full,
-                    budget_tokens,
-                )?);
-            }
-            let output = sections.join("\n\n---\n");
+            let output = search::search_multi_symbol_scopes_expanded(
+                &parts,
+                scopes,
+                cache,
+                &session,
+                &bloom,
+                expand,
+                None,
+                glob,
+                cli_full,
+                budget_tokens,
+            )?;
             return match budget_tokens {
                 Some(b) => Ok(budget::apply(&output, b)),
                 None => Ok(output),
@@ -1095,6 +1091,68 @@ mod tests {
             out,
             budget::apply(&out, 80),
             "multi-symbol multi-scope output must be globally budgeted after sections are joined"
+        );
+    }
+
+    #[test]
+    fn multi_scope_multi_symbol_expands_two_symbols_with_two_fences_and_dedup_per_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let one = tmp.path().join("one");
+        let two = tmp.path().join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        let source =
+            "pub fn alpha() {}\nfn use_alpha() { alpha(); }\npub fn beta() {}\nfn use_beta() { beta(); }\n";
+        std::fs::write(one.join("lib.rs"), source).unwrap();
+        std::fs::write(two.join("lib.rs"), source).unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run_expanded_scopes(
+            "alpha,beta",
+            &[one.clone(), two.clone()],
+            None,
+            None,
+            false,
+            2,
+            None,
+            &cache,
+            false,
+        )
+        .expect("multi-symbol search should succeed");
+
+        let fences = out
+            .lines()
+            .filter(|line| line.starts_with("```") && *line != "```")
+            .count();
+        assert_eq!(
+            fences, 2,
+            "2 expand slots across 2 queries must yield 2 fences: {out}"
+        );
+        assert!(
+            out.contains("alpha") && out.contains("beta"),
+            "both symbol sections must be present: {out}"
+        );
+
+        let default_out = run_expanded_scopes(
+            "alpha,beta",
+            &[one, two],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &cache,
+            false,
+        )
+        .expect("default multi-symbol search should succeed");
+        let default_fences = default_out
+            .lines()
+            .filter(|line| line.starts_with("```") && *line != "```")
+            .count();
+        assert_eq!(
+            default_fences, 2,
+            "CLI default coerces expand=0 to 2 — one fence per symbol section: \
+             {default_out}"
         );
     }
 }

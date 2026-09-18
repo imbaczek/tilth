@@ -13,6 +13,7 @@ use grep_searcher::Searcher;
 
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
+const COLLECTED_MATCH_FACTOR: usize = 3;
 const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
@@ -24,15 +25,31 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    let mut result = search_collected(pattern, scope, is_regex, context, glob, full)?;
+    result
+        .matches
+        .truncate(if full { FULL_MAX_MATCHES } else { MAX_MATCHES });
+    Ok(result)
+}
+
+pub(super) fn search_collected(
+    pattern: &str,
+    scope: &Path,
+    is_regex: bool,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    let display_cap = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    let collection_cap = display_cap * COLLECTED_MATCH_FACTOR;
     search_capped(
         pattern,
         scope,
         is_regex,
         context,
         glob,
-        max_matches,
-        max_matches,
+        collection_cap,
+        collection_cap,
     )
 }
 
@@ -170,6 +187,14 @@ fn search_capped(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     rank::sort(&mut all_matches, pattern, scope, context);
+    let faceted = super::facets::facet_matches(all_matches.clone(), scope);
+    let facet_totals = FacetTotals {
+        definitions: faceted.definitions.len(),
+        implementations: faceted.implementations.len(),
+        tests: faceted.tests.len(),
+        usages_local: faceted.usages_local.len(),
+        usages_cross: faceted.usages_cross.len(),
+    };
     all_matches.truncate(max_matches);
 
     Ok(SearchResult {
@@ -179,7 +204,7 @@ fn search_capped(
         total_found: total,
         definitions: 0,
         usages: total,
-        facet_totals: FacetTotals::default(),
+        facet_totals,
     })
 }
 

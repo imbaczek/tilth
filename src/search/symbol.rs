@@ -59,15 +59,24 @@ pub fn search(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
-    let (max_matches, def_threshold, usage_threshold) = if full {
-        (
-            FULL_MAX_MATCHES,
-            FULL_EARLY_QUIT_DEFINITIONS,
-            FULL_EARLY_QUIT_USAGES,
-        )
+    let mut result = search_collected(query, scope, context, glob, full)?;
+    result
+        .matches
+        .truncate(if full { FULL_MAX_MATCHES } else { MAX_MATCHES });
+    Ok(result)
+}
+
+pub(super) fn search_collected(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    let (def_threshold, usage_threshold) = if full {
+        (FULL_EARLY_QUIT_DEFINITIONS, FULL_EARLY_QUIT_USAGES)
     } else {
         (
-            MAX_MATCHES,
             EARLY_QUIT_THRESHOLD_DEFINITIONS,
             EARLY_QUIT_THRESHOLD_USAGES,
         )
@@ -130,8 +139,6 @@ pub fn search(
             usages_cross: f.usages_cross.len(),
         }
     };
-
-    merged.truncate(max_matches);
 
     Ok(SearchResult {
         query: query.to_string(),
