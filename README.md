@@ -2,178 +2,204 @@
 
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jahala/tilth/badge)](https://scorecard.dev/viewer/?uri=github.com/jahala/tilth)
 
-**Smart code reading for humans and AI agents.** Reduces cost per correct answer by **44%** on Sonnet, **39%** on Opus, and **38%** on Haiku across 160 benchmark runs. ([benchmarks](#benchmarks))
+**Smart code reading for humans and AI agents.** tilth parses your code with tree-sitter and answers questions that text search can't. It shows where a symbol is defined, who calls it, what it calls, what depends on a file, and what changed at function level.
 
-tilth is what happens when you give `ripgrep`, `tree-sitter`, and `cat` a shared brain.
+tilth is one binary. It works as a command-line tool and as an MCP server, which is how most agent hosts connect to tools. It builds no index and needs no setup.
 
-```bash
-$ tilth src/auth.ts
-# src/auth.ts (258 lines, ~3.4k tokens) [outline]
+```
+$ tilth fastapi/dependencies/utils.py
+# fastapi/dependencies/utils.py (1027 lines, ~9.6k tokens)
 
-[1-12]   imports: express(2), jsonwebtoken, @/config
-[14-22]  interface AuthConfig
-[24-42]  fn validateToken(token: string): Claims | null
-[44-89]  export fn handleAuth(req, res, next)
-[91-258] export class AuthManager
-  [99-130]  fn authenticate(credentials)
-  [132-180] fn authorize(user, resource)
+[1-]   imports: dataclasses, inspect, sys
+[86-110]     fn ensure_multipart_is_installed
+           def ensure_multipart_is_installed() -> None
+[113-125]    fn get_parameterless_sub_dependant
+           def get_parameterless_sub_dependant(*, depends: params.Depends, path: str) -> Dependant
+[128-179]    fn get_flat_dependant
+           def get_flat_dependant(
+...
+[203-215]    fn _get_signature
+           def _get_signature(call: Callable[..., Any]) -> inspect.Signature
+[218-232]    fn get_typed_signature
+           def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature
+...
 ```
 
-Small files come back whole. Large files get an outline. Drill in with `--section`:
+Small files come back whole. Large files come back as an outline with line ranges. Ask for the part you need with `--section`:
 
 ```bash
-tilth src/auth.ts --section 44-89
+tilth fastapi/dependencies/utils.py --section 218-232
 tilth docs/guide.md --section "## Installation"
 ```
 
+The examples in this README are real output from the [FastAPI](https://github.com/fastapi/fastapi) and [Gin](https://github.com/gin-gonic/gin) repositories. Lines marked `...` are cut for length.
+
 ## Search finds definitions first
 
-```
-$ tilth handleAuth --scope src/
-# Search: "handleAuth" in src/ — 6 matches (2 definitions, 4 usages)
+````
+$ tilth get_typed_signature --scope fastapi --expand=1
+# Search: "get_typed_signature" in fastapi — 2 matches (1 definitions, 1 usages)
 
-## src/auth.ts:44-89 [definition]
-  [24-42]  fn validateToken(token: string)
-→ [44-89]  export fn handleAuth(req, res, next)
-  [91-120] fn refreshSession(req, res)
+### dependencies/utils.py:218-232 [definition]
+  [203-215]    fn _get_signature
+             def _get_signature(call: Callable[..., Any]) -> inspect.Signature
+-> [218-232]    fn get_typed_signature
+             def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature
+  [235-241]    fn get_typed_annotation
 
-  44 │ export function handleAuth(req, res, next) {
-  45 │   const token = req.headers.authorization?.split(' ')[1];
-  ...
-  88 │   next();
-  89 │ }
-
-── calls ──
-  validateToken  src/auth.ts:24-42  fn validateToken(token: string): Claims | null
-  refreshSession  src/auth.ts:91-120  fn refreshSession(req, res)
-
-## src/routes/api.ts:34 [usage]
-→ [34]   router.use('/api/protected/*', handleAuth);
+```dependencies/utils.py:218-232
+ 218 | def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature:
+ 219 |     signature = _get_signature(call)
+ 220 |     unwrapped = inspect.unwrap(call)
+ ...
+ 232 |     return typed_signature
 ```
 
-Tree-sitter finds where symbols are **defined** — not just where strings appear. Each match shows its surrounding file structure so you know what you're looking at without a second read.
+-- calls --
+  _get_signature  dependencies/utils.py:203-215  def _get_signature(call: Callable[..., Any]) -> inspect.Signature
+  get_typed_annotation  dependencies/utils.py:235-241  def get_typed_annotation(annotation: Any, globalns: dict[str, Any]) -> Any
 
-Expanded definitions include a **callee footer** (`── calls ──`) showing resolved callees with file, line range, and signature — the agent can follow call chains without separate searches for each callee.
+### dependencies/utils.py:277 [usage in function get_dependant]
+  [244-253]    fn get_typed_return_annotation
+             def get_typed_return_annotation(call: Callable[..., Any]) -> Any
+-> [256-328]    fn get_dependant
+             def get_dependant(
+  [331-352]    fn add_non_field_param_to_dependency
+
+(~439 tokens)
+````
+
+tilth uses the syntax tree to tell a definition from a mention, and it lists definitions first. Each match is shown with the symbols around it, so you can see where you are without reading the file.
+
+An expanded definition ends with a `-- calls --` footer. It lists the functions the definition calls, each with its file, line range and signature. An agent can follow a call chain from there without searching again.
+
+When a search finds more than it shows, the header says so, for example `10 of 43 matches`. Add `--full` to raise the limit from 10 to 100.
 
 ### Expanded search
 
-CLI search returns compact results by default. Use `--expand` to inline source for the top matches:
+On the command line, search returns compact results. `--expand` adds the source of the top matches:
 
 ```bash
-tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
-tilth handleAuth --scope src/ --expand=5     # top 5
+tilth ServeHTTP --scope . --expand       # top 2
+tilth ServeHTTP --scope . --expand=5     # top 5
 ```
 
-In MCP mode, `expand` defaults to 2 — no flag needed.
+In MCP mode, `expand` defaults to 2.
 
 ### Multi-symbol search
 
-Trace across files in one call:
+Look up several symbols in one call:
 
 ```bash
 tilth "ServeHTTP, HandlersChain, Next" --scope .
 ```
 
-Each symbol gets its own result block with definitions and expansions. The expand budget is shared — at least one expansion per symbol, deduped across files.
+Each symbol gets its own block of results. The expand budget is shared across them, with at least one expansion per symbol.
 
-### Callers query
+### Callers
 
-Find all call sites of a symbol using structural tree-sitter matching (not text search):
+Find every call site of a symbol. tilth matches calls on the syntax tree, so comments and strings that mention the name are left out.
 
-```bash
+```
 $ tilth isTrustedProxy --callers --scope .
-# Callers of "isTrustedProxy" — 5 call sites
+# Callers of "isTrustedProxy" in ~/gin — 5 call sites
 
 ## context.go:1011 [caller: ClientIP]
-→ trusted = c.engine.isTrustedProxy(remoteIP)
+-> trusted = c.engine.isTrustedProxy(remoteIP)
+...
+## gin.go:496 [caller: validateHeader]
+-> if (i == 0) || (!engine.isTrustedProxy(ip)) {
 ```
 
-In MCP mode, use `kind: "callers"` on `tilth_search` instead.
+In MCP mode, use `kind: "callers"` on `tilth_search`.
 
-### Blast-radius deps
+### File dependencies
 
-See what a file imports and what depends on it — useful before renaming or changing exports:
+See what a file uses and what uses it. This is worth a look before you rename or remove an export.
 
-```bash
-$ tilth src/auth.ts --deps
-# deps: src/auth.ts
+```
+$ tilth recovery.go --deps
+# Deps: recovery.go — 5 local, 0 external, 3 dependents
 
-## Imports (3)
-  jsonwebtoken      (external)
-  @/config          src/config.ts
-  express           (external)
+## Uses (local)
+context.go                     Abort, AbortWithStatus, Error, Next
+debug.go                       IsDebugging
+fs.go                          Open
+gin.go                         New
+routergroup.go                 handle
 
-## Dependents (4)
-  src/routes/api.ts        uses: handleAuth, AuthManager
-  src/middleware/cors.ts   uses: validateToken
-  src/app.ts               uses: AuthManager
-  test/auth.test.ts        uses: handleAuth, AuthManager
+## Used by
+benchmarks_test.go:22          BenchmarkRecoveryMiddleware → Recovery
+benchmarks_test.go:36          BenchmarkManyHandlers → Recovery
+gin.go:239                     Default              → Recovery
+recovery_test.go:22            TestPanicClean       → RecoveryWithWriter
+...
 ```
 
 In MCP mode, use the `tilth_deps` tool.
 
 ### Grok a symbol
 
-Everything about one symbol in a single call — definition, signature, doc, callers, callees, siblings, tests:
+`grok` returns everything about one symbol in a single call: signature, doc comment, body, callees, callers, siblings and tests.
 
-```bash
-$ tilth grok handleAuth
-# grok: handleAuth [src/auth.ts:42]
+```
+$ tilth grok get_typed_signature --scope fastapi
+# grok: get_typed_signature [dependencies/utils.py:218]
 
 ## signature
-function handleAuth(req: Request): AuthContext
+def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature
 
-## callers (3)
-  src/routes/api.ts:88   in registerRoutes()
-  src/app.ts:24          in bootstrap()
+## body
+...
 
-## callees (2)
-  validateToken    src/auth.ts:120
-  loadUser         src/db/users.ts:55
+## callees (2 internal, 5 extern)
+  dependencies/utils.py
+    _get_signature       [203-215]   def _get_signature(call: Callable[..., Any]) -> inspect.Signature
+    get_typed_annotation [235-241]   def get_typed_annotation(annotation: Any, globalns: dict[str, Any]) -> Any
+...
+
+## callers (1)
+  dependencies/utils.py
+    [277]   in get_dependant()
 ```
 
 In MCP mode, use the `tilth_grok` tool.
 
-### Session dedup
+### Session memory
 
-In MCP mode, previously expanded definitions show `[shown earlier]` instead of the full body on subsequent searches. Saves tokens when the agent revisits symbols it already saw.
+In MCP mode, a definition that was already expanded comes back as `[shown earlier]` in later searches. The agent does not receive the same body twice.
 
 ## Structural diff
 
-```bash
+```
 $ tilth diff HEAD~1
-# Diff: HEAD~1 — 3 files, 2 modified, 1 added (~350 tokens)
+# Diff: HEAD~1 — 10 files, 10 modified, 9 added (~447 tokens)
+...
+## binding/bson.go (3 symbols)
+  [+]      Name                                     L16  (new, 3 lines)
+  [+]      Bind                                     L20  (new, 7 lines)
+  [+]      BindBody                                 L28  (new, 3 lines)
 
-## src/auth.rs (3 symbols)
-  [~:sig]  fn handleAuth(req) → (req, ctx)    L42
-  [~]      fn validate_session                 L88
-  [+]      fn refresh_token                    L120
+## context.go (3 symbols)
+  [~]      <const>                                  L31  (body, 13→14 lines)
+  [~]      Negotiate                                L1357  (body, 30→34 lines)
+  [+]      BSON                                     L1242
+...
 ```
 
-Function-level change detection. Drill in with `--scope`, summarize history with `--log`, detect merge conflicts automatically. Replaces `git diff` for AI agents.
-
-## Benchmarks
-
-Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
-
-| Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
-|---|---|---|---|---|---|---|---|
-| Sonnet 4.6 | 26 | 86 | $0.26 | $0.15 | **-44%** | 84% | 94% |
-| Opus 4.6 | 26 | 25 | $0.22 | $0.14 | **-39%** | 91% | 92% |
-| Haiku 4.5 | 26 | 49 | $0.12 | $0.08 | **-38%** | 54% | 73% |
-| **Average** | | **160** | **$0.20** | **$0.12** | **-40%** | **76%** | **86%** |
-
-v0.5.0 introduces top-weighted MCP instructions and scope fallback, achieving 40% average cost reduction across all three models. Sonnet accuracy improves from 84% to 94%, Haiku from 54% to 73%. All models show significant turn reduction (25% average fewer turns).
-
-Scope confusion (models passing invalid directory paths) is now handled with automatic fallback to cwd with a warning. DO NOT rules at the top of MCP instructions reduced redundant built-in tool usage (Grep, Read, Glob) to near-zero across all models.
-
-See [benchmark/](benchmark/) for per-task results, by-language breakdowns, and model comparison.
+The diff reports changes per function: what was added, what was removed, and whether a signature or only a body changed. Narrow it with `--scope`, or summarise a range of commits with `--log`.
 
 ## Why
 
-I built this because I watched AI agents make 6 tool calls to find one function. `glob → read → "too big" → grep → read again → read another file`. Each round-trip burns tokens and inference time.
+I built tilth after watching AI agents make 6 tool calls to find one function: glob, read, "too big", grep, read again, read another file.
 
-tilth gives structural awareness in one call. The outline tells you *what's in the file*. The search tells you *where things are defined*. `--section` gets you *exactly the lines you need*.
+An agent with grep can find where a piece of text appears. To find out who calls a function, it has to read files and work out the answer, and that answer can be wrong without anyone noticing. tilth parses the code and computes the answer. The outline shows what is in a file, search shows where things are defined, and `--section` returns the lines you asked for.
+
+## What it doesn't do
+
+- tilth parses syntax. It does not resolve types.
+- Callers and dependencies are matched by name. tilth cannot tell apart two functions with the same name in different modules, and it cannot follow dynamic dispatch.
+- A language without a tree-sitter grammar in tilth gets text search and plain file reading only.
 
 ## Install
 
@@ -183,7 +209,7 @@ cargo install tilth
 npx tilth
 ```
 
-Prebuilt binaries on the [releases page](https://github.com/jahala/tilth/releases).
+Prebuilt binaries are on the [releases page](https://github.com/jahala/tilth/releases).
 
 ### MCP server
 
@@ -212,13 +238,13 @@ tilth install crush            # ~/.config/crush/crush.json
 tilth install pi               # ~/.pi/agent/mcp.json
 ```
 
-Add `--edit` to enable hash-anchored file editing (see [Edit mode](#edit-mode)):
+Add `--edit` to turn on hash-anchored file editing (see [Edit mode](#edit-mode)):
 
 ```bash
 tilth install claude-code --edit
 ```
 
-For any MCP client not in the list, the server entry is the same everywhere — only the config file location and top-level key vary (`mcpServers` for most hosts, `amp.mcpServers` for Amp, TOML syntax for Codex):
+For an MCP client that is not in the list, the server entry is the same everywhere. Only the config file location and the top-level key vary (`mcpServers` for most hosts, `amp.mcpServers` for Amp, TOML syntax for Codex):
 
 ```json
 {
@@ -233,17 +259,15 @@ For any MCP client not in the list, the server entry is the same everywhere — 
 
 For edit mode, use `"args": ["--mcp", "--edit"]`.
 
-Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
+You can also call tilth from a shell. See [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill.
 
 ### Smaller models
 
-Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Grep. To force tilth adoption, disable the overlapping built-in tools:
+Smaller models sometimes reach for their built-in Bash and Grep tools even when tilth is available. To make tilth the only route, turn off the tools it overlaps with:
 
 ```bash
 claude --disallowedTools "Bash,Grep,Glob"
 ```
-
-Benchmarks show Haiku benefits significantly from tilth (54% → 73% accuracy) but may still fall back to built-in tools. Forced mode ensures consistent tool adoption.
 
 ## How it decides what to show
 
@@ -252,10 +276,12 @@ Benchmarks show Haiku benefits significantly from tilth (54% → 73% accuracy) b
 | 0 bytes | `[empty]` |
 | Binary | `[skipped]` with mime type |
 | Generated (lockfiles, .min.js) | `[generated]` |
-| < ~6000 tokens | Full content with line numbers |
-| > ~6000 tokens | Structural outline with line ranges |
+| Up to ~6,000 tokens | Full content with line numbers |
+| Over ~6,000 tokens | Structural outline with line ranges |
 
-Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-line focused module prints whole.
+The rule counts tokens, so a 1-line minified bundle gets outlined and a 120-line module prints whole.
+
+When the output is piped to another program, the command-line tool prints the full file, the way `cat` would. MCP reads and terminal reads follow the table.
 
 ## Edit mode
 
@@ -266,7 +292,7 @@ Install with `--edit` to add `tilth_write` and switch `tilth_read` to hashline o
 43:f1b|  return x;
 ```
 
-`tilth_write` batches one or more files, each in one of three modes: `hash` (default — replace lines at the hash anchors above), `overwrite` (whole file; create-only unless `overwrite: true`), and `append`. In hash mode the anchors must match the last read; if the file changed since, hashes won't match and the edit is rejected with current content shown:
+`tilth_write` takes one or more files in a single call. Each file uses one of three modes: `hash` (the default, which replaces lines at the hash anchors shown above), `overwrite` (the whole file, and create-only unless `overwrite: true`), and `append`. In hash mode the anchors must match the last read. If the file changed in the meantime, the hashes no longer match, and tilth rejects the edit and shows the current content:
 
 ```json
 {
@@ -282,7 +308,7 @@ Install with `--edit` to add `tilth_write` and switch `tilth_read` to hashline o
 }
 ```
 
-Large files still outline first — use `section` to get hashlined content for the part you need.
+Large files still come back as an outline first. Use `section` to get hashlined content for the part you need.
 
 Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-problem/).
 
@@ -295,8 +321,10 @@ tilth <path> --section "## Foo"   # markdown heading
 tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
 tilth <symbol> --expand=5         # inline source for top 5 matches
+tilth <symbol> --full             # up to 100 matches instead of 10
 tilth <symbol> --callers          # find call sites (structural)
-tilth <path> --deps               # imports + dependents
+tilth grok <symbol>               # everything about one symbol
+tilth <path> --deps               # what a file uses, and what uses it
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
 tilth "*.test.ts" --scope <dir>   # glob files
@@ -304,40 +332,46 @@ tilth diff HEAD~1                 # structural diff (function-level)
 tilth --map --scope <dir>         # codebase skeleton (CLI only)
 ```
 
-`--map` is available in the CLI but not exposed as an MCP tool — benchmarks showed AI agents overused it, hurting accuracy.
+`--map` is a command-line feature only. It is not offered as an MCP tool, because in testing agents called it far more often than it helped.
 
 ## Speed
 
-CLI times on x86_64 Mac, 26–1060 file codebases. Includes ~17ms process startup (MCP mode pays this once).
+Median of 15 runs of the release build (main after v0.10.1) on an Apple M5 Pro. Each time includes process startup. MCP mode pays startup once.
 
-| Operation | ~30 files | ~1000 files |
-|-----------|-----------|-------------|
-| File read + type detect | ~18ms | ~18ms |
-| Code outline (400 lines) | ~18ms | ~18ms |
-| Symbol search | ~27ms | — |
-| Content search | ~26ms | — |
-| Glob | ~24ms | — |
-| Map (codebase skeleton) | ~21ms | ~240ms |
+| Operation | Gin (130 files) | FastAPI (2,700 files) |
+|-----------|-----------------|-----------------------|
+| File read | 3 ms | 3 ms |
+| Glob | 5 ms | 9 ms |
+| Callers | 13 ms | 64 ms |
+| Deps | 17 ms | 28 ms |
+| Symbol search | 20 ms | 77 ms |
+| Content search | 37 ms | 80 ms |
+| Grok | 37 ms | 91 ms |
+| Map | 52 ms | 184 ms |
 
-Search, content search, and glob use early termination — time is roughly constant regardless of codebase size.
+Search walks the whole tree, so time grows with the size of the repository.
 
 ## What's inside
 
-Rust. ~20,000 lines. No runtime dependencies.
+tilth is about 35,000 lines of Rust with no runtime dependencies.
 
-- **tree-sitter** — AST parsing for 16 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir). Used for definition detection, callee extraction, callers query, and structural outlines.
-- **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
-- **ignore** crate — parallel directory walking, searches all files including gitignored
-- **memmap2** — memory-mapped file reads (no buffers)
-- **DashMap** — concurrent outline cache, invalidated by mtime
+- **tree-sitter** parses 17 languages: Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir and Bash. tilth uses it for definitions, callees, callers and outlines. Dockerfile and Make files are recognised but not parsed.
+- **ripgrep's crates** (`grep-regex`, `grep-searcher`) run content search.
+- The **ignore** crate walks directories in parallel. tilth searches every file, including gitignored ones, and skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
+- **memmap2** reads files through memory maps.
+- **DashMap** holds the outline cache, which is invalidated when a file's modified time changes.
 
-Search runs definitions and usages in parallel via `rayon::join`. Callee resolution runs at expand time — extract callee names via tree-sitter queries, resolve against the source file's outline and imported files. Callers query uses the same tree-sitter patterns in reverse, walking the codebase with `memchr` SIMD pre-filtering for fast elimination.
+Definitions and usages are searched in parallel through `rayon::join`. Callees are resolved when a definition is expanded. tilth extracts the callee names with tree-sitter queries and looks them up in the file's own outline and in the files it imports. The callers query runs the same patterns in reverse across the codebase, with a `memchr` pre-filter to skip files that cannot match.
 
-The search output format is informed by wavelet multi-resolution (outline headers show line ranges for drill-down) and 1-hop callee expansion (expanded definitions resolve callees inline).
+tilth makes no network calls, so your code stays on your machine.
+
+## A note on benchmarks
+
+Earlier versions of this README carried a cost benchmark. It was measured on v0.5.0 with early-2026 models, and it no longer describes the tool or the models people use today. We have retired it and have not replaced it, so tilth makes no cost claim. The harness and its task definitions are preserved under the `benchmark-archive` tag.
 
 ## Name
 
-**tilth** — the state of soil that's been prepared for planting. Your codebase is the soil; tilth gives it structure so you can find where to dig.
+**tilth** is the state of soil that has been prepared for planting. Your codebase is the soil, and tilth gives it structure so you can find where to dig.
 
 ## Support
 
