@@ -294,11 +294,21 @@ header.nav {
 /* ── hosts (MCP install targets) ── */
 .hosts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .host {
-  font-family: var(--font-code); font-size: 0.82rem; color: var(--pp-text-soft);
+  font-family: var(--font-code); font-size: 0.82rem; line-height: inherit; color: var(--pp-text-soft);
   background: var(--pp-surface); border: 1px solid var(--pp-border);
-  border-radius: var(--radius-sm); padding: 7px 13px;
+  border-radius: var(--radius-sm); padding: 7px 13px; cursor: pointer;
+  transition: color var(--dur-micro) ease, border-color var(--dur-micro) ease;
 }
-.host b { color: var(--pp-accent-ink); font-weight: 700; }
+.host:hover { border-color: var(--pp-accent); color: var(--pp-text); }
+.host[aria-pressed="true"] { border-color: var(--pp-accent); color: var(--pp-accent-ink); }
+.hostcmd { margin-bottom: 28px; }
+.term-copy {
+  margin-left: auto; font-family: var(--font-body); font-weight: 600; font-size: 0.76rem;
+  padding: 4px 12px; cursor: pointer; color: var(--pp-term-text); background: transparent;
+  border: 1px solid var(--pp-term-border); border-radius: var(--radius-sm);
+  transition: border-color var(--dur-micro) ease;
+}
+.term-copy:hover { border-color: var(--pp-term-sky); }
 
 /* ── two-column "for you" ── */
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; }
@@ -796,13 +806,20 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     <div class="section-head reveal">
       <div class="kicker">one server, every agent host</div>
       <h2>it installs where your agent already lives.</h2>
-      <p>One command writes tilth into a host&rsquo;s MCP config. Run it for the hosts you use.</p>
+      <p>One command writes tilth into a host&rsquo;s MCP config. Pick your host below to see it.</p>
     </div>
     <div class="reveal">
-      <div class="code" style="margin-bottom:28px"><span class="k">tilth</span> install claude-code      <span class="c"># ~/.claude.json</span>
-<span class="k">tilth</span> install claude-code <span class="hl">--edit</span> <span class="c"># + hash-anchored editing</span></div>
-      <div class="hosts">
-        <span class="host"><b>claude-code</b></span><span class="host">cursor</span><span class="host">windsurf</span><span class="host">vscode</span><span class="host">claude-desktop</span><span class="host">codex</span><span class="host">gemini</span><span class="host">opencode</span><span class="host">amp</span><span class="host">droid</span><span class="host">zed</span><span class="host">copilot-cli</span><span class="host">augment</span><span class="host">kiro</span><span class="host">cline</span><span class="host">roo-code</span><span class="host">trae</span><span class="host">qwen-code</span><span class="host">antigravity</span><span class="host">&plus; more</span>
+      <div class="term hostcmd">
+        <div class="term-bar">
+          <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
+          <span class="title">tilth &middot; install</span>
+          <button type="button" class="term-copy" id="hostCopy" aria-label="copy the install command">copy</button>
+        </div>
+<div class="term-body" id="hostCode" aria-live="polite"><span class="pr">$</span> <span class="cmd">tilth install <span data-h>claude-code</span></span>         <span class="dim"># <span data-path>~/.claude.json</span></span>
+<span class="pr">$</span> <span class="cmd">tilth install <span data-h>claude-code</span> <span class="sk">--edit</span></span>  <span class="dim"># + hash-anchored editing</span></div>
+      </div>
+      <div class="hosts" role="group" aria-label="agent hosts">
+        <button type="button" class="host" data-host="claude-code" data-path="~/.claude.json" aria-pressed="true">claude-code</button><button type="button" class="host" data-host="cursor" data-path="~/.cursor/mcp.json" aria-pressed="false">cursor</button><button type="button" class="host" data-host="windsurf" data-path="~/.codeium/windsurf/mcp_config.json" aria-pressed="false">windsurf</button><button type="button" class="host" data-host="vscode" data-path=".vscode/mcp.json, run from your project root" aria-pressed="false">vscode</button><button type="button" class="host" data-host="claude-desktop" data-path="claude_desktop_config.json (macOS, Windows)" aria-pressed="false">claude-desktop</button><button type="button" class="host" data-host="codex" data-path="~/.codex/config.toml" aria-pressed="false">codex</button><button type="button" class="host" data-host="gemini" data-path="~/.gemini/settings.json" aria-pressed="false">gemini</button><button type="button" class="host" data-host="opencode" data-path="~/.config/opencode/opencode.json" aria-pressed="false">opencode</button><button type="button" class="host" data-host="amp" data-path="~/.config/amp/settings.json" aria-pressed="false">amp</button><button type="button" class="host" data-host="droid" data-path="~/.factory/mcp.json" aria-pressed="false">droid</button><button type="button" class="host" data-host="zed" data-path="~/.config/zed/settings.json" aria-pressed="false">zed</button><button type="button" class="host" data-host="copilot-cli" data-path="~/.copilot/mcp-config.json" aria-pressed="false">copilot-cli</button><button type="button" class="host" data-host="augment" data-path="~/.augment/settings.json" aria-pressed="false">augment</button><button type="button" class="host" data-host="kiro" data-path="~/.kiro/settings/mcp.json" aria-pressed="false">kiro</button><button type="button" class="host" data-host="cline" data-path="VS Code globalStorage (extension)" aria-pressed="false">cline</button><button type="button" class="host" data-host="roo-code" data-path="VS Code globalStorage (extension)" aria-pressed="false">roo-code</button><button type="button" class="host" data-host="kilo-code" data-path="VS Code globalStorage (extension)" aria-pressed="false">kilo-code</button><button type="button" class="host" data-host="trae" data-path=".trae/mcp.json, run from your project root" aria-pressed="false">trae</button><button type="button" class="host" data-host="qwen-code" data-path="~/.qwen/settings.json" aria-pressed="false">qwen-code</button><button type="button" class="host" data-host="antigravity" data-path="~/.gemini/antigravity/mcp_config.json" aria-pressed="false">antigravity</button><button type="button" class="host" data-host="crush" data-path="~/.config/crush/crush.json" aria-pressed="false">crush</button><button type="button" class="host" data-host="pi" data-path="~/.pi/agent/mcp.json" aria-pressed="false">pi</button>
       </div>
       <p style="margin-top:20px; color:var(--pp-text-soft); font-size:0.95rem">Smaller models sometimes prefer their built-in tools. Run with <code>--disallowedTools "Bash,Grep,Glob"</code> to make tilth the only way through. You can also call the CLI straight from bash, and the agent prompt lives in <a href="https://github.com/jahala/tilth/blob/main/AGENTS.md">AGENTS.md</a>.</p>
     </div>
@@ -969,6 +986,25 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     var was = cb.textContent;
     cb.textContent = 'copied';
     setTimeout(function () { cb.textContent = was; }, 1400);
+  });
+
+  // hosts: pick one, see and copy its install command
+  var hostBtns = document.querySelectorAll('.host[data-host]');
+  var hostCode = document.getElementById('hostCode');
+  hostBtns.forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      hostBtns.forEach(function (b) { b.setAttribute('aria-pressed', b === btn ? 'true' : 'false'); });
+      hostCode.querySelectorAll('[data-h]').forEach(function (el) { el.textContent = btn.getAttribute('data-host'); });
+      hostCode.querySelector('[data-path]').textContent = btn.getAttribute('data-path');
+    });
+  });
+  var hc = document.getElementById('hostCopy');
+  hc && hc.addEventListener('click', function () {
+    var host = hostCode.querySelector('[data-h]').textContent;
+    navigator.clipboard && navigator.clipboard.writeText('tilth install ' + host);
+    var was = hc.textContent;
+    hc.textContent = 'copied';
+    setTimeout(function () { hc.textContent = was; }, 1400);
   });
 
   // entrances — things unfold (reduced-motion handled in CSS + here)
