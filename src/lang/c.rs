@@ -22,5 +22,6 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     strip_family: Some(StripFamily::CppC),
     extract_receiver: None,
     callee_filter: None,
+    test_site: None,
     definitions: DEFAULT_DEFS,
 };

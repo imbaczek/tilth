@@ -6,6 +6,8 @@
 //! definition-name extraction and weight) lives once as `DEFAULT_*` items; only
 //! the languages that diverge carry their own values.
 
+use std::path::Path;
+
 use tree_sitter_language::LanguageFn;
 
 use crate::lang::treesitter::{
@@ -13,6 +15,10 @@ use crate::lang::treesitter::{
     extract_definition_name as default_extract_definition_name, DEFINITION_KINDS,
 };
 use crate::types::Lang;
+
+/// Signature of [`LangSpec::test_site`]: the captured node, the file's bytes,
+/// the file's path, and the search scope that path is judged relative to.
+pub(crate) type TestSiteFn = fn(&tree_sitter::Node, &[u8], &Path, &Path) -> bool;
 
 /// All per-language data and behavior in one record. Read via `spec(lang)`.
 pub(crate) struct LangSpec {
@@ -45,6 +51,11 @@ pub(crate) struct LangSpec {
     /// Rust-only: reject a `@callee` capture that `callee_query` matched too
     /// loosely. Consumers of the capture apply it when present.
     pub callee_filter: Option<fn(&tree_sitter::Node) -> bool>,
+    /// Rust-only: whether a call site is test code by a signal only the source
+    /// carries — a `#[test]` function, a `#[cfg(test)]` module, or a file under
+    /// a `tests` directory. Languages whose tests `is_test_file` recognises
+    /// from the filename alone leave this `None`.
+    pub test_site: Option<TestSiteFn>,
     /// Definition-name extraction + weight (Elixir overrides the defaults).
     pub definitions: DefinitionOps,
 }
@@ -269,6 +280,19 @@ mod tests {
                 matches!(lang, Lang::Rust),
                 "{lang:?} callee-filter presence mismatch — only Rust's callee \
                  query has a pattern loose enough to need one"
+            );
+        }
+    }
+
+    #[test]
+    fn only_rust_detects_test_sites() {
+        for &lang in mod_all_langs_for_test() {
+            assert_eq!(
+                spec(lang).test_site.is_some(),
+                matches!(lang, Lang::Rust),
+                "{lang:?} test-site detector presence mismatch — only Rust marks \
+                 test code by attribute and `tests/` directory rather than by \
+                 the filename conventions `is_test_file` knows"
             );
         }
     }
