@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tilth — smart code reading for humans and AI agents</title>
+<title>tilth · smart code reading for humans and AI agents</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%231C1610'/><g stroke-linecap='round'><line x1='8' y1='9' x2='24' y2='9' stroke='%23403628' stroke-width='1.7'/><line x1='11' y1='15' x2='23' y2='15' stroke='%234E88A6' stroke-width='2.6'/><line x1='11' y1='20' x2='19' y2='20' stroke='%23403628' stroke-width='1.7'/><line x1='8' y1='25' x2='22' y2='25' stroke='%23403628' stroke-width='1.7'/></g><circle cx='8' cy='9' r='1.8' fill='%239A8C72'/><circle cx='11' cy='15' r='2.6' fill='%234E88A6'/></svg>">
-<meta name="description" content="tilth gives ripgrep, tree-sitter, and cat a shared brain: token-aware outlines, definition-first search, callers, blast-radius deps, and structural diff. Structural awareness in one call — and 40% less cost per correct answer across models.">
+<meta name="description" content="tilth parses your code with tree-sitter and answers what text search can't: where a symbol is defined, who calls it, what it calls, what depends on a file, and what changed at function level. One binary, no index, MCP server and CLI.">
 
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -47,6 +47,8 @@
   --pp-pleach: #97539B;
   --pp-umbel:  #E89227;
   --pp-copeca: #1F8A7B;
+  --pp-pollen: #C8B330;
+  --pp-weeder: #8E3B5E;
 
   /* soil-night terminal — colors.md */
   --pp-term-bg:      #1C1610;
@@ -126,7 +128,7 @@ h1 em, h2 em { font-style: italic; font-weight: inherit; color: var(--pp-accent-
 p { margin: 0; }
 a { color: var(--pp-primary); text-decoration: none; }
 a:hover { color: var(--pp-primary-deep); }
-code { font-family: var(--font-code); font-size: 0.9em; }
+code { font-family: var(--font-code); font-size: 0.9em; font-variant-ligatures: none; }
 
 .container { max-width: var(--container); margin: 0 auto; padding: 0 var(--gutter); }
 section { padding: 112px 0; }
@@ -205,7 +207,7 @@ header.nav {
 .term-bar .dot.y { background: var(--pp-caution); }
 .term-bar .dot.g { background: var(--pp-healthy); }
 .term-bar .title { margin-left: 8px; color: var(--pp-term-soft); font-size: 0.76rem; letter-spacing: 0.04em; }
-.term-body { padding: 18px 18px 20px; color: var(--pp-term-text); white-space: pre-wrap; }
+.term-body { padding: 18px 18px 20px; color: var(--pp-term-text); white-space: pre-wrap; font-variant-ligatures: none; }
 .term-body .pr  { color: var(--pp-term-sun); }
 .term-body .cmd { color: var(--pp-term-text); }
 .term-body .ok  { color: var(--pp-term-green); }
@@ -253,24 +255,20 @@ header.nav {
 .beat .verbname .seq { color: var(--pp-muted); font-weight: 400; font-size: 1rem; }
 .beat p { color: var(--pp-text-soft); font-size: 0.95rem; margin-top: 12px; }
 
-/* ── benchmark table ── */
-.bench-wrap {
-  background: var(--pp-surface); border: 1px solid var(--pp-border);
-  border-left: 3px solid var(--pp-accent); border-radius: var(--radius-lg);
-  padding: 8px 4px; margin-top: 40px; overflow-x: auto;
+/* ── the questions: text left, real output right ── */
+.qa { display: grid; gap: 0; }
+.qa-row {
+  display: grid; grid-template-columns: 0.65fr 1.55fr; gap: 36px; align-items: start;
+  border-top: 1px solid var(--pp-border); padding: 36px 0;
 }
-.bench { width: 100%; border-collapse: collapse; font-size: 0.95rem; min-width: 560px; }
-.bench th, .bench td { text-align: right; padding: 16px 20px; }
-.bench th:first-child, .bench td:first-child { text-align: left; }
-.bench thead th {
-  font-family: var(--font-code); font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase;
-  color: var(--pp-accent-ink); font-weight: 700; border-bottom: 1px solid var(--pp-border);
-}
-.bench tbody td { border-bottom: 1px solid var(--pp-border); color: var(--pp-text-soft); font-family: var(--font-code); }
-.bench tbody td:first-child { color: var(--pp-text); font-family: var(--font-body); font-weight: 600; }
-.bench tbody tr:last-child td { border-bottom: none; font-weight: 700; color: var(--pp-text); }
-.bench .delta { color: var(--pp-accent-ink); font-weight: 700; }
-.bench-note { margin-top: 16px; font-size: 0.92rem; color: var(--pp-text-soft); }
+.qa-row:last-child { padding-bottom: 0; }
+@media (max-width: 880px) { .qa-row { grid-template-columns: 1fr; gap: 20px; } }
+.qa-row .num { font-family: var(--font-code); font-size: 0.8rem; color: var(--pp-accent-ink); font-weight: 500; }
+.qa-row h4 { margin: 8px 0 12px; }
+.qa-row p { color: var(--pp-text-soft); font-size: 0.98rem; }
+.qa-row .term { min-width: 0; font-size: 0.76rem; }
+.qa-row .term-body { white-space: pre; overflow-x: auto; }
+.qa-limits { margin-top: 36px; max-width: 66ch; font-size: 0.92rem; color: var(--pp-text-soft); }
 
 /* ── what's inside ── */
 .langs { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
@@ -284,7 +282,7 @@ header.nav {
 .speed th:first-child, .speed td:first-child { text-align: left; }
 .speed thead th { font-family: var(--font-code); font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--pp-accent-ink); }
 .speed td { color: var(--pp-text-soft); font-family: var(--font-code); }
-.speed td:first-child { color: var(--pp-text); font-family: var(--font-body); }
+.speed td:first-child { color: var(--pp-text); font-family: var(--font-body); white-space: nowrap; }
 
 /* ── decision table (how it decides) ── */
 .decide { width: 100%; border-collapse: collapse; font-size: 0.95rem; margin-top: 8px; }
@@ -351,6 +349,7 @@ header.nav {
 
 /* ── two-col layout (start section) ── */
 .face-layout { display: grid; grid-template-columns: 0.9fr 1.1fr; gap: 36px; align-items: start; }
+.face-layout > * { min-width: 0; }
 @media (max-width: 880px) { .face-layout { grid-template-columns: 1fr; gap: 24px; } }
 
 /* ── footer / garden ── */
@@ -422,7 +421,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     </a>
     <nav class="nav-links" aria-label="page sections">
       <a href="#why">the round-trip</a>
-      <a href="#bench">benchmarks</a>
+      <a href="#answers">the questions</a>
       <a href="#read">how it reads</a>
       <a href="#verbs">the verbs</a>
       <a href="#install">install</a>
@@ -445,7 +444,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     <div class="reveal">
       <div class="kicker">smart code reading &middot; for humans &amp; agents</div>
       <h1>give grep, tree-sitter, and cat a <em>shared brain</em>.</h1>
-      <p class="lede">tilth reads code the way an agent needs it: small files whole, large files as a structural outline, and every search resolved to where a symbol is <strong>defined</strong> &mdash; not just where the text appears. structural awareness in one call, not six.</p>
+      <p class="lede">tilth reads code the way an agent needs it. small files come back whole, large files as a structural outline, and every search leads to where a symbol is <strong>defined</strong>. it also answers what text search can&rsquo;t, such as who calls a function. structural awareness in one call.</p>
       <div class="hero-cta">
         <a class="btn btn-primary" href="#install">get tilth</a>
         <a class="btn btn-outline" href="https://github.com/jahala/tilth">view source</a>
@@ -506,19 +505,19 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       <div class="term">
         <div class="term-bar">
           <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-          <span class="title">tilth &mdash; search</span>
+          <span class="title">tilth &middot; callers</span>
         </div>
-<div class="term-body"><span class="pr">$</span> <span class="cmd">tilth handleAuth --scope src/</span>
-<span class="dim"># "handleAuth" in src/ &mdash; 6 matches (2 def, 4 usage)</span>
+<div class="term-body"><span class="pr">$</span> <span class="cmd">tilth isTrustedProxy --callers --scope .</span>
+<span class="dim"># Callers of "isTrustedProxy" in ~/gin &mdash; 5 call sites</span>
 
-<span class="ok">## src/auth.ts:44-89 </span><span class="sk">[definition]</span>
-<span class="dim">  [24-42]  fn validateToken(token)</span>
-<span class="hl">&rarr; [44-89]  export fn handleAuth(req, res, next)</span>
-<span class="dim">  [91-120] fn refreshSession(req, res)</span>
+<span class="ok">## context.go:1011 </span><span class="sk">[caller: ClientIP]</span>
+<span class="hl">-&gt; trusted = c.engine.isTrustedProxy(remoteIP)</span>
 
-<span class="sk">  &#9472;&#9472; calls &#9472;&#9472;</span>
-<span class="dim">  validateToken   src/auth.ts:24-42</span>
-<span class="dim">  refreshSession  src/auth.ts:91-120</span></div>
+<span class="ok">## context_test.go:3094 </span><span class="sk">[caller: TestRemoteIPFail]</span>
+<span class="hl">-&gt; trust := c.engine.isTrustedProxy(ip)</span>
+<span class="dim">...</span>
+<span class="ok">## gin.go:496 </span><span class="sk">[caller: validateHeader]</span>
+<span class="hl">-&gt; if (i == 0) || (!engine.isTrustedProxy(ip)) {</span></div>
       </div>
     </div>
 
@@ -531,13 +530,13 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     <div class="section-head reveal">
       <div class="kicker">the round-trip tax</div>
       <h2>an agent makes six calls to find <em>one</em> function.</h2>
-      <p class="lede">glob &rarr; read &rarr; &ldquo;too big&rdquo; &rarr; grep &rarr; read again &rarr; read another file. each round-trip burns tokens and inference time &mdash; to answer a question the file&rsquo;s own structure already knew.</p>
+      <p class="lede">glob &rarr; read &rarr; &ldquo;too big&rdquo; &rarr; grep &rarr; read again &rarr; read another file. six round-trips to answer a question the file&rsquo;s own structure already knew.</p>
     </div>
     <div class="grid grid-2 stagger">
       <div class="card">
         <div class="num">without tilth</div>
         <h4 style="margin-top:8px">built-in tools answer in fragments</h4>
-        <p>grep finds where a string appears, not where a symbol is defined. cat returns a whole file when you needed eight lines &mdash; or overflows the context window, so the agent re-greps and re-reads. structure is rediscovered on every call.</p>
+        <p>grep finds where a string appears. it cannot say where a symbol is defined. cat returns a whole file when you needed eight lines, or overflows the context window, so the agent greps and reads again. structure is rediscovered on every call.</p>
       </div>
       <div class="card">
         <div class="num">with tilth</div>
@@ -548,30 +547,115 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
   </div>
 </section>
 
-<!-- ═══ benchmarks ═══ -->
-<section id="bench">
+<!-- ═══ the questions ═══ -->
+<section id="answers">
   <div class="container">
     <div class="section-head reveal">
-      <div class="kicker">measured, not claimed</div>
-      <h2>&minus;40% cost per correct answer.</h2>
-      <p>code-navigation tasks across four real-world repositories &mdash; Express, FastAPI, Gin, ripgrep. baseline is Claude Code&rsquo;s built-in tools; tilth is those same tools plus the tilth MCP server. scored the honest way: dollars spent per correct answer, across 160 runs.</p>
+      <div class="kicker">computed from the syntax tree</div>
+      <h2>questions grep can&rsquo;t answer.</h2>
+      <p>grep finds where text appears. to learn who calls a function, an agent then has to read files and work it out, and that answer can be wrong without anyone noticing. tilth parses the code and computes the answer. everything below is real output from the FastAPI and Gin repositories, with <code>...</code> where lines are cut.</p>
     </div>
-    <div class="bench-wrap reveal">
-      <table class="bench" aria-label="Cost per correct answer: baseline vs tilth, by model">
-        <thead>
-          <tr>
-            <th>Model</th><th>Runs</th><th>Baseline $/correct</th><th>tilth $/correct</th><th>Change</th><th>Baseline acc</th><th>tilth acc</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr><td>Sonnet 4.6</td><td>86</td><td>$0.26</td><td>$0.15</td><td class="delta">&minus;44%</td><td>84%</td><td>94%</td></tr>
-          <tr><td>Opus 4.6</td><td>25</td><td>$0.22</td><td>$0.14</td><td class="delta">&minus;39%</td><td>91%</td><td>92%</td></tr>
-          <tr><td>Haiku 4.5</td><td>49</td><td>$0.12</td><td>$0.08</td><td class="delta">&minus;38%</td><td>54%</td><td>73%</td></tr>
-          <tr><td>Average</td><td>160</td><td>$0.20</td><td>$0.12</td><td class="delta">&minus;40%</td><td>76%</td><td>86%</td></tr>
-        </tbody>
-      </table>
+    <div class="qa reveal">
+
+      <div class="qa-row">
+        <div>
+          <div class="num">01</div>
+          <h4>where is it defined?</h4>
+          <p>Search uses the syntax tree to tell a definition from a mention, and lists definitions first. Each match sits among the symbols around it, so you know where you are without opening the file.</p>
+        </div>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">tilth &middot; search</span></div>
+<div class="term-body"><span class="pr">$</span> <span class="cmd">tilth get_typed_signature --scope fastapi</span>
+<span class="dim"># Search: "get_typed_signature" in fastapi &mdash; 2 matches (1 definitions, 1 usages)</span>
+
+<span class="ok">### dependencies/utils.py:218-232 </span><span class="sk">[definition]</span>
+<span class="dim">  [203-215]    fn _get_signature</span>
+<span class="dim">             def _get_signature(call: Callable[..., Any]) -&gt; inspect.Signature</span>
+<span class="hl">-&gt; [218-232]    fn get_typed_signature</span>
+<span class="dim">             def get_typed_signature(call: Callable[..., Any]) -&gt; inspect.Signature</span>
+<span class="dim">  [235-241]    fn get_typed_annotation</span>
+
+<span class="ok">### dependencies/utils.py:277 </span><span class="sk">[usage in function get_dependant]</span>
+<span class="dim">...</span></div>
+        </div>
+      </div>
+
+      <div class="qa-row">
+        <div>
+          <div class="num">02</div>
+          <h4>what does it call?</h4>
+          <p>An expanded definition ends with a <code style="white-space:nowrap">-- calls --</code> footer. It lists the functions the definition calls, and the ones those call, each with file, line range and signature. An agent can follow the chain without searching again.</p>
+        </div>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">tilth &middot; search --expand</span></div>
+<div class="term-body"><span class="pr">$</span> <span class="cmd">tilth ServeHTTP --scope . --glob '!*_test.go' --expand=1</span>
+<span class="dim">...</span>
+<span class="sk">-- calls --</span>
+<span class="dim">  updateRouteTrees  gin.go:517-521  func (engine *Engine) updateRouteTrees()</span>
+<span class="dim">    -&gt; updateRouteTree  gin.go:504-514  func updateRouteTree(n *node)</span>
+<span class="dim">  handleHTTPRequest  gin.go:690-760  func (engine *Engine) handleHTTPRequest(c *Context)</span>
+<span class="dim">    ...</span>
+<span class="dim">    -&gt; Next  context.go:188-196  func (c *Context) Next()</span>
+<span class="dim">    -&gt; Set  context.go:276-284  func (c *Context) Set(key any, value any)</span>
+<span class="dim">    -&gt; Header  context.go:1079-1085  func (c *Context) Header(key, value string)</span>
+<span class="dim">    ...</span>
+<span class="dim">  reset  context.go:103-118  func (c *Context) reset()</span>
+<span class="dim">  Get  context.go:288-293  func (c *Context) Get(key any) (value any, exists bool)</span></div>
+        </div>
+      </div>
+
+      <div class="qa-row">
+        <div>
+          <div class="num">03</div>
+          <h4>what depends on this file?</h4>
+          <p><code>--deps</code> shows what a file uses and what uses it, down to the function and the symbol. Read it before you rename or remove an export.</p>
+        </div>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">tilth &middot; deps</span></div>
+<div class="term-body"><span class="pr">$</span> <span class="cmd">tilth recovery.go --deps</span>
+<span class="dim"># Deps: recovery.go &mdash; 5 local, 0 external, 3 dependents</span>
+
+<span class="ok">## Uses (local)</span>
+<span class="dim">context.go                     Abort, AbortWithStatus, Error, Next</span>
+<span class="dim">debug.go                       IsDebugging</span>
+<span class="dim">fs.go                          Open</span>
+<span class="dim">gin.go                         New</span>
+<span class="dim">routergroup.go                 handle</span>
+
+<span class="ok">## Used by</span>
+<span class="dim">benchmarks_test.go:22          BenchmarkRecoveryMiddleware &rarr; Recovery</span>
+<span class="dim">benchmarks_test.go:36          BenchmarkManyHandlers &rarr; Recovery</span>
+<span class="dim">gin.go:239                     Default              &rarr; Recovery</span>
+<span class="dim">...</span></div>
+        </div>
+      </div>
+
+      <div class="qa-row">
+        <div>
+          <div class="num">04</div>
+          <h4>what changed?</h4>
+          <p>The diff is reported per function. It says what was added, what was removed, and whether a signature or only a body changed, so a review starts from the symbols that moved.</p>
+        </div>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="title">tilth &middot; diff</span></div>
+<div class="term-body"><span class="pr">$</span> <span class="cmd">tilth diff HEAD~1</span>
+<span class="dim"># Diff: HEAD~1 &mdash; 10 files, 10 modified, 9 added (~447 tokens)</span>
+<span class="dim">...</span>
+<span class="ok">## binding/bson.go (3 symbols)</span>
+<span class="hl">  [+]      Name                                     L16  (new, 3 lines)</span>
+<span class="hl">  [+]      Bind                                     L20  (new, 7 lines)</span>
+<span class="hl">  [+]      BindBody                                 L28  (new, 3 lines)</span>
+
+<span class="ok">## context.go (3 symbols)</span>
+<span class="dim">  [~]      &lt;const&gt;                                  L31  (body, 13&rarr;14 lines)</span>
+<span class="dim">  [~]      Negotiate                                L1357  (body, 30&rarr;34 lines)</span>
+<span class="hl">  [+]      BSON                                     L1242</span>
+<span class="dim">...</span></div>
+        </div>
+      </div>
+
     </div>
-    <p class="bench-note reveal">The metric is <strong>cost per correct answer</strong> &mdash; total spend divided by correct answers, the expected cost under retry. It is the same yardstick <a href="https://jahala.github.io/copeca/">copeca</a> applies across the garden: lower means it is cheaper to be right. Every model also finished in fewer turns &mdash; 25% fewer on average. Figures measured on v0.5.0. <a href="https://github.com/jahala/tilth/tree/main/benchmark">Full methodology &rarr;</a></p>
+    <p class="qa-limits reveal">tilth parses syntax and does not resolve types. Callers and dependencies are matched by name, so two functions with the same name in different modules look alike, and dynamic dispatch is out of reach.</p>
   </div>
 </section>
 
@@ -581,7 +665,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     <div class="section-head reveal">
       <div class="kicker">outline &middot; drill &middot; search &middot; follow</div>
       <h2>it shows you the shape first.</h2>
-      <p>tree-sitter parses the file into an abstract syntax tree, so tilth knows the difference between a definition and a mention. what it returns is decided by tokens, not lines &mdash; a 1-line minified bundle gets outlined; a 120-line focused module prints whole.</p>
+      <p>tree-sitter parses the file into an abstract syntax tree, so tilth knows the difference between a definition and a mention. what it returns is decided by token count. a 1-line minified bundle gets outlined, and a 120-line focused module prints whole.</p>
     </div>
     <div class="beats stagger reveal">
       <div class="beat">
@@ -597,12 +681,12 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       <div class="beat">
         <div class="step">step 03</div>
         <div class="verbname">search<span class="seq">&rarr;</span></div>
-        <p>Definitions first, then usages &mdash; structurally, not by string match. Each hit is shown inside its surrounding file structure, so you know what you found.</p>
+        <p>Definitions first, then usages, matched on the syntax tree. Each hit is shown inside its surrounding file structure, so you know what you found.</p>
       </div>
       <div class="beat">
         <div class="step">step 04</div>
         <div class="verbname">follow</div>
-        <p>An expanded definition carries a <code>&#9472;&#9472; calls &#9472;&#9472;</code> footer of resolved callees, with file and line. Follow the call chain without a fresh search for each one.</p>
+        <p>An expanded definition carries a <code style="white-space:nowrap">-- calls --</code> footer of resolved callees, with file and line. Follow the call chain without a fresh search for each one.</p>
       </div>
     </div>
     <div class="grid grid-2 reveal" style="margin-top:56px">
@@ -622,8 +706,8 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       <div class="card">
         <div class="num">in MCP mode</div>
         <h4 style="margin-top:8px">it remembers what the agent saw</h4>
-        <p>Definitions already expanded once come back as <code>[shown earlier]</code> on later searches, instead of repeating the whole body &mdash; so revisiting a symbol costs almost nothing in tokens. <code>expand</code> defaults to 2; no flag to remember.</p>
-        <p style="margin-top:14px">Install with <code>--edit</code> and tilth adds hash-anchored writing: each line carries a hash, and an edit is rejected if the file changed since you read it. No blind overwrite.</p>
+        <p>Definitions already expanded once come back as <code>[shown earlier]</code> on later searches, so the agent does not receive the same body twice. <code>expand</code> defaults to 2, so there is no flag to remember.</p>
+        <p style="margin-top:14px">Install with <code>--edit</code> and tilth adds hash-anchored writing: each line carries a hash, and an edit is rejected if the file changed since you read it.</p>
       </div>
     </div>
   </div>
@@ -634,21 +718,21 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
   <div class="container">
     <div class="section-head reveal">
       <div class="kicker">one binary, the whole loop</div>
-      <h2>read, search, and navigate &mdash; structurally.</h2>
+      <h2>read, search, and navigate by structure.</h2>
       <p>The same engine behind the CLI is exposed as MCP tools, so an agent reaches for the right one without a wall of upfront instructions.</p>
     </div>
     <div class="verbs stagger reveal">
       <div class="verb">
         <span class="cmd">tilth &lt;symbol&gt; --scope</span>
-        <p>Definition-first search. Multi-symbol in one call &mdash; <code>"ServeHTTP, Next"</code> &mdash; each with its own block. <code>--expand</code> inlines source for the top matches.</p>
+        <p>Definition-first search. Several symbols fit in one call, such as <code>"ServeHTTP, Next"</code>, and each gets its own block. <code>--expand</code> inlines source for the top matches.</p>
       </div>
       <div class="verb">
         <span class="cmd">tilth &lt;symbol&gt; --callers</span>
-        <p>Every call site of a symbol, matched structurally with tree-sitter &mdash; not a text grep that trips on comments and strings.</p>
+        <p>Every call site of a symbol, matched on the syntax tree, so comments and strings that mention the name are left out.</p>
       </div>
       <div class="verb">
         <span class="cmd">tilth &lt;path&gt; --deps</span>
-        <p>Blast radius: what a file imports, and what depends on it &mdash; with the symbols each dependent uses. Read it before you rename an export.</p>
+        <p>What a file uses and what depends on it, with the symbols each dependent uses. Read it before you rename an export.</p>
       </div>
       <div class="verb">
         <span class="cmd">tilth grok &lt;symbol&gt;</span>
@@ -656,11 +740,11 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       </div>
       <div class="verb">
         <span class="cmd">tilth diff HEAD~1</span>
-        <p>Function-level structural diff &mdash; which symbols changed, added, or had their signature altered. Replaces <code>git diff</code> for an agent.</p>
+        <p>A function-level diff that shows which symbols were added, changed, or had their signature altered. It can stand in for <code>git diff</code> when an agent reviews a change.</p>
       </div>
       <div class="verb">
         <span class="cmd">tilth "/regex/" --scope</span>
-        <p>Content and glob search on ripgrep&rsquo;s own engine, with early termination &mdash; roughly constant time whether the tree is 30 files or 1,000.</p>
+        <p>Content and glob search on ripgrep&rsquo;s own engine. When results are cut, the header says how many matches there are in total.</p>
       </div>
     </div>
   </div>
@@ -670,36 +754,37 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
 <section class="band" id="inside">
   <div class="container">
     <div class="section-head reveal">
-      <div class="kicker">Rust &middot; ~20,000 lines &middot; no runtime dependencies</div>
+      <div class="kicker">Rust &middot; ~35,000 lines &middot; no runtime dependencies</div>
       <h2>fast enough to sit in the loop.</h2>
-      <p>tilth is one binary with nothing to install behind it. Search runs definitions and usages in parallel; reads are memory-mapped; the codebase walk uses SIMD pre-filtering to skip files quickly.</p>
+      <p>tilth is one binary with nothing to install behind it. Definitions and usages are searched in parallel, reads are memory-mapped, and the codebase walk pre-filters files with SIMD so most are skipped quickly.</p>
     </div>
     <div class="grid grid-3 stagger reveal">
       <div class="card">
-        <div class="num">16 languages</div>
+        <div class="num">17 languages</div>
         <h4 style="margin-top:8px">AST-aware, via tree-sitter</h4>
-        <p>Definition detection, callee extraction, callers, and outlines &mdash; all structural, across:</p>
+        <p>Definitions, callees, callers and outlines, all from the syntax tree, across:</p>
         <div class="langs" style="margin-top:16px">
-          <span class="lang">Rust</span><span class="lang">TypeScript</span><span class="lang">TSX</span><span class="lang">JavaScript</span><span class="lang">Python</span><span class="lang">Go</span><span class="lang">Java</span><span class="lang">Scala</span><span class="lang">C</span><span class="lang">C++</span><span class="lang">Ruby</span><span class="lang">PHP</span><span class="lang">C#</span><span class="lang">Swift</span><span class="lang">Kotlin</span><span class="lang">Elixir</span>
+          <span class="lang">Rust</span><span class="lang">TypeScript</span><span class="lang">TSX</span><span class="lang">JavaScript</span><span class="lang">Python</span><span class="lang">Go</span><span class="lang">Java</span><span class="lang">Scala</span><span class="lang">C</span><span class="lang">C++</span><span class="lang">Ruby</span><span class="lang">PHP</span><span class="lang">C#</span><span class="lang">Swift</span><span class="lang">Kotlin</span><span class="lang">Elixir</span><span class="lang">Bash</span>
         </div>
       </div>
       <div class="card">
-        <div class="num">constant-time search</div>
-        <h4 style="margin-top:8px">it does not slow down with the repo</h4>
+        <div class="num">measured on real repositories</div>
+        <h4 style="margin-top:8px">milliseconds per call</h4>
         <table class="speed">
-          <thead><tr><th>operation</th><th>~30</th><th>~1000</th></tr></thead>
+          <thead><tr><th>operation</th><th>gin</th><th>fastapi</th></tr></thead>
           <tbody>
-            <tr><td>file read + detect</td><td>~18ms</td><td>~18ms</td></tr>
-            <tr><td>symbol search</td><td>~27ms</td><td>~27ms</td></tr>
-            <tr><td>codebase map</td><td>~21ms</td><td>~240ms</td></tr>
+            <tr><td>file read</td><td>3ms</td><td>3ms</td></tr>
+            <tr><td>callers</td><td>13ms</td><td>64ms</td></tr>
+            <tr><td>symbol search</td><td>20ms</td><td>77ms</td></tr>
+            <tr><td>codebase map</td><td>52ms</td><td>184ms</td></tr>
           </tbody>
         </table>
-        <p style="margin-top:12px; font-size:0.88rem">Search, content, and glob use early termination. MCP mode pays the ~17ms startup once.</p>
+        <p style="margin-top:12px; font-size:0.88rem">Gin has 130 files and FastAPI has 2,700. Median of 15 runs on an Apple M5 Pro, process startup included. Search walks the whole tree, so time grows with the repository. MCP mode pays startup once.</p>
       </div>
       <div class="card">
         <div class="num">built on the good parts</div>
         <h4 style="margin-top:8px">ripgrep&rsquo;s engine, tree-sitter&rsquo;s parser</h4>
-        <p>Content search runs on ripgrep&rsquo;s own <code>grep-regex</code> and <code>grep-searcher</code>; the directory walk on the <code>ignore</code> crate; reads through <code>memmap2</code>; the outline cache on <code>DashMap</code>, invalidated by mtime. No reinvented wheels.</p>
+        <p>Content search runs on ripgrep&rsquo;s own <code>grep-regex</code> and <code>grep-searcher</code>. The <code>ignore</code> crate walks directories, <code>memmap2</code> reads files, and <code>DashMap</code> holds the outline cache, which is invalidated by mtime.</p>
       </div>
     </div>
   </div>
@@ -711,7 +796,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     <div class="section-head reveal">
       <div class="kicker">one server, every agent host</div>
       <h2>it installs where your agent already lives.</h2>
-      <p>One command wires tilth into a host&rsquo;s MCP config. A host you do not use is simply one you never run.</p>
+      <p>One command writes tilth into a host&rsquo;s MCP config. Run it for the hosts you use.</p>
     </div>
     <div class="reveal">
       <div class="code" style="margin-bottom:28px"><span class="k">tilth</span> install claude-code      <span class="c"># ~/.claude.json</span>
@@ -719,7 +804,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       <div class="hosts">
         <span class="host"><b>claude-code</b></span><span class="host">cursor</span><span class="host">windsurf</span><span class="host">vscode</span><span class="host">claude-desktop</span><span class="host">codex</span><span class="host">gemini</span><span class="host">opencode</span><span class="host">amp</span><span class="host">droid</span><span class="host">zed</span><span class="host">copilot-cli</span><span class="host">augment</span><span class="host">kiro</span><span class="host">cline</span><span class="host">roo-code</span><span class="host">trae</span><span class="host">qwen-code</span><span class="host">antigravity</span><span class="host">&plus; more</span>
       </div>
-      <p style="margin-top:20px; color:var(--pp-text-soft); font-size:0.95rem">Smaller models sometimes prefer their built-in tools &mdash; run with <code>--disallowedTools "Bash,Grep,Glob"</code> to make tilth the only way through. Or call the CLI straight from bash; the agent prompt lives in <a href="https://github.com/jahala/tilth/blob/main/AGENTS.md">AGENTS.md</a>.</p>
+      <p style="margin-top:20px; color:var(--pp-text-soft); font-size:0.95rem">Smaller models sometimes prefer their built-in tools. Run with <code>--disallowedTools "Bash,Grep,Glob"</code> to make tilth the only way through. You can also call the CLI straight from bash, and the agent prompt lives in <a href="https://github.com/jahala/tilth/blob/main/AGENTS.md">AGENTS.md</a>.</p>
     </div>
   </div>
 </section>
@@ -728,26 +813,27 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
 <section class="band" id="fit">
   <div class="container">
     <div class="section-head reveal">
-      <div class="kicker">the honest answer</div>
+      <div class="kicker">a plain answer</div>
       <h2>is tilth for you?</h2>
-      <p>tilth earns its place when something reads code often and pays for every token &mdash; which is most agents, and plenty of humans. So:</p>
+      <p>tilth earns its place when something reads a lot of code and needs to get the structure right. That is most agents, and plenty of humans.</p>
     </div>
     <div class="split reveal">
       <div class="yes">
-        <h3>reach for tilth when <span class="tag" style="color:var(--pp-primary)">&mdash; a fit</span></h3>
+        <h3>reach for tilth when <span class="tag" style="color:var(--pp-primary)">&middot; a fit</span></h3>
         <ul>
-          <li>an AI agent navigates your code and the token bill shows it</li>
+          <li>an AI agent navigates your code, and you want its answers computed from the syntax tree</li>
           <li>the repo is large, unfamiliar, or spans several languages</li>
-          <li>you want definitions and call chains, not string matches</li>
-          <li>you measure a tool by its cost per correct answer</li>
+          <li>you need definitions and call chains, and grep only gives you string matches</li>
+          <li>your agent&rsquo;s built-in search is weak or missing</li>
         </ul>
       </div>
       <div class="no">
-        <h3>less to gain when <span class="tag" style="color:var(--pp-muted)">&mdash; maybe not</span></h3>
+        <h3>less to gain when <span class="tag" style="color:var(--pp-muted)">&middot; maybe not</span></h3>
         <ul>
           <li>it&rsquo;s one small script you already hold in your head</li>
-          <li>nothing automated ever reads the code &mdash; only you, occasionally</li>
-          <li>your language isn&rsquo;t among the sixteen tree-sitter grammars</li>
+          <li>only you read the code, and only occasionally</li>
+          <li>your language isn&rsquo;t among the 17 tree-sitter grammars</li>
+          <li>you need type-aware answers, since tilth matches callers by name and does not resolve types</li>
         </ul>
       </div>
     </div>
@@ -789,7 +875,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
           </div>
           <div class="status-cell">
             <div class="label">languages</div>
-            <div class="val">16 <small>tree-sitter</small></div>
+            <div class="val">17 <small>tree-sitter</small></div>
           </div>
           <div class="status-cell">
             <div class="label">runtime deps</div>
@@ -826,7 +912,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
     <div class="foot-grid">
       <div class="reveal">
         <h4>tilth</h4>
-        <p class="foot-soft">smart code reading for humans and AI agents. Token-aware outlines, definition-first search, callers, blast-radius deps, and structural diff &mdash; structural awareness in one call.</p>
+        <p class="foot-soft">smart code reading for humans and AI agents. Token-aware outlines, definition-first search, callers, blast-radius deps, and structural diff. structural awareness in one call.</p>
         <p class="foot-soft" style="margin-top:16px">
           <a href="https://github.com/jahala/tilth">github &rarr;</a>
           &nbsp; MIT licensed &nbsp;&middot;&nbsp;
@@ -842,13 +928,15 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
           <a href="https://jahala.github.io/pleach/"><span class="dot" style="background:var(--pp-pleach)"></span>pleach</a>
           <a href="https://jahala.github.io/umbel/"><span class="dot" style="background:var(--pp-umbel)"></span>umbel</a>
           <a href="https://jahala.github.io/copeca/"><span class="dot" style="background:var(--pp-copeca)"></span>copeca</a>
+          <a href="https://jahala.github.io/pollen/"><span class="dot" style="background:var(--pp-pollen)"></span>pollen</a>
+          <a href="https://jahala.github.io/weeder/"><span class="dot" style="background:var(--pp-weeder)"></span>weeder</a>
         </nav>
         <p class="foot-soft" style="margin-top:16px">small, sharp tools for building with agents.</p>
       </div>
       <div class="reveal">
         <h4>nearby</h4>
         <p class="foot-soft">
-          <a href="https://jahala.github.io/copeca/">copeca</a> &mdash; cost per correct answer. tilth&rsquo;s &minus;40% is a copeca number: same metric, same yardstick.
+          <a href="https://jahala.github.io/copeca/">copeca</a> measures cost per correct answer for agent tools.
         </p>
         <p class="foot-soft" style="margin-top:16px">
           <a href="https://buymeacoffee.com/jahala">buy me a coffee &rarr;</a>

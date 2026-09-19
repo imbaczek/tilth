@@ -5,7 +5,7 @@
 #   - cargo  (root Cargo.toml, the main crate)
 #   - npm    (npm/package.json, the download-proxy wrapper)
 #   - github-actions (workflow action versions)
-# Python under benchmark/ is CI-helper evaluation code — no top-level manifest, so skipped.
+# Python under scripts/ uses the standard library only, so there is no manifest to track.
 version: 2
 updates:
   - package-ecosystem: github-actions
