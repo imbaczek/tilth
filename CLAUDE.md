@@ -71,7 +71,7 @@ src/
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
   edit.rs              Hash-anchored editing (tilth_write hash mode). Hashline verification + atomic apply.
   edit_parse_check.rs  Post-edit tree-sitter parse check — diffs pre/post ERROR/MISSING nodes so tilth_write reports only errors the edit introduced.
-  install.rs           `tilth install <host>` — writes MCP config for 6 hosts.
+  install.rs           `tilth install <host>` — writes MCP config for 22 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
   map.rs               Codebase map generation (CLI only, disabled as MCP tool).
@@ -81,7 +81,7 @@ src/
   types.rs             Shared types (QueryType, Lang, OutlineEntry, etc.).
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
-benchmark/             Evaluation harness (see Benchmarks section below).
+scripts/fixtures/      setup_repos.py clones four real-world repos at pinned commits (README examples, speed table, parity checks).
 prompts/               MCP server instruction source (mcp-base.md + mcp-edit.md). Embedded into the binary at compile time and regenerated into AGENTS.md.
 AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/*.md via scripts/regen-agents-md.sh — do not edit directly.
 ```
@@ -109,48 +109,6 @@ Update version in **both** `Cargo.toml` and `npm/package.json`. Tag with `v<vers
 
 Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both names have an OIDC trusted publisher on npmjs.com (`jahala/tilth` + `release.yml`), so releases need no token. `@plotplot/tilth` was bootstrapped with a one-time manual publish — npm cannot configure trusted publishing for a package that does not exist yet.
 
-## Benchmarks
-
-26 code navigation tasks across 4 repos (Express/JS, FastAPI/Python, Gin/Go, ripgrep/Rust). Each task runs headless `claude -p` with a question, checks answer against ground-truth strings.
-
-**Setup** (one-time — clones repos at pinned commits):
-
-```bash
-python benchmark/fixtures/setup.py
-```
-
-**Run** (from project root — works inside Conductor/Claude Code sessions, `run.py` strips `CLAUDECODE` env var):
-
-```bash
-# Full suite: all tasks, baseline + tilth, 3 reps per task
-python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all
-
-# Specific tasks
-python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_trait_implementors --modes tilth
-
-# Models: sonnet, opus, haiku, gpt5, o3
-# Modes: baseline (built-in tools), tilth (built-in + tilth MCP), tilth_forced (tilth MCP only)
-# Tasks: all, or comma-separated names from benchmark/tasks/*.py
-```
-
-Hard tasks take 2-5 min each. Run in background for multi-task suites. Do NOT pipe output through `head` or similar — it breaks the pipe and causes timeouts.
-
-**Analyze**:
-
-```bash
-python benchmark/analyze.py benchmark/results/benchmark_<timestamp>_<model>.jsonl
-python benchmark/compare_versions.py old.jsonl new.jsonl
-
-# Quick check of a results file:
-jq -r '[.task, (.correct|tostring), (.total_cost_usd|tostring), (.tool_calls.tilth_search // 0 | tostring)] | join("\t")' benchmark/results/<file>.jsonl
-```
-
-Results written to `benchmark/results/benchmark_<timestamp>_<model>.jsonl`. Each line is JSON with: `task`, `mode`, `model`, `correct`, `total_cost_usd`, `num_turns`, `tool_calls` (map of tool name → count), `tool_sequence`, `tilth_version`, `duration_ms`, token counts.
-
-Key metric: **cost per correct answer** = total_spend / correct_count. This is the expected cost under retry (geometric model: `avg_cost / accuracy`).
-
-Task definitions are in `benchmark/tasks/*.py`. Each has `name`, `prompt`, `ground_truth` (required strings), `repo`, and difficulty tier. Hard tasks for testing instruction changes: `rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`.
-
 ## MCP instructions
 
 Server instructions sent via MCP protocol live in `prompts/`:
@@ -166,4 +124,4 @@ Changes to MCP instructions must be surgical — no bloat. Haiku is sensitive to
 - Framing ("DO NOT" works better than "IMPORTANT:" for weaker models)
 - Concrete examples (tool call patterns, not abstract descriptions)
 
-Test instruction changes with haiku benchmarks on hard tasks (`rg_search_dispatch`, `rg_trait_implementors`, `gin_servehttp_flow`).
+Validate instruction changes with a copeca A/B before shipping them. The in-repo benchmark harness was retired in September 2026 and is preserved under the `benchmark-archive` tag. tilth publishes no cost, accuracy or turn figures.

@@ -22,13 +22,6 @@ Thumbs.db
 __pycache__/
 *.pyc
 
-# Benchmark
-benchmark/fixtures/repo/
-benchmark/fixtures/repos/
-benchmark/results/*.jsonl
-benchmark/results/*.md
-!benchmark/results/.gitkeep
-
 # Brand (petals) — pulled from the plotplot umbrella, kept local (never committed)
 .petalsrc
 .brand/

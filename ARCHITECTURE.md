@@ -11,7 +11,7 @@ Tilth is a single Rust binary that exposes two surfaces: a CLI
 core: a query classifier, a tree-sitter-driven search engine, a smart
 file reader, and supporting subsystems for diff, edit, blast-radius
 analysis, and codebase mapping. There's also a Cargo workspace, an
-`install.rs` that writes MCP-host configs, a benchmark harness, and an
+`install.rs` that writes MCP-host configs, and an
 npm wrapper that fetches a prebuilt binary on `npm install`.
 
 The single most useful function for orienting yourself is
@@ -176,8 +176,8 @@ Tool dispatch is routed by name through `dispatch_tool` to
 `tool_session` / `tool_edit` (the last only in edit mode).
 `tilth_map` is no longer reachable through MCP — its schema is omitted
 from `tools/list` and the dispatch stub has been removed. The CLI
-still has `tilth --map`; the MCP boundary was retired after benchmark
-data showed structural maps hurt agent task success rates.
+still has `tilth --map`; the MCP boundary was retired after testing
+showed that agents overused structural maps.
 
 Concurrency: each `tools/call` spawns a worker thread, communicates via
 `mpsc::channel`, and waits with `recv_timeout`. The default per-tool
