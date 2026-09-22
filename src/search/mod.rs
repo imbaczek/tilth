@@ -21,6 +21,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::SystemTime;
 
 use ignore::WalkBuilder;
@@ -35,8 +36,8 @@ use crate::types::{estimate_tokens, FileType, Match, SearchResult};
 use crate::format::rel;
 
 // Directories that are always skipped — build artifacts, dependencies, VCS internals.
-// We skip these explicitly instead of relying on .gitignore so that locally-relevant
-// gitignored files (docs/, configs, generated code) are still searchable.
+// Keep this list even when ignore files are disabled; it covers common
+// high-volume directories that are rarely useful search targets.
 pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     ".jj",
@@ -80,22 +81,58 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
-/// Shared walker policy: searches ALL files except known junk directories.
-/// Does NOT respect .gitignore — ensures gitignored but locally-relevant files
-/// are found. Used by both the parallel search walker (`walker()`) and the
-/// sequential map walker (`crate::map::generate`), which each apply their own
-/// final `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
+const GITIGNORE_OVERRIDE_UNSET: u8 = 0;
+const GITIGNORE_OVERRIDE_DISABLED: u8 = 1;
+const GITIGNORE_OVERRIDE_ENABLED: u8 = 2;
+static GITIGNORE_OVERRIDE: AtomicU8 = AtomicU8::new(GITIGNORE_OVERRIDE_UNSET);
+
+fn gitignore_from_env() -> Option<bool> {
+    std::env::var("TILTH_RESPECT_GITIGNORE").ok().map(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+pub(crate) fn gitignore_config() -> (bool, &'static str) {
+    match GITIGNORE_OVERRIDE.load(Ordering::Relaxed) {
+        GITIGNORE_OVERRIDE_DISABLED => (false, "runtime"),
+        GITIGNORE_OVERRIDE_ENABLED => (true, "runtime"),
+        _ => gitignore_from_env().map_or((false, "default"), |enabled| (enabled, "environment")),
+    }
+}
+
+pub(crate) fn set_gitignore_config(value: Option<bool>) {
+    let value = match value {
+        Some(false) => GITIGNORE_OVERRIDE_DISABLED,
+        Some(true) => GITIGNORE_OVERRIDE_ENABLED,
+        None => GITIGNORE_OVERRIDE_UNSET,
+    };
+    GITIGNORE_OVERRIDE.store(value, Ordering::Relaxed);
+}
+
+/// Shared walker policy: searches files except known junk directories and
+/// `.tilthignore` entries. Gitignore-style files are opt-in.
+/// Used by both the parallel search walker (`walker()`) and the sequential map
+/// walker (`crate::map::generate`), which each apply their own final
+/// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
+    base_walk_builder_with_gitignore(scope, gitignore_config().0)
+}
+
+fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> WalkBuilder {
     let mut builder = WalkBuilder::new(scope);
     builder
         .follow_links(true)
         .same_file_system(true) // Stop at mount boundaries (NFS, external volumes).
         .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
+        .git_ignore(respect_gitignore)
+        .git_global(respect_gitignore)
+        .git_exclude(respect_gitignore)
+        .ignore(respect_gitignore)
+        .parents(true)
+        .add_custom_ignore_filename(".tilthignore")
         .filter_entry(|entry| {
             if entry.file_type().is_some_and(|ft| ft.is_dir()) {
                 if let Some(name) = entry.file_name().to_str() {
@@ -107,8 +144,8 @@ pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
     builder
 }
 
-/// Build a parallel directory walker that searches ALL files except known junk directories.
-/// Does NOT respect .gitignore — ensures gitignored but locally-relevant files are found.
+/// Build a parallel directory walker over `.tilthignore`-filtered files except
+/// known junk directories. Gitignore-style files are opt-in.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
     let threads = std::env::var("TILTH_THREADS")
@@ -1571,6 +1608,15 @@ mod tests {
     /// Collect all file paths from a walker into a sorted Vec.
     fn walk_paths(scope: &Path, glob: Option<&str>) -> Vec<PathBuf> {
         let w = walker(scope, glob).expect("walker failed");
+        collect_walk_paths(w)
+    }
+
+    fn walk_paths_with_gitignore(scope: &Path, respect_gitignore: bool) -> Vec<PathBuf> {
+        let w = base_walk_builder_with_gitignore(scope, respect_gitignore).build_parallel();
+        collect_walk_paths(w)
+    }
+
+    fn collect_walk_paths(w: ignore::WalkParallel) -> Vec<PathBuf> {
         let paths: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
         w.run(|| {
             let paths = &paths;
@@ -1605,6 +1651,122 @@ mod tests {
         let exts = extensions(&all);
         assert!(exts.contains("rs"), "expected .rs files, got {exts:?}");
         assert!(!all.is_empty());
+    }
+
+    #[test]
+    fn walker_ignores_gitignore_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("ignored").join("hidden.rs"),
+            "fn hidden() {}\n",
+        )
+        .unwrap();
+
+        let paths = walk_paths_with_gitignore(tmp.path(), false);
+        let rels: HashSet<String> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(tmp.path()).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            rels.contains("visible.rs"),
+            "non-ignored file should be walked: {rels:?}"
+        );
+        assert!(
+            rels.contains("ignored/hidden.rs"),
+            "gitignored file should be walked by default: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn walker_respects_tilthignore_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".tilthignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("ignored").join("hidden.rs"),
+            "fn hidden() {}\n",
+        )
+        .unwrap();
+
+        let paths = walk_paths_with_gitignore(tmp.path(), false);
+        let rels: HashSet<String> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(tmp.path()).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            rels.contains("visible.rs"),
+            "non-ignored file should be walked: {rels:?}"
+        );
+        assert!(
+            !rels.contains("ignored/hidden.rs"),
+            ".tilthignore file should not be walked: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn walker_respects_parent_tilthignore_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let ignored = src.join("ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(tmp.path().join(".tilthignore"), "src/ignored/\n").unwrap();
+        std::fs::write(src.join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(ignored.join("hidden.rs"), "fn hidden() {}\n").unwrap();
+
+        let paths = walk_paths_with_gitignore(&src, false);
+        let rels: HashSet<String> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(&src).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            rels.contains("visible.rs"),
+            "non-ignored file should be walked: {rels:?}"
+        );
+        assert!(
+            !rels.contains("ignored/hidden.rs"),
+            "parent .tilthignore file should not be walked: {rels:?}"
+        );
+    }
+
+    #[test]
+    fn walker_respects_gitignore_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
+        std::fs::write(
+            tmp.path().join("ignored").join("hidden.rs"),
+            "fn hidden() {}\n",
+        )
+        .unwrap();
+
+        let paths = walk_paths_with_gitignore(tmp.path(), true);
+        let rels: HashSet<String> = paths
+            .iter()
+            .filter_map(|p| p.strip_prefix(tmp.path()).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+
+        assert!(
+            rels.contains("visible.rs"),
+            "non-ignored file should be walked: {rels:?}"
+        );
+        assert!(
+            !rels.contains("ignored/hidden.rs"),
+            "gitignored file should not be walked when enabled: {rels:?}"
+        );
     }
 
     #[test]

@@ -20,6 +20,10 @@ struct Cli {
     #[arg(long, default_value = ".")]
     scope: PathBuf,
 
+    /// Respect .gitignore, .ignore, and Git exclude files while walking.
+    #[arg(long)]
+    respect_gitignore: bool,
+
     /// Line range or markdown heading (e.g. "45-89" or "## Architecture"). Bypasses smart view.
     #[arg(long)]
     section: Option<String>,
@@ -167,6 +171,10 @@ enum Command {
 fn main() {
     configure_thread_pools();
     let cli = Cli::parse();
+
+    if cli.respect_gitignore {
+        std::env::set_var("TILTH_RESPECT_GITIGNORE", "1");
+    }
 
     // Shell completions
     if let Some(shell) = cli.completions {
