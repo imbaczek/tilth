@@ -261,6 +261,26 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
+serde_json::json!({
+            "name": "tilth_config",
+            "annotations": { "readOnlyHint": false, "idempotentHint": true },
+            "description": "Read or update MCP runtime configuration. Gitignore handling persists for this server process and applies to search, list, map, callers, and other filesystem walks. .tilthignore and built-in junk-directory exclusions always remain active.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["get", "set", "reset"],
+                        "default": "get",
+                        "description": "get reports effective configuration; set applies supplied values; reset returns to startup environment/default behavior."
+                    },
+                    "respect_gitignore": {
+                        "type": "boolean",
+                        "description": "For action=set, enable or disable .gitignore, .ignore, and Git exclude rules."
+                    }
+                }
+            }
+        }),
     ];
 
     if edit_mode {
@@ -423,7 +443,7 @@ mod tests {
         }
     }
 
-    /// #195: tools that refuse a file scope say so in the schema; `tilth_diff`
+/// #195: tools that refuse a file scope say so in the schema; `tilth_diff`
     /// accepts either and says that instead.
     #[test]
     fn scope_descriptions_state_what_scope_accepts() {
@@ -467,6 +487,22 @@ mod tests {
                 !names.contains(&"tilth_savings"),
                 "tilth_savings must not be advertised (edit_mode={edit_mode})"
             );
+        }
+    }
+
+    #[test]
+    fn tilth_config_exposes_gitignore_runtime_setting() {
+        for edit_mode in [false, true] {
+            let defs = tool_definitions(edit_mode);
+            let config = defs
+                .iter()
+                .find(|tool| tool["name"] == "tilth_config")
+                .expect("tilth_config must be advertised in every MCP mode");
+            assert_eq!(
+                config["inputSchema"]["properties"]["respect_gitignore"]["type"],
+                "boolean"
+            );
+            assert_eq!(config["annotations"]["readOnlyHint"], false);
         }
     }
 }
