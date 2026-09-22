@@ -27,6 +27,7 @@ Outline format: `[<start>-<end>]  <symbol>`. Full/section format: `<line> │ <c
 
 ```bash
 tilth <symbol> --scope <dir>                # definitions + usages
+tilth <symbol> --scope src --scope tests    # search multiple scopes
 tilth "Foo,Bar,Baz" --scope <dir>           # multi-symbol (max 5)
 tilth <symbol> --expand                     # inline source for top 2 matches
 tilth <symbol> --expand=5                   # inline source for top 5
@@ -61,7 +62,7 @@ Output per match:
 ## Files
 
 ```bash
-tilth "*.test.ts" --scope <dir>   # glob (respects .gitignore)
+tilth "*.test.ts" --scope <dir>   # glob files (respects .gitignore)
 tilth --map --scope <dir>         # codebase skeleton with directory token rollups
 ```
 

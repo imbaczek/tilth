@@ -142,6 +142,48 @@ fn resolve_scope_at(
     Ok((resolved, None))
 }
 
+pub(super) fn resolve_scopes(
+    args: &Value,
+    root: Option<&std::path::Path>,
+) -> Result<(Vec<PathBuf>, Option<String>), String> {
+    if args.get("scope").is_some() && args.get("scopes").is_some() {
+        return Err("provide either \"scope\" or \"scopes\", not both".to_string());
+    }
+
+    let Some(scopes_value) = args.get("scopes") else {
+        let (scope, warning) = resolve_scope(args, root)?;
+        return Ok((vec![scope], warning));
+    };
+
+    let scopes = scopes_value
+        .as_array()
+        .ok_or("\"scopes\" must be an array of strings")?;
+    if scopes.is_empty() {
+        return Err("\"scopes\" must contain at least one scope".to_string());
+    }
+
+    let mut resolved = Vec::with_capacity(scopes.len());
+    let mut warning = String::new();
+    for scope in scopes {
+        let raw = scope
+            .as_str()
+            .ok_or("\"scopes\" must be an array of strings")?;
+        let scoped_args = serde_json::json!({ "scope": raw });
+        let (scope, scope_warning) = resolve_scope(&scoped_args, root)?;
+        resolved.push(scope);
+        if let Some(scope_warning) = scope_warning {
+            warning.push_str(&scope_warning);
+        }
+    }
+
+    let warning = if warning.is_empty() {
+        None
+    } else {
+        Some(warning)
+    };
+    Ok((resolved, warning))
+}
+
 /// Resolve a relative read path under the absolute-path discipline
 /// (`anchor_path`). Absolute paths are used as-is; a relative path requires an
 /// absolute `root`, otherwise it is unresolvable (the server cannot see the

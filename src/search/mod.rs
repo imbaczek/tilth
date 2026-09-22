@@ -7,6 +7,7 @@ pub mod deps;
 pub mod facets;
 pub mod glob;
 pub mod grok;
+pub mod merge;
 pub mod rank;
 pub mod siblings;
 pub mod strip;
@@ -323,6 +324,16 @@ pub fn search_symbol_raw(
     symbol::search(query, scope, None, glob, full)
 }
 
+/// Raw symbol search over several explicit scopes, merged before display caps.
+pub fn search_symbol_raw_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    merge::symbol_raw_scopes(query, scopes, None, glob, full)
+}
+
 /// Raw content search — returns structured result for programmatic inspection.
 pub fn search_content_raw(
     query: &str,
@@ -344,6 +355,44 @@ pub fn search_regex_raw(
     content::search(pattern, scope, true, None, glob, full)
 }
 
+fn search_content_raw_scopes_with_context(
+    query: &str,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    merge::content_raw_scopes(query, scopes, context, glob, full)
+}
+
+pub fn search_content_raw_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    search_content_raw_scopes_with_context(query, scopes, None, glob, full)
+}
+
+fn search_regex_raw_scopes_with_context(
+    pattern: &str,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    merge::regex_raw_scopes(pattern, scopes, context, glob, full)
+}
+
+pub fn search_regex_raw_scopes(
+    pattern: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full: bool,
+) -> Result<SearchResult, TilthError> {
+    search_regex_raw_scopes_with_context(pattern, scopes, None, glob, full)
+}
+
 /// Format a raw search result (symbol or content — both use the same pipeline).
 pub fn format_raw_result(
     result: &SearchResult,
@@ -351,6 +400,141 @@ pub fn format_raw_result(
 ) -> Result<String, TilthError> {
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(result, cache, None, &bloom, 0, None)
+}
+
+pub fn search_symbol_scopes_expanded(
+    query: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let result = merge::symbol_raw_scopes(query, scopes, context, glob, full)?;
+    format_search_result_scopes(&result, scopes, cache, Some(session), bloom, expand, budget)
+}
+
+pub fn search_multi_symbol_scopes_expanded(
+    queries: &[&str],
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let mut expand_remaining = if expand == 0 {
+        0
+    } else {
+        expand.max(queries.len())
+    };
+    let mut expanded_files = HashSet::new();
+    let mut sections = Vec::with_capacity(queries.len());
+
+    for query in queries {
+        let result = merge::symbol_raw_scopes(query, scopes, context, glob, full)?;
+        let mut out = search_header_for_scopes(&result, scopes);
+        let mut segments = Vec::new();
+        format_matches(
+            &result.matches,
+            &result.scope,
+            cache,
+            Some(session),
+            bloom,
+            &mut expand_remaining,
+            &mut expanded_files,
+            &mut out,
+            &mut segments,
+        );
+        if result.total_found > result.matches.len() {
+            let omitted = result.total_found - result.matches.len();
+            let _ = write!(
+                out,
+                "\n\n... and {omitted} more matches. Narrow with scopes."
+            );
+        }
+        let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+        sections.push(crate::search::alloc::fit_to_budget(
+            &out,
+            &segments,
+            budget_tokens,
+        ));
+    }
+    Ok(sections.join("\n\n---\n"))
+}
+
+pub fn search_content_scopes_expanded(
+    query: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let result = search_content_raw_scopes_with_context(query, scopes, context, glob, full)?;
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result_scopes(
+        &result,
+        scopes,
+        cache,
+        Some(session),
+        &bloom,
+        expand,
+        budget,
+    )
+}
+
+pub fn search_regex_scopes_expanded(
+    pattern: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    full: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let result = search_regex_raw_scopes_with_context(pattern, scopes, context, glob, full)?;
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result_scopes(
+        &result,
+        scopes,
+        cache,
+        Some(session),
+        &bloom,
+        expand,
+        budget,
+    )
+}
+
+fn search_header_for_scopes(result: &SearchResult, scopes: &[PathBuf]) -> String {
+    let scope_list = scopes
+        .iter()
+        .map(|scope| scope.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parts = match (result.definitions, result.usages) {
+        (0, _) => format!("{} matches", result.total_found),
+        (definitions, usages) => format!(
+            "{} matches ({definitions} definitions, {usages} usages)",
+            result.total_found
+        ),
+    };
+    format!(
+        "# Search: \"{}\" in scopes [{}] — {parts}",
+        result.query, scope_list
+    )
 }
 
 pub fn search_glob(pattern: &str, scope: &Path) -> Result<String, TilthError> {
@@ -378,6 +562,17 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
         let hidden = total - shown;
         let _ = write!(out, "\n\n... and {hidden} more {kind}. Narrow with scope.");
     }
+}
+
+fn hidden_beyond_facets(result: &SearchResult) -> usize {
+    let totals = &result.facet_totals;
+    result.total_found.saturating_sub(
+        totals.definitions
+            + totals.implementations
+            + totals.tests
+            + totals.usages_local
+            + totals.usages_cross,
+    )
 }
 
 /// Format match entries with optional expansion.
@@ -1036,13 +1231,42 @@ fn format_search_result(
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let header = format::search_header(
-        &result.query,
-        &result.scope,
-        result.matches.len(),
-        result.total_found,
-        result.definitions,
-        result.usages,
+    format_search_result_impl(result, None, cache, session, bloom, expand, budget)
+}
+
+fn format_search_result_scopes(
+    result: &SearchResult,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: Option<&Session>,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    format_search_result_impl(result, Some(scopes), cache, session, bloom, expand, budget)
+}
+
+fn format_search_result_impl(
+    result: &SearchResult,
+    searched_scopes: Option<&[PathBuf]>,
+    cache: &OutlineCache,
+    session: Option<&Session>,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let header = searched_scopes.map_or_else(
+        || {
+            format::search_header(
+                &result.query,
+                &result.scope,
+                result.matches.len(),
+                result.total_found,
+                result.definitions,
+                result.usages,
+            )
+        },
+        |scopes| search_header_for_scopes(result, scopes),
     );
     let mut out = header;
     let mut expand_remaining = expand;
@@ -1202,6 +1426,14 @@ fn format_search_result(
                 out,
                 "\n\n... and {omitted} more matches. Narrow with scope."
             );
+        } else {
+            let hidden = hidden_beyond_facets(result);
+            if hidden > 0 {
+                let _ = write!(
+                    out,
+                    "\n\n... and {hidden} additional matches beyond per-scope collection limits."
+                );
+            }
         }
     } else {
         // Linear display for ≤5 matches
@@ -1789,6 +2021,38 @@ mod tests {
     }
 
     #[test]
+    fn combined_symbol_search_ranks_definition_in_later_scope_before_earlier_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let earlier = tmp.path().join("earlier");
+        let later = tmp.path().join("later");
+        std::fs::create_dir_all(&earlier).unwrap();
+        std::fs::create_dir_all(&later).unwrap();
+        std::fs::write(
+            earlier.join("usage.rs"),
+            "fn first_scope_usage() {\n    target();\n}\n",
+        )
+        .unwrap();
+        std::fs::write(later.join("lib.rs"), "pub fn target() {}\n").unwrap();
+
+        let result = search_symbol_raw_scopes("target", &[earlier, later], None, false)
+            .expect("combined search failed");
+
+        assert_eq!(result.total_found, 2, "unexpected matches: {result:#?}");
+        assert_eq!(result.definitions, 1);
+        assert_eq!(result.usages, 1);
+        let first = result.matches.first().expect("missing first match");
+        assert!(
+            first.is_definition,
+            "later-scope definition should outrank earlier usage: {result:#?}"
+        );
+        assert!(
+            first.path.ends_with("later/lib.rs"),
+            "first match should come from later scope: {}",
+            first.path.display()
+        );
+    }
+
+    #[test]
     fn callers_search_glob_restricts_results() {
         let scope = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let bloom = crate::index::bloom::BloomFilterCache::new();
@@ -2211,6 +2475,61 @@ mod tests {
         assert_eq!(count_label(10, 14), "10/14");
         // Zero / zero — still bare (no header is emitted at zero anyway).
         assert_eq!(count_label(0, 0), "0");
+    }
+
+    #[test]
+    fn content_and_regex_hidden_counts_exclude_displayed_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        for count in [5usize, 6, 15] {
+            std::fs::write(tmp.path().join("data.txt"), "123\n".repeat(count)).unwrap();
+            for is_regex in [false, true] {
+                let result =
+                    content::search("123", tmp.path(), is_regex, None, None, false).unwrap();
+                assert_eq!(result.total_found, count);
+                assert_eq!(result.matches.len(), count.min(10));
+                assert_eq!(
+                    hidden_beyond_facets(&result),
+                    0,
+                    "is_regex={is_regex}, total={}, displayed={}, facets={:?}",
+                    result.total_found,
+                    result.matches.len(),
+                    result.facet_totals,
+                );
+                let output = format_raw_result(&result, &cache).unwrap();
+                if count > 10 {
+                    assert!(
+                        output.contains(format!("{} more usages", count - 10).as_str()),
+                        "{output}"
+                    );
+                    assert!(!output.contains("additional matches"), "{output}");
+                } else {
+                    assert!(
+                        !output.contains("more usages") && !output.contains("additional matches"),
+                        "{output}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hidden_beyond_facets_reports_uncategorized_collected_cap_hits() {
+        let result = SearchResult {
+            query: "target".to_string(),
+            scope: PathBuf::from("."),
+            matches: Vec::new(),
+            total_found: 120,
+            definitions: 0,
+            usages: 120,
+            facet_totals: crate::types::FacetTotals {
+                usages_local: 40,
+                usages_cross: 60,
+                ..Default::default()
+            },
+        };
+
+        assert_eq!(hidden_beyond_facets(&result), 20);
     }
 
     #[test]
@@ -2809,8 +3128,8 @@ mod tests {
             "header must disclose the display cap: {out}"
         );
         assert!(
-            out.contains("... and 5 more matches"),
-            "faceted content results must emit the global hidden tail: {out}"
+            out.contains("... and 5 more usages"),
+            "faceted content results must disclose the per-facet display cap: {out}"
         );
     }
     /// Two things the disclosure must get right on the SYMBOL path, which
