@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::SystemTime;
 
 use ignore::WalkBuilder;
@@ -81,13 +82,35 @@ const EXPAND_FULL_FILE_THRESHOLD: u64 = 800;
 /// section)" so the user knows to expand for the rest.
 const MARKDOWN_PREVIEW_MAX_LINES: usize = 40;
 
-fn respect_gitignore_from_env() -> bool {
-    std::env::var("TILTH_RESPECT_GITIGNORE").is_ok_and(|v| {
+const GITIGNORE_OVERRIDE_UNSET: u8 = 0;
+const GITIGNORE_OVERRIDE_DISABLED: u8 = 1;
+const GITIGNORE_OVERRIDE_ENABLED: u8 = 2;
+static GITIGNORE_OVERRIDE: AtomicU8 = AtomicU8::new(GITIGNORE_OVERRIDE_UNSET);
+
+fn gitignore_from_env() -> Option<bool> {
+    std::env::var("TILTH_RESPECT_GITIGNORE").ok().map(|v| {
         matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+pub(crate) fn gitignore_config() -> (bool, &'static str) {
+    match GITIGNORE_OVERRIDE.load(Ordering::Relaxed) {
+        GITIGNORE_OVERRIDE_DISABLED => (false, "runtime"),
+        GITIGNORE_OVERRIDE_ENABLED => (true, "runtime"),
+        _ => gitignore_from_env().map_or((false, "default"), |enabled| (enabled, "environment")),
+    }
+}
+
+pub(crate) fn set_gitignore_config(value: Option<bool>) {
+    let value = match value {
+        Some(false) => GITIGNORE_OVERRIDE_DISABLED,
+        Some(true) => GITIGNORE_OVERRIDE_ENABLED,
+        None => GITIGNORE_OVERRIDE_UNSET,
+    };
+    GITIGNORE_OVERRIDE.store(value, Ordering::Relaxed);
 }
 
 /// Shared walker policy: searches files except known junk directories and
@@ -96,7 +119,7 @@ fn respect_gitignore_from_env() -> bool {
 /// walker (`crate::map::generate`), which each apply their own final
 /// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
 pub(crate) fn base_walk_builder(scope: &Path) -> WalkBuilder {
-    base_walk_builder_with_gitignore(scope, respect_gitignore_from_env())
+    base_walk_builder_with_gitignore(scope, gitignore_config().0)
 }
 
 fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> WalkBuilder {
