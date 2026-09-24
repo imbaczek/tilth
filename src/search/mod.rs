@@ -131,22 +131,26 @@ fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> Wa
         .git_global(respect_gitignore)
         .git_exclude(respect_gitignore)
         .ignore(respect_gitignore)
+        .require_git(!respect_gitignore)
         .parents(true)
         .add_custom_ignore_filename(".tilthignore")
-        .filter_entry(|entry| {
-            if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-                if let Some(name) = entry.file_name().to_str() {
-                    return !SKIP_DIRS.contains(&name);
-                }
-            }
-            true
-        });
+        .filter_entry(include_entry);
     builder
+}
+
+fn include_entry(entry: &ignore::DirEntry) -> bool {
+    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+        if let Some(name) = entry.file_name().to_str() {
+            return !SKIP_DIRS.contains(&name);
+        }
+    }
+    true
 }
 
 /// Build a parallel directory walker over `.tilthignore`-filtered files except
 /// known junk directories. Gitignore-style files are opt-in.
-/// When `glob` is Some, applies a file-pattern override (whitelist or negation).
+/// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
+/// With gitignore enabled, the glob cannot override ignore rules.
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
     let threads = std::env::var("TILTH_THREADS")
         .ok()
@@ -155,7 +159,8 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    let mut builder = base_walk_builder(scope);
+    let respect_gitignore = gitignore_config().0;
+    let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
     builder.threads(threads);
 
     if let Some(pattern) = glob {
@@ -167,10 +172,24 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
                     query: pattern.to_string(),
                     reason: format!("invalid glob: {e}"),
                 })?;
-            builder.overrides(overrides.build().map_err(|e| TilthError::InvalidQuery {
+            let overrides = overrides.build().map_err(|e| TilthError::InvalidQuery {
                 query: pattern.to_string(),
                 reason: format!("invalid glob: {e}"),
-            })?);
+            })?;
+            if respect_gitignore {
+                // A glob narrows the walk without whitelisting ignored entries.
+                builder.filter_entry(move |entry| {
+                    include_entry(entry)
+                        && !overrides
+                            .matched(
+                                entry.path(),
+                                entry.file_type().is_some_and(|ft| ft.is_dir()),
+                            )
+                            .is_ignore()
+                });
+            } else {
+                builder.overrides(overrides);
+            }
         }
     }
 
