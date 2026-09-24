@@ -52,7 +52,7 @@ pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
 }
 
 /// Check if a match is in a test file or contains test markers.
-fn is_test_match(m: &Match) -> bool {
+pub(super) fn is_test_match(m: &Match) -> bool {
     // Path-based detection
     let path_str = m.path.to_string_lossy();
     if path_str.contains("_test.")
