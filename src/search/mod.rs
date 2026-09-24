@@ -402,6 +402,15 @@ pub fn format_raw_result(
     format_search_result(result, cache, None, &bloom, 0, None)
 }
 
+pub fn format_raw_result_scopes(
+    result: &SearchResult,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    let bloom = crate::index::bloom::BloomFilterCache::new();
+    format_search_result_scopes(result, scopes, cache, None, &bloom, 0, None)
+}
+
 pub fn search_symbol_scopes_expanded(
     query: &str,
     scopes: &[PathBuf],

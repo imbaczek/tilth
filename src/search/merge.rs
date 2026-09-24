@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::error::TilthError;
 use crate::types::{FacetTotals, Match, SearchResult};
@@ -39,8 +40,9 @@ pub fn content_raw_scopes(
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
+    let visited = Mutex::new(HashSet::new());
     combine_scoped_results(scopes, full, context, glob, |scope| {
-        content::search_collected(pattern, scope, is_regex, context, glob, true)
+        content::search_collected_scoped(pattern, scope, is_regex, context, glob, &visited)
     })
 }
 
@@ -51,8 +53,9 @@ pub fn regex_raw_scopes(
     glob: Option<&str>,
     full: bool,
 ) -> Result<SearchResult, TilthError> {
+    let visited = Mutex::new(HashSet::new());
     combine_scoped_results(scopes, full, context, glob, |scope| {
-        content::search_collected(pattern, scope, true, context, glob, true)
+        content::search_collected_scoped(pattern, scope, true, context, glob, &visited)
     })
 }
 
@@ -89,17 +92,41 @@ where
     let mut seen = HashSet::new();
     let mut first_err = None;
     let mut any_ok = false;
+    let mut total_found = 0;
+    let mut definitions = 0;
+    let mut uncollected_tests = 0;
+    let mut uncollected_usages_cross = 0;
 
     for scope in &scopes {
         match search(scope) {
             Ok(result) => {
                 any_ok = true;
+                // Content scopes count disjoint files before truncation; symbol
+                // scopes retain every observed hit, so duplicates are visible.
+                total_found += result.total_found;
+                definitions += result.definitions;
+                // Only content searches cap their collected rows. Their exact
+                // facets must retain hits absent from the rows merged below.
+                // Shared visited files make these withheld counts disjoint.
+                if result.total_found > result.matches.len() {
+                    let collected_tests = result
+                        .matches
+                        .iter()
+                        .filter(|m| facets::is_test_match(m))
+                        .count();
+                    uncollected_tests += result.facet_totals.tests - collected_tests;
+                    uncollected_usages_cross +=
+                        result.facet_totals.usages_cross - (result.matches.len() - collected_tests);
+                }
                 if query.is_empty() {
                     query = result.query;
                 }
                 for m in result.matches {
                     if seen.insert(match_identity(&m)) {
                         merged.push(m);
+                    } else {
+                        total_found -= 1;
+                        definitions -= usize::from(m.is_definition);
                     }
                 }
             }
@@ -124,8 +151,6 @@ where
         }
     });
 
-    let total_found = merged.len();
-    let definitions = merged.iter().filter(|m| m.is_definition).count();
     let usages = total_found - definitions;
     let facet_totals = {
         let snapshot = merged.clone();
@@ -133,9 +158,9 @@ where
         FacetTotals {
             definitions: f.definitions.len(),
             implementations: f.implementations.len(),
-            tests: f.tests.len(),
+            tests: f.tests.len() + uncollected_tests,
             usages_local: f.usages_local.len(),
-            usages_cross: f.usages_cross.len(),
+            usages_cross: f.usages_cross.len() + uncollected_usages_cross,
         }
     };
 

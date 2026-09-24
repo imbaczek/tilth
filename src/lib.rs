@@ -696,7 +696,7 @@ fn run_query_basic_scopes(
     match query_type {
         QueryType::Symbol(name) => {
             let result = search::search_symbol_raw_scopes(name, scopes, glob, false)?;
-            search::format_raw_result(&result, cache)
+            search::format_raw_result_scopes(&result, scopes, cache)
         }
         QueryType::Concept(text) if text.contains(' ') => {
             multi_word_concept_search_scopes(text, scopes, cache, glob)
@@ -704,11 +704,11 @@ fn run_query_basic_scopes(
         QueryType::Concept(text) => single_query_search_scopes(text, scopes, cache, true, glob),
         QueryType::Content(text) => {
             let result = search::search_content_raw_scopes(text, scopes, glob, false)?;
-            search::format_raw_result(&result, cache)
+            search::format_raw_result_scopes(&result, scopes, cache)
         }
         QueryType::Regex(pattern) => {
             let result = search::search_regex_raw_scopes(pattern, scopes, glob, false)?;
-            search::format_raw_result(&result, cache)
+            search::format_raw_result_scopes(&result, scopes, cache)
         }
         QueryType::Fallthrough(text) => {
             single_query_search_scopes(text, scopes, cache, false, glob)
@@ -774,16 +774,16 @@ fn single_query_search_scopes(
     };
 
     if accept_sym {
-        return search::format_raw_result(&sym_result, cache);
+        return search::format_raw_result_scopes(&sym_result, scopes, cache);
     }
 
     let content_result = search::search_content_raw_scopes(text, scopes, glob, false)?;
     if content_result.total_found > 0 {
-        return search::format_raw_result(&content_result, cache);
+        return search::format_raw_result_scopes(&content_result, scopes, cache);
     }
 
     if prefer_definitions && sym_result.total_found > 0 {
-        return search::format_raw_result(&sym_result, cache);
+        return search::format_raw_result_scopes(&sym_result, scopes, cache);
     }
 
     Err(error::TilthError::NotFound {
@@ -850,7 +850,7 @@ fn multi_word_concept_search_scopes(
     let mut content_result = search::search_content_raw_scopes(text, scopes, glob, false)?;
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
-        return search::format_raw_result(&content_result, cache);
+        return search::format_raw_result_scopes(&content_result, scopes, cache);
     }
 
     let words: Vec<&str> = text.split_whitespace().collect();
@@ -873,7 +873,7 @@ fn multi_word_concept_search_scopes(
     let mut relaxed_result = search::search_regex_raw_scopes(&relaxed, scopes, glob, false)?;
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
-        return search::format_raw_result(&relaxed_result, cache);
+        return search::format_raw_result_scopes(&relaxed_result, scopes, cache);
     }
 
     Err(error::TilthError::NotFound {

@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -65,6 +66,50 @@ fn search_capped(
     max_matches: usize,
     per_file_cap: usize,
 ) -> Result<SearchResult, TilthError> {
+    search_capped_with_visited(
+        pattern,
+        scope,
+        is_regex,
+        context,
+        glob,
+        max_matches,
+        per_file_cap,
+        None,
+    )
+}
+
+/// Search each physical file once across scopes, before counting or capping hits.
+pub(super) fn search_collected_scoped(
+    pattern: &str,
+    scope: &Path,
+    is_regex: bool,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    visited: &Mutex<HashSet<PathBuf>>,
+) -> Result<SearchResult, TilthError> {
+    let cap = FULL_MAX_MATCHES * COLLECTED_MATCH_FACTOR;
+    search_capped_with_visited(
+        pattern,
+        scope,
+        is_regex,
+        context,
+        glob,
+        cap,
+        cap,
+        Some(visited),
+    )
+}
+
+fn search_capped_with_visited(
+    pattern: &str,
+    scope: &Path,
+    is_regex: bool,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    max_matches: usize,
+    per_file_cap: usize,
+    visited: Option<&Mutex<HashSet<PathBuf>>>,
+) -> Result<SearchResult, TilthError> {
     let matcher = if is_regex {
         RegexMatcher::new(pattern)
     } else {
@@ -78,6 +123,7 @@ fn search_capped(
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
+    let tests_found = AtomicUsize::new(0);
 
     let walker = super::walker(scope, glob)?;
 
@@ -85,6 +131,7 @@ fn search_capped(
         let matcher = &matcher;
         let matches = &matches;
         let total_found = &total_found;
+        let tests_found = &tests_found;
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -134,6 +181,19 @@ fn search_capped(
 
             let (file_lines, mtime) = file_metadata(path);
 
+            // Deduplicate only files admitted by this scope's glob/ignore rules
+            // and the content filters above, before counting or capping hits.
+            if let Some(visited) = visited {
+                let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                if !visited
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(identity)
+                {
+                    return ignore::WalkState::Continue;
+                }
+            }
+
             let mut file_matches = Vec::new();
             let mut searcher = Searcher::new();
 
@@ -160,6 +220,13 @@ fn search_capped(
 
             if !file_matches.is_empty() {
                 total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
+                tests_found.fetch_add(
+                    file_matches
+                        .iter()
+                        .filter(|m| super::facets::is_test_match(m))
+                        .count(),
+                    Ordering::Relaxed,
+                );
                 // Carry only this file's own top `per_file_cap` forward. The
                 // global top-N is always a subset of the per-file top-Ns under
                 // the same comparator, so nothing displayed changes, while the
@@ -187,13 +254,15 @@ fn search_capped(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     rank::sort(&mut all_matches, pattern, scope, context);
-    let faceted = super::facets::facet_matches(all_matches.clone(), scope);
+    // Content matches have no primary definition, so every non-test usage is
+    // cross-package. Count both facets before either collection cap is applied.
+    let tests = tests_found.load(Ordering::Relaxed);
     let facet_totals = FacetTotals {
-        definitions: faceted.definitions.len(),
-        implementations: faceted.implementations.len(),
-        tests: faceted.tests.len(),
-        usages_local: faceted.usages_local.len(),
-        usages_cross: faceted.usages_cross.len(),
+        definitions: 0,
+        implementations: 0,
+        tests,
+        usages_local: 0,
+        usages_cross: total - tests,
     };
     all_matches.truncate(max_matches);
 
