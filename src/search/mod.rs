@@ -92,7 +92,7 @@ thread_local! {
 }
 
 pub(crate) fn call_gitignore_override() -> Option<bool> {
-    CALL_GITIGNORE_OVERRIDE.with(|current| current.get())
+    CALL_GITIGNORE_OVERRIDE.with(std::cell::Cell::get)
 }
 
 pub(crate) fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
@@ -117,7 +117,7 @@ fn gitignore_from_env() -> Option<bool> {
 }
 
 pub(crate) fn gitignore_config() -> (bool, &'static str) {
-    if let Some(value) = CALL_GITIGNORE_OVERRIDE.with(|current| current.get()) {
+    if let Some(value) = CALL_GITIGNORE_OVERRIDE.with(std::cell::Cell::get) {
         return (value, "call");
     }
 
