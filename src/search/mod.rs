@@ -1934,7 +1934,7 @@ mod tests {
     }
 
     #[test]
-    fn walker_ignores_gitignore_by_default() {
+    fn walker_gitignore_setting_controls_ignored_files() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir(tmp.path().join(".git")).unwrap();
         std::fs::create_dir(tmp.path().join("ignored")).unwrap();
@@ -1946,21 +1946,22 @@ mod tests {
         )
         .unwrap();
 
-        let paths = walk_paths_with_gitignore(tmp.path(), false);
-        let rels: HashSet<String> = paths
-            .iter()
-            .filter_map(|p| p.strip_prefix(tmp.path()).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-
-        assert!(
-            rels.contains("visible.rs"),
-            "non-ignored file should be walked: {rels:?}"
-        );
-        assert!(
-            rels.contains("ignored/hidden.rs"),
-            "gitignored file should be walked by default: {rels:?}"
-        );
+        for enabled in [false, true] {
+            let rels: HashSet<String> = walk_paths_with_gitignore(tmp.path(), enabled)
+                .iter()
+                .filter_map(|p| p.strip_prefix(tmp.path()).ok())
+                .map(|p| p.to_string_lossy().to_string())
+                .collect();
+            assert!(
+                rels.contains("visible.rs"),
+                "visible file missing: {rels:?}"
+            );
+            assert_eq!(
+                rels.contains("ignored/hidden.rs"),
+                !enabled,
+                "unexpected gitignore behavior with enabled={enabled}: {rels:?}"
+            );
+        }
     }
 
     #[test]
@@ -2016,36 +2017,6 @@ mod tests {
         assert!(
             !rels.contains("ignored/hidden.rs"),
             "parent .tilthignore file should not be walked: {rels:?}"
-        );
-    }
-
-    #[test]
-    fn walker_respects_gitignore_when_enabled() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join(".git")).unwrap();
-        std::fs::create_dir(tmp.path().join("ignored")).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "ignored/\n").unwrap();
-        std::fs::write(tmp.path().join("visible.rs"), "fn visible() {}\n").unwrap();
-        std::fs::write(
-            tmp.path().join("ignored").join("hidden.rs"),
-            "fn hidden() {}\n",
-        )
-        .unwrap();
-
-        let paths = walk_paths_with_gitignore(tmp.path(), true);
-        let rels: HashSet<String> = paths
-            .iter()
-            .filter_map(|p| p.strip_prefix(tmp.path()).ok())
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-
-        assert!(
-            rels.contains("visible.rs"),
-            "non-ignored file should be walked: {rels:?}"
-        );
-        assert!(
-            !rels.contains("ignored/hidden.rs"),
-            "gitignored file should not be walked when enabled: {rels:?}"
         );
     }
 
