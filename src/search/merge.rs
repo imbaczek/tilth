@@ -63,7 +63,7 @@ fn combine_scoped_results<F>(
     scopes: &[PathBuf],
     full: bool,
     context: Option<&Path>,
-    glob: Option<&str>,
+    _glob: Option<&str>,
     mut search: F,
 ) -> Result<SearchResult, TilthError>
 where
@@ -76,7 +76,7 @@ where
         });
     }
 
-    let scopes = minimal_scopes(scopes, glob);
+    let scopes = minimal_scopes(scopes);
 
     if scopes.len() == 1 {
         let mut result = search(&scopes[0])?;
@@ -178,21 +178,13 @@ where
     })
 }
 
-fn minimal_scopes(scopes: &[PathBuf], glob: Option<&str>) -> Vec<PathBuf> {
+fn minimal_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
     let mut unique: Vec<PathBuf> = Vec::new();
     for scope in scopes {
         let canonical = scope.canonicalize().unwrap_or_else(|_| scope.clone());
         if !unique.contains(&canonical) {
             unique.push(canonical);
         }
-    }
-    if glob.is_none_or(str::is_empty) {
-        let candidates = unique.clone();
-        unique.retain(|scope| {
-            !candidates
-                .iter()
-                .any(|other| scope != other && scope.starts_with(other))
-        });
     }
     unique
 }
@@ -304,10 +296,7 @@ mod tests {
     fn minimal_scopes_keeps_one_copy_of_duplicate_scope() {
         let tmp = tempfile::tempdir().unwrap();
         let scope = tmp.path().to_path_buf();
-        assert_eq!(
-            minimal_scopes(&[scope.clone(), scope.clone()], None),
-            vec![scope]
-        );
+        assert_eq!(minimal_scopes(&[scope.clone(), scope.clone()]), vec![scope]);
     }
 
     #[test]
@@ -434,27 +423,40 @@ mod tests {
     }
 
     #[test]
-    fn minimal_scopes_with_glob_keeps_nested_scopes_for_distinct_filters() {
+    fn minimal_scopes_keeps_nested_scopes() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let nested = root.join("nested");
         std::fs::create_dir_all(&nested).unwrap();
         assert_eq!(
-            minimal_scopes(&[root.clone(), nested.clone()], Some("*.rs")),
+            minimal_scopes(&[root.clone(), nested.clone()]),
             vec![root.canonicalize().unwrap(), nested.canonicalize().unwrap()]
         );
     }
 
     #[test]
-    fn minimal_scopes_without_glob_drops_nested_scopes() {
+    fn explicit_nested_scope_searches_ignored_directory() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
-        let nested = root.join("nested");
+        let nested = root.join("ignored");
         std::fs::create_dir_all(&nested).unwrap();
-        assert_eq!(
-            minimal_scopes(&[root.clone(), nested.clone()], None),
-            vec![root.canonicalize().unwrap()]
-        );
+        std::fs::write(root.join(".tilthignore"), "ignored/\n").unwrap();
+        std::fs::write(nested.join("match.rs"), "unique_scoped_needle\n").unwrap();
+
+        let parent_only = content_raw_scopes(
+            "unique_scoped_needle",
+            std::slice::from_ref(&root),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(parent_only.total_found, 0);
+
+        let combined =
+            content_raw_scopes("unique_scoped_needle", &[root, nested], None, None, false).unwrap();
+        assert_eq!(combined.total_found, 1);
+        assert_eq!(combined.matches.len(), 1);
     }
 
     #[test]

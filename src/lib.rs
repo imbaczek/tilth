@@ -492,7 +492,7 @@ fn run_inner_scopes(
             };
             run_query_expanded_scopes(&query_type, scopes, cache, &ctx, glob)?
         }
-        _ => run_query_basic_scopes(&query_type, scopes, cache, glob)?,
+        _ => run_query_basic_scopes(&query_type, scopes, cache, glob, cli_full)?,
     };
 
     match budget_tokens {
@@ -692,26 +692,29 @@ fn run_query_basic_scopes(
     scopes: &[PathBuf],
     cache: &OutlineCache,
     glob: Option<&str>,
+    full_search: bool,
 ) -> Result<String, TilthError> {
     match query_type {
         QueryType::Symbol(name) => {
-            let result = search::search_symbol_raw_scopes(name, scopes, glob, false)?;
+            let result = search::search_symbol_raw_scopes(name, scopes, glob, full_search)?;
             search::format_raw_result_scopes(&result, scopes, cache)
         }
         QueryType::Concept(text) if text.contains(' ') => {
-            multi_word_concept_search_scopes(text, scopes, cache, glob)
+            multi_word_concept_search_scopes(text, scopes, cache, glob, full_search)
         }
-        QueryType::Concept(text) => single_query_search_scopes(text, scopes, cache, true, glob),
+        QueryType::Concept(text) => {
+            single_query_search_scopes(text, scopes, cache, true, glob, full_search)
+        }
         QueryType::Content(text) => {
-            let result = search::search_content_raw_scopes(text, scopes, glob, false)?;
+            let result = search::search_content_raw_scopes(text, scopes, glob, full_search)?;
             search::format_raw_result_scopes(&result, scopes, cache)
         }
         QueryType::Regex(pattern) => {
-            let result = search::search_regex_raw_scopes(pattern, scopes, glob, false)?;
+            let result = search::search_regex_raw_scopes(pattern, scopes, glob, full_search)?;
             search::format_raw_result_scopes(&result, scopes, cache)
         }
         QueryType::Fallthrough(text) => {
-            single_query_search_scopes(text, scopes, cache, false, glob)
+            single_query_search_scopes(text, scopes, cache, false, glob, full_search)
         }
         QueryType::FilePath(_) | QueryType::Glob(_) => {
             unreachable!("non-search query type in basic path")
@@ -765,8 +768,9 @@ fn single_query_search_scopes(
     cache: &cache::OutlineCache,
     prefer_definitions: bool,
     glob: Option<&str>,
+    full_search: bool,
 ) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw_scopes(text, scopes, glob, false)?;
+    let sym_result = search::search_symbol_raw_scopes(text, scopes, glob, full_search)?;
     let accept_sym = if prefer_definitions {
         sym_result.definitions > 0
     } else {
@@ -777,7 +781,7 @@ fn single_query_search_scopes(
         return search::format_raw_result_scopes(&sym_result, scopes, cache);
     }
 
-    let content_result = search::search_content_raw_scopes(text, scopes, glob, false)?;
+    let content_result = search::search_content_raw_scopes(text, scopes, glob, full_search)?;
     if content_result.total_found > 0 {
         return search::format_raw_result_scopes(&content_result, scopes, cache);
     }
@@ -846,8 +850,9 @@ fn multi_word_concept_search_scopes(
     scopes: &[PathBuf],
     cache: &cache::OutlineCache,
     glob: Option<&str>,
+    full_search: bool,
 ) -> Result<String, error::TilthError> {
-    let mut content_result = search::search_content_raw_scopes(text, scopes, glob, false)?;
+    let mut content_result = search::search_content_raw_scopes(text, scopes, glob, full_search)?;
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
         return search::format_raw_result_scopes(&content_result, scopes, cache);
@@ -870,7 +875,7 @@ fn multi_word_concept_search_scopes(
             .join("|")
     };
 
-    let mut relaxed_result = search::search_regex_raw_scopes(&relaxed, scopes, glob, false)?;
+    let mut relaxed_result = search::search_regex_raw_scopes(&relaxed, scopes, glob, full_search)?;
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
         return search::format_raw_result_scopes(&relaxed_result, scopes, cache);
@@ -988,6 +993,31 @@ mod tests {
                     shown > 10,
                     "{path}: {query:?} with --full --expand=0 showed {shown} matches, want >10"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn multi_scope_full_raises_unexpanded_match_cap() {
+        let dir = fixture();
+        let empty = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let scopes = [dir.path().to_path_buf(), empty.path().to_path_buf()];
+        for &(query, path) in UNEXPANDED_QUERIES {
+            let out = run_expanded_scopes(
+                query,
+                &scopes,
+                None,
+                None,
+                true,
+                0,
+                Some("*.rs"),
+                &cache,
+                true,
+            )
+            .unwrap_or_else(|e| panic!("{path}: {query:?} failed: {e}"));
+            for shown in header_match_counts(&out) {
+                assert!(shown > 10, "{path}: {query:?} showed only {shown} matches");
             }
         }
     }
