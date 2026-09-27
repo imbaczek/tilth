@@ -388,7 +388,7 @@ fn run_inner_scopes(
                     suggestion: None,
                 }));
             }
-            return Ok(outputs.join("\n\n---\n"));
+            return Ok(apply_budget(outputs.join("\n\n---\n"), budget_tokens));
         }
         QueryType::FilePath(path) => read_file_query(&path, &scopes[0], section, full, cache)?,
         QueryType::Glob(pattern) if multi_scope => {
@@ -410,7 +410,7 @@ fn run_inner_scopes(
                     suggestion: None,
                 }));
             }
-            return Ok(outputs.join("\n\n---\n"));
+            return Ok(apply_budget(outputs.join("\n\n---\n"), budget_tokens));
         }
         QueryType::Glob(pattern) => search::search_glob(&pattern, &scopes[0])?,
         _ if use_expanded => {
@@ -1112,6 +1112,56 @@ mod tests {
                 scope.display()
             );
         }
+    }
+
+    #[test]
+    fn multi_scope_file_path_budgets_joined_output() {
+        const BUDGET: u64 = 40;
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        let content = "line contains enough text to consume budget\n".repeat(100);
+        for scope in [&first, &second] {
+            std::fs::write(scope.join("large.txt"), &content).unwrap();
+        }
+
+        let scopes = [first, second];
+        let cache = OutlineCache::new();
+        let per_scope_outputs = scopes
+            .iter()
+            .map(|scope| {
+                let path = scope.join("large.txt");
+                let output = read_file_query(&path, scope, None, true, &cache).unwrap();
+                format!(
+                    "# Scope: {}\n\n{}",
+                    scope.display(),
+                    budget::apply(&output, BUDGET)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n---\n");
+        let expected = budget::apply(&per_scope_outputs, BUDGET);
+        assert_ne!(
+            per_scope_outputs, expected,
+            "joined fixture should exceed the aggregate budget"
+        );
+
+        let actual = run_expanded_scopes(
+            "large.txt",
+            &scopes,
+            None,
+            Some(BUDGET),
+            true,
+            0,
+            None,
+            &cache,
+            false,
+        )
+        .expect("multi-scope file path should succeed");
+
+        assert_eq!(actual, expected);
     }
 
     #[test]
