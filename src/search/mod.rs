@@ -139,6 +139,9 @@ pub(crate) fn set_gitignore_config(value: Option<bool>) {
 
 /// Shared walker policy: searches files except known junk directories and
 /// `.tilthignore` entries. Gitignore-style files are opt-in.
+/// The scope itself is an explicit traversal root: `--scope src/tmp` searches
+/// that directory even if a parent `.gitignore` excludes `src/tmp/`; ignore
+/// rules still filter entries beneath the scope.
 /// Used by both the parallel search walker (`walker()`) and the sequential map
 /// walker (`crate::map::generate`), which each apply their own final
 /// `.max_depth()`/`.threads()` and `.build()`/`.build_parallel()`.
