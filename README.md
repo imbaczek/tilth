@@ -96,6 +96,10 @@ tilth "ServeHTTP, HandlersChain, Next" --scope .
 
 Each symbol gets its own block of results. The expand budget is shared across them, with at least one expansion per symbol.
 
+### Multiple scopes
+
+Pass `--scope` more than once on the command line, or use `scopes` in MCP `tilth_search`, to search several directories together. A relative query that names a file in any scope reads the matching file(s) and does not search the other scopes for that query as text. If no scope contains the file, tilth falls back to searching as usual.
+
 ### Callers
 
 Find every call site of a symbol. tilth matches calls on the syntax tree, so comments and strings that mention the name are left out.
