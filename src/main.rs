@@ -166,12 +166,12 @@ enum Command {
 }
 
 fn main() {
-    configure_thread_pools();
     let cli = Cli::parse();
 
     if cli.respect_gitignore {
         std::env::set_var("TILTH_RESPECT_GITIGNORE", "1");
     }
+    configure_thread_pools();
 
     // Shell completions
     if let Some(shell) = cli.completions {

@@ -89,9 +89,18 @@ pub(super) fn search_collected(
         reason: e.to_string(),
     })?;
 
+    let gitignore = super::call_gitignore_override();
     let (defs, usages) = rayon::join(
-        || find_definitions(query, scope, glob, def_threshold),
-        || find_usages(query, &matcher, scope, glob, usage_threshold),
+        || {
+            super::with_gitignore_override(gitignore, || {
+                find_definitions(query, scope, glob, def_threshold)
+            })
+        },
+        || {
+            super::with_gitignore_override(gitignore, || {
+                find_usages(query, &matcher, scope, glob, usage_threshold)
+            })
+        },
     );
 
     let defs = defs?;
