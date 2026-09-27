@@ -613,7 +613,15 @@ pub fn search_regex_scopes_expanded(
 fn search_header_for_scopes(result: &SearchResult, scopes: &[PathBuf]) -> String {
     let scope_list = scopes
         .iter()
-        .map(|scope| scope.display().to_string())
+        .map(|scope| {
+            let canonical = scope.canonicalize().unwrap_or_else(|_| scope.clone());
+            let count = result
+                .scope_counts
+                .iter()
+                .find(|(path, _)| path == &canonical)
+                .map_or_else(|| "error".to_string(), |(_, count)| count.to_string());
+            format!("{} ({count})", scope.display())
+        })
         .collect::<Vec<_>>()
         .join(", ");
     let parts = match (result.definitions, result.usages) {
@@ -654,6 +662,11 @@ fn write_hidden_tail(out: &mut String, shown: usize, total: usize, kind: &str) {
         let hidden = total - shown;
         let _ = write!(out, "\n\n... and {hidden} more {kind}. Narrow with scope.");
     }
+}
+
+fn write_hidden_only_facet(out: &mut String, title: &str, total: usize, kind: &str) {
+    let _ = write!(out, "\n\n## {title} (0/{total})");
+    write_hidden_tail(out, 0, total, kind);
 }
 
 fn hidden_beyond_facets(result: &SearchResult) -> usize {
@@ -1374,7 +1387,7 @@ fn format_search_result_impl(
     }
 
     // Apply faceting when there are many matches (>5)
-    if result.matches.len() > 5 {
+    if result.matches.len() > 5 || result.total_found > result.matches.len() {
         let faceted = facets::facet_matches(result.matches.clone(), &result.scope);
         let totals = &result.facet_totals;
 
@@ -1407,6 +1420,8 @@ fn format_search_result_impl(
                 totals.definitions,
                 "definitions",
             );
+        } else if totals.definitions > 0 {
+            write_hidden_only_facet(&mut out, "Definitions", totals.definitions, "definitions");
         }
 
         if !faceted.implementations.is_empty() {
@@ -1432,6 +1447,13 @@ fn format_search_result_impl(
                 totals.implementations,
                 "implementations",
             );
+        } else if totals.implementations > 0 {
+            write_hidden_only_facet(
+                &mut out,
+                "Implementations",
+                totals.implementations,
+                "implementations",
+            );
         }
 
         if !faceted.tests.is_empty() {
@@ -1451,6 +1473,8 @@ fn format_search_result_impl(
                 );
             }
             write_hidden_tail(&mut out, faceted.tests.len(), totals.tests, "tests");
+        } else if totals.tests > 0 {
+            write_hidden_only_facet(&mut out, "Tests", totals.tests, "tests");
         }
 
         if !faceted.usages_local.is_empty() {
@@ -1473,6 +1497,13 @@ fn format_search_result_impl(
             write_hidden_tail(
                 &mut out,
                 faceted.usages_local.len(),
+                totals.usages_local,
+                "usages",
+            );
+        } else if totals.usages_local > 0 {
+            write_hidden_only_facet(
+                &mut out,
+                "Usages — same package",
                 totals.usages_local,
                 "usages",
             );
@@ -1501,6 +1532,8 @@ fn format_search_result_impl(
                 totals.usages_cross,
                 "usages",
             );
+        } else if totals.usages_cross > 0 {
+            write_hidden_only_facet(&mut out, "Usages — other", totals.usages_cross, "usages");
         }
 
         // Content/regex results carry no per-facet totals (all-zero), so the
@@ -2715,9 +2748,35 @@ mod tests {
                 usages_cross: 60,
                 ..Default::default()
             },
+            scope_counts: Vec::new(),
         };
 
         assert_eq!(hidden_beyond_facets(&result), 20);
+    }
+
+    #[test]
+    fn multi_scope_output_shows_scope_counts_and_hidden_only_facets() {
+        let root = tempfile::tempdir().unwrap();
+        let one = root.path().join("one");
+        let two = root.path().join("two");
+        let result = SearchResult {
+            query: "target".to_string(),
+            scope: root.path().to_path_buf(),
+            matches: Vec::new(),
+            total_found: 3,
+            definitions: 0,
+            usages: 3,
+            facet_totals: crate::types::FacetTotals {
+                tests: 3,
+                ..Default::default()
+            },
+            scope_counts: vec![(one.clone(), 2), (two.clone(), 1)],
+        };
+        let out = format_raw_result_scopes(&result, &[one, two], &OutlineCache::new()).unwrap();
+        assert!(out.contains("one (2)"), "{out}");
+        assert!(out.contains("two (1)"), "{out}");
+        assert!(out.contains("## Tests (0/3)"), "{out}");
+        assert!(out.contains("more tests"), "{out}");
     }
 
     #[test]

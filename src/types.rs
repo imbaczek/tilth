@@ -142,6 +142,8 @@ pub struct SearchResult {
     /// merged set before truncation; used by the renderer to print
     /// `displayed/total` headings and the per-facet hidden-count tail line.
     pub facet_totals: FacetTotals,
+    /// Matches found in each explicit scope before the display cap.
+    pub scope_counts: Vec<(PathBuf, usize)>,
 }
 
 /// Pre-cap counts per subfacet. Defaults to all-zero for callers that don't

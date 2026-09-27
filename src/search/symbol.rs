@@ -157,6 +157,7 @@ pub(super) fn search_collected(
         definitions: def_count,
         usages: usage_count,
         facet_totals: totals,
+        scope_counts: Vec::new(),
     })
 }
 

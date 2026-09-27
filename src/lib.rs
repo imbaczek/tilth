@@ -426,7 +426,10 @@ fn run_inner_scopes(
         QueryType::FilePath(_) => {
             let mut outputs = Vec::new();
             let mut first_err = None;
-            for scope in scopes {
+            for (scope_index, scope) in scopes.iter().enumerate() {
+                if Path::new(query).is_absolute() && scope_index > 0 {
+                    break;
+                }
                 if !matches!(classify(query, scope), QueryType::FilePath(_)) {
                     continue;
                 }
@@ -1083,6 +1086,32 @@ mod tests {
             !out.contains("noise.rs"),
             "missing-scope file path must not be reclassified as a search: {out}"
         );
+    }
+
+    #[test]
+    fn multi_scope_absolute_file_path_is_read_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("only_once.txt");
+        std::fs::write(&file, "absolute file content\n").unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run_expanded_scopes(
+            file.to_str().unwrap(),
+            &[first, second],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &cache,
+            false,
+        )
+        .unwrap();
+        assert_eq!(out.matches("absolute file content").count(), 1, "{out}");
     }
 
     #[test]

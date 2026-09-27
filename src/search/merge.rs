@@ -41,9 +41,20 @@ pub fn content_raw_scopes(
 ) -> Result<SearchResult, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
     let visited = Mutex::new(HashSet::new());
-    combine_scoped_results(scopes, full, context, glob, |scope| {
+    let mut result = combine_scoped_results(scopes, full, context, glob, |scope| {
         content::search_collected_scoped(pattern, scope, is_regex, context, glob, &visited)
-    })
+    })?;
+    if scopes_overlap(scopes) {
+        result.scope_counts = independent_content_scope_counts(
+            pattern,
+            scopes,
+            is_regex,
+            context,
+            glob,
+            &result.scope_counts,
+        );
+    }
+    Ok(result)
 }
 
 pub fn regex_raw_scopes(
@@ -54,9 +65,62 @@ pub fn regex_raw_scopes(
     full: bool,
 ) -> Result<SearchResult, TilthError> {
     let visited = Mutex::new(HashSet::new());
-    combine_scoped_results(scopes, full, context, glob, |scope| {
+    let mut result = combine_scoped_results(scopes, full, context, glob, |scope| {
         content::search_collected_scoped(pattern, scope, true, context, glob, &visited)
+    })?;
+    if scopes_overlap(scopes) {
+        result.scope_counts = independent_content_scope_counts(
+            pattern,
+            scopes,
+            true,
+            context,
+            glob,
+            &result.scope_counts,
+        );
+    }
+    Ok(result)
+}
+
+fn scopes_overlap(scopes: &[PathBuf]) -> bool {
+    let canonical: Vec<PathBuf> = scopes
+        .iter()
+        .map(|scope| scope.canonicalize().unwrap_or_else(|_| scope.clone()))
+        .collect();
+    canonical.iter().enumerate().any(|(i, scope)| {
+        canonical
+            .iter()
+            .enumerate()
+            .any(|(j, other)| i != j && scope != other && scope.starts_with(other))
     })
+}
+
+fn independent_content_scope_counts(
+    pattern: &str,
+    scopes: &[PathBuf],
+    is_regex: bool,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    fallback: &[(PathBuf, usize)],
+) -> Vec<(PathBuf, usize)> {
+    minimal_scopes(scopes)
+        .into_iter()
+        .map(|scope| {
+            let visited = Mutex::new(HashSet::new());
+            let count = content::search_collected_scoped(
+                pattern, &scope, is_regex, context, glob, &visited,
+            )
+            .map_or_else(
+                |_| {
+                    fallback
+                        .iter()
+                        .find(|(path, _)| path == &scope)
+                        .map_or(0, |(_, count)| *count)
+                },
+                |result| result.total_found,
+            );
+            (scope, count)
+        })
+        .collect()
 }
 
 fn combine_scoped_results<F>(
@@ -80,6 +144,7 @@ where
 
     if scopes.len() == 1 {
         let mut result = search(&scopes[0])?;
+        result.scope_counts = vec![(scopes[0].clone(), result.total_found)];
         result
             .matches
             .truncate(if full { FULL_MAX_MATCHES } else { MAX_MATCHES });
@@ -94,6 +159,7 @@ where
     let mut any_ok = false;
     let mut total_found = 0;
     let mut definitions = 0;
+    let mut scope_counts = Vec::new();
     let mut uncollected_tests = 0;
     let mut uncollected_usages_cross = 0;
 
@@ -101,6 +167,7 @@ where
         match search(scope) {
             Ok(result) => {
                 any_ok = true;
+                scope_counts.push((scope.clone(), result.total_found));
                 // Content scopes count disjoint files before truncation; symbol
                 // scopes retain every observed hit, so duplicates are visible.
                 total_found += result.total_found;
@@ -175,6 +242,7 @@ where
         definitions,
         usages,
         facet_totals,
+        scope_counts,
     })
 }
 
@@ -255,6 +323,7 @@ mod tests {
                 usages_local: f.usages_local.len(),
                 usages_cross: f.usages_cross.len(),
             },
+            scope_counts: Vec::new(),
         }
     }
 
@@ -457,6 +526,27 @@ mod tests {
             content_raw_scopes("unique_scoped_needle", &[root, nested], None, None, false).unwrap();
         assert_eq!(combined.total_found, 1);
         assert_eq!(combined.matches.len(), 1);
+    }
+
+    #[test]
+    fn overlapping_scopes_report_independent_content_and_regex_counts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("match.rs"), "scope_count_needle\n").unwrap();
+
+        for scopes in [
+            vec![root.clone(), nested.clone()],
+            vec![nested.clone(), root.clone()],
+        ] {
+            for search in [content_raw_scopes, regex_raw_scopes] {
+                let result = search("scope_count_needle", &scopes, None, None, false).unwrap();
+                assert_eq!(result.total_found, 1);
+                assert_eq!(result.scope_counts.len(), 2);
+                assert!(result.scope_counts.iter().all(|(_, count)| *count == 1));
+            }
+        }
     }
 
     #[test]

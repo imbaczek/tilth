@@ -461,7 +461,7 @@ mod tests {
             "combined search should not render per-scope wrappers: {out}"
         );
         let scope_header = format!(
-            "in scopes [{}, {}]",
+            "in scopes [{} (1), {} (1)]",
             earlier.canonicalize().unwrap().display(),
             later.canonicalize().unwrap().display()
         );

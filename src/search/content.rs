@@ -274,6 +274,7 @@ fn search_capped_with_visited(
         definitions: 0,
         usages: total,
         facet_totals,
+        scope_counts: Vec::new(),
     })
 }
 
