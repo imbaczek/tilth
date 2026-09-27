@@ -1190,6 +1190,39 @@ mod tests {
     }
 
     #[test]
+    fn multi_scope_glob_includes_matches_from_each_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("first.txt"), "first scope\n").unwrap();
+        std::fs::write(second.join("second.txt"), "second scope\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run_expanded_scopes(
+            "*.txt",
+            &[first.clone(), second.clone()],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &cache,
+            false,
+        )
+        .expect("glob results should be collected from both scopes");
+
+        for (scope, file) in [(&first, "first.txt"), (&second, "second.txt")] {
+            assert!(
+                out.contains(&format!("# Scope: {}", scope.display())) && out.contains(file),
+                "missing glob output for {}: {out}",
+                scope.display()
+            );
+        }
+    }
+
+    #[test]
     fn multi_scope_absolute_file_path_is_read_once() {
         let tmp = tempfile::tempdir().unwrap();
         let file = tmp.path().join("only_once.txt");
