@@ -1,6 +1,7 @@
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -15,10 +16,12 @@ use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{heading_text, outline_language, parse_markdown};
 use crate::search::rank;
-use crate::types::{FacetTotals, FileType, Match, SearchResult};
+use crate::types::{CountEstimate, FacetTotals, FileType, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
+
+type AliasPaths = HashMap<std::path::PathBuf, Vec<std::path::PathBuf>>;
 
 const MAX_MATCHES: usize = 10;
 /// Stop walking once we have this many raw definition matches.
@@ -33,6 +36,81 @@ const FULL_MAX_MATCHES: usize = 100;
 /// `FULL_MAX_MATCHES` the same way the default thresholds are.
 const FULL_EARLY_QUIT_USAGES: usize = FULL_MAX_MATCHES * 3;
 const FULL_EARLY_QUIT_DEFINITIONS: usize = FULL_MAX_MATCHES * 3;
+
+/// Called only after the walker has applied its eligibility filters.
+fn stop_for_eligible_remainder(
+    found: usize,
+    threshold: usize,
+    skipped_eligible: &AtomicBool,
+) -> bool {
+    if found < threshold {
+        return false;
+    }
+    skipped_eligible.store(true, Ordering::Relaxed);
+    true
+}
+
+fn symbol_count_estimate(total: usize, defs_skipped: bool, usages_skipped: bool) -> CountEstimate {
+    if defs_skipped || usages_skipped {
+        CountEstimate::Observed { count: total }
+    } else {
+        CountEstimate::Exact(total)
+    }
+}
+
+fn usage_is_dominated_by_definition(usage: &Match, definitions: &[Match]) -> bool {
+    let physical = usage
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| usage.path.clone());
+    definitions.iter().any(|definition| {
+        definition.line == usage.line
+            && definition
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| definition.path.clone())
+                == physical
+    })
+}
+
+fn admit_physical_file(
+    path: &Path,
+    seen: &Mutex<HashSet<std::path::PathBuf>>,
+    observed_paths: &Mutex<AliasPaths>,
+) -> bool {
+    let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    {
+        let mut paths = observed_paths
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let aliases = paths.entry(identity.clone()).or_default();
+        if !aliases.iter().any(|observed| observed == path) {
+            aliases.push(path.to_path_buf());
+        }
+    }
+    seen.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(identity)
+}
+
+fn select_observed_paths(matches: &mut [Match], observed_paths: &AliasPaths) {
+    for m in matches {
+        let identity = m.path.canonicalize().unwrap_or_else(|_| m.path.clone());
+        if let Some(paths) = observed_paths.get(&identity) {
+            if let Some(path) = paths.iter().min_by(|a, b| {
+                if super::content::preferred_path(a, b, &identity) {
+                    std::cmp::Ordering::Less
+                } else if super::content::preferred_path(b, a, &identity) {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            }) {
+                m.path.clone_from(path);
+            }
+        }
+    }
+}
 
 /// Display-side stratum: 0 = code def, 1 = doc-heading def, 2 = usage. Used
 /// as a stable sort key after `rank::sort` so the `MAX_MATCHES` cap can't drop
@@ -103,8 +181,18 @@ pub(super) fn search_collected(
         },
     );
 
-    let defs = defs?;
-    let usages = usages?;
+    let (defs, defs_skipped, definition_paths) = defs?;
+    let (usages, usages_skipped, usage_paths) = usages?;
+    let mut alias_paths: HashMap<(std::path::PathBuf, bool), Vec<std::path::PathBuf>> =
+        definition_paths
+            .into_iter()
+            .map(|(physical, paths)| ((physical, true), paths))
+            .collect();
+    alias_paths.extend(
+        usage_paths
+            .into_iter()
+            .map(|(physical, paths)| ((physical, false), paths)),
+    );
 
     // Deduplicate: remove usage matches that overlap with definition matches.
     // Linear scan — max ~30 defs from EARLY_QUIT_THRESHOLD, no allocation needed.
@@ -112,9 +200,7 @@ pub(super) fn search_collected(
     let def_count = merged.len();
 
     for m in usages {
-        let dominated = merged[..def_count]
-            .iter()
-            .any(|d| d.path == m.path && d.line == m.line);
+        let dominated = usage_is_dominated_by_definition(&m, &merged[..def_count]);
         if !dominated {
             merged.push(m);
         }
@@ -158,6 +244,10 @@ pub(super) fn search_collected(
         usages: usage_count,
         facet_totals: totals,
         scope_counts: Vec::new(),
+        count_estimate: symbol_count_estimate(total, defs_skipped, usages_skipped),
+        scope_errors: Vec::new(),
+        file_ledger: None,
+        alias_paths,
     })
 }
 
@@ -174,11 +264,14 @@ fn find_definitions(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
+) -> Result<(Vec<Match>, bool, AliasPaths), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     // Early-quit checks are approximate by design — one extra iteration is harmless.
     let found_count = AtomicUsize::new(0);
+    let skipped_eligible = AtomicBool::new(false);
+    let seen = Mutex::new(HashSet::new());
+    let observed_paths = Mutex::new(HashMap::new());
     let needle = query.as_bytes();
 
     let walker = super::walker(scope, glob)?;
@@ -186,13 +279,11 @@ fn find_definitions(
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let skipped_eligible = &skipped_eligible;
+        let seen = &seen;
+        let observed_paths = &observed_paths;
 
         Box::new(move |entry| {
-            // Early termination: enough definitions found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -238,6 +329,16 @@ fn find_definitions(
                 && crate::lang::detection::is_minified_by_content(content.as_bytes())
             {
                 return ignore::WalkState::Continue;
+            }
+            if !admit_physical_file(path, seen, observed_paths) {
+                return ignore::WalkState::Continue;
+            }
+            if stop_for_eligible_remainder(
+                found_count.load(Ordering::Relaxed),
+                early_quit_threshold,
+                skipped_eligible,
+            ) {
+                return ignore::WalkState::Quit;
             }
 
             // Get file metadata once per file
@@ -301,9 +402,18 @@ fn find_definitions(
         })
     });
 
-    Ok(matches
+    let mut matches = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let observed_paths = observed_paths
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    select_observed_paths(&mut matches, &observed_paths);
+    Ok((
+        matches,
+        skipped_eligible.load(Ordering::Relaxed),
+        observed_paths,
+    ))
 }
 
 /// Tree-sitter structural definition detection.
@@ -541,23 +651,24 @@ fn find_usages(
     scope: &Path,
     glob: Option<&str>,
     early_quit_threshold: usize,
-) -> Result<Vec<Match>, TilthError> {
+) -> Result<(Vec<Match>, bool, AliasPaths), TilthError> {
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
     // Relaxed: same reasoning as find_definitions — approximate early-quit, joined before read
     let found_count = AtomicUsize::new(0);
+    let skipped_eligible = AtomicBool::new(false);
+    let seen = Mutex::new(HashSet::new());
+    let observed_paths = Mutex::new(HashMap::new());
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let skipped_eligible = &skipped_eligible;
+        let seen = &seen;
+        let observed_paths = &observed_paths;
 
         Box::new(move |entry| {
-            // Early termination: enough usages found
-            if found_count.load(Ordering::Relaxed) >= early_quit_threshold {
-                return ignore::WalkState::Quit;
-            }
-
             let Ok(entry) = entry else {
                 return ignore::WalkState::Continue;
             };
@@ -601,6 +712,16 @@ fn find_usages(
             {
                 return ignore::WalkState::Continue;
             }
+            if !admit_physical_file(path, seen, observed_paths) {
+                return ignore::WalkState::Continue;
+            }
+            if stop_for_eligible_remainder(
+                found_count.load(Ordering::Relaxed),
+                early_quit_threshold,
+                skipped_eligible,
+            ) {
+                return ignore::WalkState::Quit;
+            }
 
             let (file_lines, mtime) = file_metadata(path);
 
@@ -640,9 +761,18 @@ fn find_usages(
         })
     });
 
-    Ok(matches
+    let mut matches = matches
         .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let observed_paths = observed_paths
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    select_observed_paths(&mut matches, &observed_paths);
+    Ok((
+        matches,
+        skipped_eligible.load(Ordering::Relaxed),
+        observed_paths,
+    ))
 }
 
 /// Markdown heading definition detector.
@@ -839,6 +969,60 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    #[cfg(unix)]
+    #[test]
+    fn definition_suppresses_same_physical_line_through_different_alias() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let physical = tmp.path().join("source.rs");
+        let alias = tmp.path().join("alias.rs");
+        std::fs::write(&physical, "fn target() {}\n").unwrap();
+        symlink(&physical, &alias).unwrap();
+        let make_match = |path: PathBuf, is_definition: bool| Match {
+            path,
+            line: 1,
+            text: "fn target() {}".to_string(),
+            is_definition,
+            exact: true,
+            file_lines: 1,
+            mtime: SystemTime::UNIX_EPOCH,
+            def_range: is_definition.then_some((1, 1)),
+            def_name: is_definition.then_some("target".to_string()),
+            def_weight: if is_definition { 100 } else { 0 },
+            impl_target: None,
+        };
+        let definition = make_match(physical, true);
+        let usage = make_match(alias, false);
+        assert!(usage_is_dominated_by_definition(&usage, &[definition]));
+    }
+
+    #[test]
+    fn coverage_marks_only_skipped_eligible_remainder() {
+        let skipped = AtomicBool::new(false);
+        for _ in 0..50 {
+            assert!(!stop_for_eligible_remainder(49, 50, &skipped));
+        }
+        assert!(!skipped.load(Ordering::Relaxed));
+        // Exhaustion immediately after the threshold remains complete. The
+        // excluded-only remainder never reaches this callback.
+        assert!(!skipped.load(Ordering::Relaxed));
+        assert!(stop_for_eligible_remainder(50, 50, &skipped));
+        assert!(skipped.load(Ordering::Relaxed));
+        assert_eq!(
+            symbol_count_estimate(50, false, false),
+            CountEstimate::Exact(50)
+        );
+        assert_eq!(
+            symbol_count_estimate(50, true, false),
+            CountEstimate::Observed { count: 50 }
+        );
+        assert_eq!(
+            symbol_count_estimate(50, false, true),
+            CountEstimate::Observed { count: 50 }
+        );
+    }
 
     #[test]
     fn rust_definitions_detected() {

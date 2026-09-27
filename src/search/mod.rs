@@ -180,6 +180,16 @@ fn include_entry(entry: &ignore::DirEntry) -> bool {
 /// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
 /// With gitignore enabled, the glob cannot override ignore rules.
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
+    let metadata = fs::metadata(scope).map_err(|source| TilthError::IoError {
+        path: scope.to_path_buf(),
+        source,
+    })?;
+    if metadata.is_dir() {
+        fs::read_dir(scope).map_err(|source| TilthError::IoError {
+            path: scope.to_path_buf(),
+            source,
+        })?;
+    }
     let threads = std::env::var("TILTH_THREADS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -249,18 +259,6 @@ pub(crate) fn file_metadata(path: &Path) -> (u32, SystemTime) {
 /// same meaning here and in the five siblings below: it raises both the match
 /// cap and the walker's early-quit thresholds, so the reported totals move as
 /// well as the number of matches shown.
-pub fn search_symbol(
-    query: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    glob: Option<&str>,
-    full: bool,
-) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, None, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
-}
-
 pub fn search_symbol_expanded(
     query: &str,
     scope: &Path,
@@ -273,7 +271,7 @@ pub fn search_symbol_expanded(
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let result = symbol::search(query, scope, context, glob, full)?;
+    let result = merge::symbol_raw_scopes(query, &[scope.to_path_buf()], context, glob, full)?;
     format_search_result(&result, cache, Some(session), bloom, expand, budget)
 }
 
@@ -300,15 +298,8 @@ pub fn search_multi_symbol_expanded(
     let mut sections = Vec::with_capacity(queries.len());
 
     for query in queries {
-        let result = symbol::search(query, scope, context, glob, full)?;
-        let mut out = format::search_header(
-            &result.query,
-            &result.scope,
-            result.matches.len(),
-            result.total_found,
-            result.definitions,
-            result.usages,
-        );
+        let result = merge::symbol_raw_scopes(query, &[scope.to_path_buf()], context, glob, full)?;
+        let mut out = one_root_multi_symbol_header(&result);
         let mut segments: Vec<(i64, usize, usize)> = Vec::new();
         format_matches(
             &result.matches,
@@ -338,31 +329,6 @@ pub fn search_multi_symbol_expanded(
     Ok(sections.join("\n\n---\n"))
 }
 
-pub fn search_content(
-    query: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    glob: Option<&str>,
-    full: bool,
-) -> Result<String, TilthError> {
-    let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, None, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
-}
-
-pub fn search_regex(
-    pattern: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    glob: Option<&str>,
-    full: bool,
-) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, None, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, None, &bloom, 0, None)
-}
-
 pub fn search_content_expanded(
     query: &str,
     scope: &Path,
@@ -375,28 +341,16 @@ pub fn search_content_expanded(
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let (pattern, is_regex) = parse_pattern(query);
-    let result = content::search(pattern, scope, is_regex, context, glob, full)?;
+    let result = if is_regex {
+        merge::regex_raw_scopes(pattern, &[scope.to_path_buf()], context, glob, full)?
+    } else {
+        merge::content_raw_scopes(pattern, &[scope.to_path_buf()], context, glob, full)?
+    };
     let bloom = crate::index::bloom::BloomFilterCache::new();
     format_search_result(&result, cache, Some(session), &bloom, expand, budget)
 }
 
 /// Expanded regex search — takes raw pattern, no slash wrapping needed.
-pub fn search_regex_expanded(
-    pattern: &str,
-    scope: &Path,
-    cache: &OutlineCache,
-    session: &Session,
-    expand: usize,
-    context: Option<&Path>,
-    glob: Option<&str>,
-    full: bool,
-    budget: Option<u64>,
-) -> Result<String, TilthError> {
-    let result = content::search(pattern, scope, true, context, glob, full)?;
-    let bloom = crate::index::bloom::BloomFilterCache::new();
-    format_search_result(&result, cache, Some(session), &bloom, expand, budget)
-}
-
 /// Raw symbol search — returns structured result for programmatic inspection.
 pub fn search_symbol_raw(
     query: &str,
@@ -418,26 +372,7 @@ pub fn search_symbol_raw_scopes(
 }
 
 /// Raw content search — returns structured result for programmatic inspection.
-pub fn search_content_raw(
-    query: &str,
-    scope: &Path,
-    glob: Option<&str>,
-    full: bool,
-) -> Result<SearchResult, TilthError> {
-    let (pattern, is_regex) = parse_pattern(query);
-    content::search(pattern, scope, is_regex, None, glob, full)
-}
-
 /// Raw regex search — returns structured result for programmatic inspection.
-pub fn search_regex_raw(
-    pattern: &str,
-    scope: &Path,
-    glob: Option<&str>,
-    full: bool,
-) -> Result<SearchResult, TilthError> {
-    content::search(pattern, scope, true, None, glob, full)
-}
-
 fn search_content_raw_scopes_with_context(
     query: &str,
     scopes: &[PathBuf],
@@ -522,17 +457,59 @@ pub fn search_multi_symbol_scopes_expanded(
     full: bool,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
+    let results = queries
+        .iter()
+        .map(|query| merge::symbol_raw_scopes(query, scopes, context, glob, full))
+        .collect::<Result<Vec<_>, _>>()?;
+    format_multi_symbol_scope_results(&results, scopes, cache, session, bloom, expand, budget)
+}
+
+fn format_multi_symbol_scope_results(
+    results: &[SearchResult],
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let effective_scopes = merge::minimal_scopes(scopes);
+    let scopes = effective_scopes.as_slice();
     let mut expand_remaining = if expand == 0 {
         0
     } else {
-        expand.max(queries.len())
+        expand.max(results.len())
     };
     let mut expanded_files = HashSet::new();
-    let mut sections = Vec::with_capacity(queries.len());
+    let mut sections = Vec::with_capacity(results.len());
+    let mut scope_errors: Vec<(PathBuf, String)> = Vec::new();
 
-    for query in queries {
-        let result = merge::symbol_raw_scopes(query, scopes, context, glob, full)?;
-        let mut out = search_header_for_scopes(&result, scopes);
+    for result in results {
+        for failure in &result.scope_errors {
+            if !scope_errors
+                .iter()
+                .any(|(scope, _)| scope == &failure.scope)
+            {
+                scope_errors.push((failure.scope.clone(), failure.error.to_string()));
+            }
+        }
+        let mut out = if scopes.len() == 1 {
+            one_root_multi_symbol_header(result)
+        } else {
+            search_header_for_scopes(result, scopes)
+        };
+        if scopes.len() > 1
+            && matches!(
+                result.count_estimate,
+                crate::types::CountEstimate::Observed { .. }
+            )
+        {
+            out = out.replacen(
+                &format!("{} matches", result.total_found),
+                &format!("at least {} matches", result.total_found),
+                1,
+            );
+        }
         let mut segments = Vec::new();
         format_matches(
             &result.matches,
@@ -549,7 +526,8 @@ pub fn search_multi_symbol_scopes_expanded(
             let omitted = result.total_found - result.matches.len();
             let _ = write!(
                 out,
-                "\n\n... and {omitted} more matches. Narrow with scopes."
+                "\n\n... and {omitted} more matches. Narrow with {}.",
+                if scopes.len() == 1 { "scope" } else { "scopes" }
             );
         }
         let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
@@ -559,7 +537,37 @@ pub fn search_multi_symbol_scopes_expanded(
             budget_tokens,
         ));
     }
-    Ok(sections.join("\n\n---\n"))
+    let joined = sections.join("\n\n---\n");
+    if scope_errors.is_empty() {
+        return Ok(joined);
+    }
+    let mut prelude = String::from("# Search: multiple symbols\n\n## Scope errors\n");
+    for (scope, error) in scope_errors {
+        let _ = writeln!(prelude, "- {}: {error}", scope.display());
+    }
+    Ok(format!("{}\n\n{joined}", prelude.trim_end()))
+}
+
+fn one_root_multi_symbol_header(result: &SearchResult) -> String {
+    let mut header = format::search_header(
+        &result.query,
+        &result.scope,
+        result.matches.len(),
+        result.total_found,
+        result.definitions,
+        result.usages,
+    );
+    if matches!(
+        result.count_estimate,
+        crate::types::CountEstimate::Observed { .. }
+    ) {
+        header = header.replacen(
+            &format!("{} matches", result.total_found),
+            &format!("at least {} matches", result.total_found),
+            1,
+        );
+    }
+    header
 }
 
 pub fn search_content_scopes_expanded(
@@ -618,7 +626,10 @@ fn search_header_for_scopes(result: &SearchResult, scopes: &[PathBuf]) -> String
             let count = result
                 .scope_counts
                 .iter()
-                .find(|(path, _)| path == &canonical)
+                .find(|(path, _)| {
+                    path == scope
+                        || path.canonicalize().unwrap_or_else(|_| path.clone()) == canonical
+                })
                 .map_or_else(|| "error".to_string(), |(_, count)| count.to_string());
             format!("{} ({count})", scope.display())
         })
@@ -1348,7 +1359,16 @@ fn format_search_result_scopes(
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    format_search_result_impl(result, Some(scopes), cache, session, bloom, expand, budget)
+    let effective_scopes = merge::minimal_scopes(scopes);
+    format_search_result_impl(
+        result,
+        (effective_scopes.len() > 1).then_some(effective_scopes.as_slice()),
+        cache,
+        session,
+        bloom,
+        expand,
+        budget,
+    )
 }
 
 fn format_search_result_impl(
@@ -1360,7 +1380,7 @@ fn format_search_result_impl(
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let header = searched_scopes.map_or_else(
+    let mut header = searched_scopes.map_or_else(
         || {
             format::search_header(
                 &result.query,
@@ -1373,7 +1393,23 @@ fn format_search_result_impl(
         },
         |scopes| search_header_for_scopes(result, scopes),
     );
+    if matches!(
+        result.count_estimate,
+        crate::types::CountEstimate::Observed { .. }
+    ) {
+        header = header.replacen(
+            &format!("{} matches", result.total_found),
+            &format!("at least {} matches", result.total_found),
+            1,
+        );
+    }
     let mut out = header;
+    if !result.scope_errors.is_empty() {
+        out.push_str("\n\n## Scope errors");
+        for failure in &result.scope_errors {
+            let _ = write!(out, "\n- {}: {}", failure.scope.display(), failure.error);
+        }
+    }
     let mut expand_remaining = expand;
     let mut expanded_files = HashSet::new();
     let mut segments: Vec<(i64, usize, usize)> = Vec::new();
@@ -1922,6 +1958,191 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_requested_scope_is_error_and_successful_scope_is_lower_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        let missing = root.path().join("missing");
+        fs::create_dir(&good).unwrap();
+        fs::write(good.join("hit.rs"), "a_unique_scope_marker\n").unwrap();
+
+        let single = search_content_raw_scopes(
+            "a_unique_scope_marker",
+            std::slice::from_ref(&missing),
+            None,
+            false,
+        );
+        assert!(matches!(single, Err(TilthError::IoError { path, .. }) if path == missing));
+
+        let other_missing = root.path().join("also_missing");
+        let all_failed = search_content_raw_scopes(
+            "a_unique_scope_marker",
+            &[missing.clone(), other_missing],
+            None,
+            false,
+        );
+        assert!(
+            matches!(all_failed, Err(TilthError::ScopedFailures { failures }) if failures.len() == 2)
+        );
+        assert!(matches!(
+            search_symbol_raw("marker", &missing, None, false),
+            Err(TilthError::IoError { .. })
+        ));
+        assert!(matches!(
+            glob::search("*.rs", &missing),
+            Err(TilthError::IoError { .. })
+        ));
+
+        let result = search_content_raw_scopes(
+            "a_unique_scope_marker",
+            &[good.clone(), missing.clone()],
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.total_found, 1);
+        assert!(matches!(
+            result.count_estimate,
+            crate::types::CountEstimate::Observed { count: 1 }
+        ));
+        assert_eq!(result.scope_errors.len(), 1);
+        let out =
+            format_raw_result_scopes(&result, &[good, missing], &OutlineCache::new()).unwrap();
+        assert!(out.contains("at least 1 matches"), "{out}");
+        assert!(out.contains("## Scope errors"), "{out}");
+    }
+
+    #[test]
+    fn repeated_root_uses_single_scope_presentation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("hit.rs"), "a_unique_scope_marker\n").unwrap();
+        let scopes = vec![root.path().to_path_buf(), root.path().to_path_buf()];
+        let result =
+            search_content_raw_scopes("a_unique_scope_marker", &scopes, None, false).unwrap();
+        let out = format_raw_result_scopes(&result, &scopes, &OutlineCache::new()).unwrap();
+        assert!(
+            !out.starts_with("# Search: \"a_unique_scope_marker\" in scopes ["),
+            "{out}"
+        );
+        assert!(
+            out.starts_with("# Search: \"a_unique_scope_marker\" in "),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn repeated_root_multi_symbol_uses_single_scope_presentation() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("hit.rs"),
+            "pub fn alpha_target() {}\npub fn beta_target() {}\n",
+        )
+        .unwrap();
+        let scopes = vec![root.path().to_path_buf(), root.path().to_path_buf()];
+        let out = search_multi_symbol_scopes_expanded(
+            &["alpha_target", "beta_target"],
+            &scopes,
+            &OutlineCache::new(),
+            &Session::new(),
+            &crate::index::bloom::BloomFilterCache::new(),
+            0,
+            None,
+            None,
+            false,
+            Some(80),
+        )
+        .unwrap();
+        assert!(!out.contains(" in scopes ["), "{out}");
+        assert!(out.contains("# Search: \"alpha_target\" in "), "{out}");
+        assert!(out.contains("# Search: \"beta_target\" in "), "{out}");
+    }
+
+    #[test]
+    fn partial_result_displays_lower_bound_and_error_prelude() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        let failed = root.path().join("failed");
+        let mut result = SearchResult {
+            query: "target".to_string(),
+            scope: root.path().to_path_buf(),
+            matches: Vec::new(),
+            total_found: 2,
+            definitions: 0,
+            usages: 2,
+            facet_totals: crate::types::FacetTotals {
+                usages_cross: 2,
+                ..Default::default()
+            },
+            scope_counts: vec![(good.clone(), 2)],
+            count_estimate: crate::types::CountEstimate::Observed { count: 2 },
+            scope_errors: vec![crate::types::ScopeError {
+                scope: failed.clone(),
+                error: TilthError::PermissionDenied {
+                    path: failed.clone(),
+                },
+            }],
+            file_ledger: None,
+            alias_paths: std::collections::HashMap::new(),
+        };
+        let out = format_raw_result_scopes(&result, &[good, failed], &OutlineCache::new()).unwrap();
+        assert!(out.contains("at least 2 matches"), "{out}");
+        assert!(out.contains("## Scope errors"), "{out}");
+        assert!(out.contains("[permission denied]"), "{out}");
+        result.scope_counts = vec![(PathBuf::from("."), 0)];
+        let header =
+            search_header_for_scopes(&result, &[PathBuf::from("."), PathBuf::from("/failed")]);
+        assert!(header.contains(". (0)"), "{header}");
+    }
+
+    #[test]
+    fn multi_symbol_sections_keep_one_error_per_failed_scope_through_final_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        let failed = root.path().join("failed");
+        let results: Vec<_> = ["alpha", "beta"]
+            .into_iter()
+            .map(|query| SearchResult {
+                query: query.to_string(),
+                scope: root.path().to_path_buf(),
+                matches: Vec::new(),
+                total_found: 1,
+                definitions: 0,
+                usages: 1,
+                facet_totals: crate::types::FacetTotals {
+                    usages_cross: 1,
+                    ..Default::default()
+                },
+                scope_counts: vec![(good.clone(), 1)],
+                count_estimate: crate::types::CountEstimate::Observed { count: 1 },
+                scope_errors: vec![crate::types::ScopeError {
+                    scope: failed.clone(),
+                    error: TilthError::PermissionDenied {
+                        path: failed.clone(),
+                    },
+                }],
+                file_ledger: None,
+                alias_paths: std::collections::HashMap::new(),
+            })
+            .collect();
+        assert!(one_root_multi_symbol_header(&results[0]).contains("at least 1 matches"));
+        let out = format_multi_symbol_scope_results(
+            &results,
+            &[good, failed],
+            &OutlineCache::new(),
+            &Session::new(),
+            &crate::index::bloom::BloomFilterCache::new(),
+            0,
+            Some(100),
+        )
+        .unwrap();
+        assert_eq!(out.matches("- ").count(), 1, "{out}");
+        assert!(out.contains("# Search: \"alpha\""), "{out}");
+        assert!(out.contains("# Search: \"beta\""), "{out}");
+        let budgeted = crate::budget::apply(&out, 30);
+        assert!(budgeted.contains("## Scope errors") || budgeted == "... truncated");
+        assert!(!budgeted.contains("- /failed: permission deni\n"));
+    }
     use std::collections::HashSet;
     use std::sync::Mutex;
 
@@ -2417,7 +2638,7 @@ mod tests {
         .unwrap();
         // Should find the symbol in both real/api.rs and linked/api.rs
         assert!(
-            result.total_found >= 2,
+            result.total_found == 1,
             "expected symbol found via both real and symlinked paths, got {}",
             result.total_found
         );
@@ -2749,6 +2970,10 @@ mod tests {
                 ..Default::default()
             },
             scope_counts: Vec::new(),
+            count_estimate: crate::types::CountEstimate::Exact(120),
+            scope_errors: Vec::new(),
+            file_ledger: None,
+            alias_paths: std::collections::HashMap::new(),
         };
 
         assert_eq!(hidden_beyond_facets(&result), 20);
@@ -2771,6 +2996,10 @@ mod tests {
                 ..Default::default()
             },
             scope_counts: vec![(one.clone(), 2), (two.clone(), 1)],
+            count_estimate: crate::types::CountEstimate::Exact(3),
+            scope_errors: Vec::new(),
+            file_ledger: None,
+            alias_paths: std::collections::HashMap::new(),
         };
         let out = format_raw_result_scopes(&result, &[one, two], &OutlineCache::new()).unwrap();
         assert!(out.contains("one (2)"), "{out}");

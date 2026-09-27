@@ -57,6 +57,68 @@ pub fn sort(matches: &mut [Match], query: &str, scope: &Path, context: Option<&P
     });
 }
 
+/// Score one actual observation using the same key as a one-root search.
+/// Callers merging scopes pass one shared clock value for the whole query.
+pub(super) fn observation_score(
+    m: &Match,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    now: SystemTime,
+) -> i32 {
+    let ctx_parent = context.and_then(|c| c.parent());
+    let ctx_pkg_root = context
+        .and_then(crate::lang::package_root)
+        .map(std::path::Path::to_path_buf);
+    let mut pkg_cache = HashMap::new();
+    score(
+        m,
+        query,
+        scope,
+        ctx_parent,
+        ctx_pkg_root.as_ref(),
+        &mut pkg_cache,
+        now,
+    )
+}
+
+pub(super) fn sort_with_alias_paths(
+    matches: &mut Vec<Match>,
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    alias_paths: &HashMap<PathBuf, Vec<PathBuf>>,
+) {
+    let now = SystemTime::now();
+    let score = |m: &Match| {
+        let physical = m.path.canonicalize().unwrap_or_else(|_| m.path.clone());
+        alias_paths.get(&physical).map_or_else(
+            || observation_score(m, query, scope, context, now),
+            |paths| {
+                paths
+                    .iter()
+                    .map(|path| {
+                        let mut observed = m.clone();
+                        observed.path.clone_from(path);
+                        observation_score(&observed, query, scope, context, now)
+                    })
+                    .max()
+                    .unwrap_or_else(|| observation_score(m, query, scope, context, now))
+            },
+        )
+    };
+    let mut scored: Vec<(i32, Match)> = std::mem::take(matches)
+        .into_iter()
+        .map(|m| (score(&m), m))
+        .collect();
+    scored.sort_by(|(sa, a), (sb, b)| {
+        sb.cmp(sa)
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+    });
+    matches.extend(scored.into_iter().map(|(_, m)| m));
+}
+
 /// Keep the `k` highest-ranked matches and drop the rest, preserving nothing
 /// else. Scores every match once — `sort`'s comparator re-scores O(n log n)
 /// times — and orders by the same (score, path, line) key, so the survivors are

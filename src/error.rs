@@ -5,6 +5,10 @@ use thiserror::Error;
 /// Every error tilth can produce. Displayed as user-facing messages with suggestions.
 #[derive(Debug, Error)]
 pub enum TilthError {
+    #[error("all scopes failed: {}", format_scoped_failures(failures))]
+    ScopedFailures {
+        failures: Vec<crate::types::ScopeError>,
+    },
     #[error("not found: {}{}", path.display(), suggestion.as_deref().map_or(String::new(), |s| format!(" — did you mean: {s}")))]
     NotFound {
         path: PathBuf,
@@ -35,9 +39,18 @@ impl TilthError {
             Self::NotFound { .. }
             | Self::IoError { .. }
             | Self::AlreadyExists { .. }
-            | Self::ConcurrentModification { .. } => 2,
+            | Self::ConcurrentModification { .. }
+            | Self::ScopedFailures { .. } => 2,
             Self::InvalidQuery { .. } | Self::ParseError { .. } => 3,
             Self::PermissionDenied { .. } => 4,
         }
     }
+}
+
+fn format_scoped_failures(failures: &[crate::types::ScopeError]) -> String {
+    failures
+        .iter()
+        .map(|failure| format!("{}: {}", failure.scope.display(), failure.error))
+        .collect::<Vec<_>>()
+        .join("; ")
 }

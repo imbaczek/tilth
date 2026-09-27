@@ -181,19 +181,6 @@ pub fn run_expanded_scopes(
     cache: &OutlineCache,
     cli_full: bool,
 ) -> Result<String, TilthError> {
-    if scopes.len() == 1 {
-        return run_expanded(
-            query,
-            &scopes[0],
-            section,
-            budget_tokens,
-            full,
-            expand,
-            glob,
-            cache,
-            cli_full,
-        );
-    }
     run_inner_scopes(
         query,
         scopes,
@@ -290,7 +277,22 @@ fn run_inner_scopes(
     cache: &OutlineCache,
     cli_full: bool,
 ) -> Result<String, TilthError> {
-    let mut classifications: Vec<_> = scopes.iter().map(|scope| classify(query, scope)).collect();
+    if scopes.is_empty() {
+        return Err(TilthError::NotFound {
+            path: PathBuf::from("."),
+            suggestion: None,
+        });
+    }
+    let mut seen_roots = std::collections::HashSet::new();
+    let scopes: Vec<PathBuf> = scopes
+        .iter()
+        .filter(|scope| {
+            seen_roots.insert(scope.canonicalize().unwrap_or_else(|_| (*scope).clone()))
+        })
+        .cloned()
+        .collect();
+    let scopes = scopes.as_slice();
+    let classifications: Vec<_> = scopes.iter().map(|scope| classify(query, scope)).collect();
     let multi_scope = scopes.len() > 1;
     let has_file_path = classifications
         .iter()
@@ -298,7 +300,7 @@ fn run_inner_scopes(
     let query_type = if multi_scope && has_file_path {
         QueryType::FilePath(PathBuf::from(query))
     } else {
-        classifications.remove(0)
+        classifications[0].clone()
     };
     let use_expanded =
         expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
@@ -326,33 +328,18 @@ fn run_inner_scopes(
             let session = session::Session::new();
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
-            let output = if multi_scope {
-                search::search_multi_symbol_scopes_expanded(
-                    &parts,
-                    scopes,
-                    cache,
-                    &session,
-                    &bloom,
-                    expand,
-                    None,
-                    glob,
-                    cli_full,
-                    budget_tokens,
-                )?
-            } else {
-                search::search_multi_symbol_expanded(
-                    &parts,
-                    &scopes[0],
-                    cache,
-                    &session,
-                    &bloom,
-                    expand,
-                    None,
-                    glob,
-                    cli_full,
-                    budget_tokens,
-                )?
-            };
+            let output = search::search_multi_symbol_scopes_expanded(
+                &parts,
+                scopes,
+                cache,
+                &session,
+                &bloom,
+                expand,
+                None,
+                glob,
+                cli_full,
+                budget_tokens,
+            )?;
             return match budget_tokens {
                 Some(budget) => Ok(budget::apply(&output, budget)),
                 None => Ok(output),
@@ -361,9 +348,9 @@ fn run_inner_scopes(
     }
 
     let output = match query_type {
-        QueryType::FilePath(_) if multi_scope => {
+        QueryType::FilePath(_) => {
             let mut outputs = Vec::new();
-            let mut first_error = None;
+            let mut failures = Vec::new();
             for (scope_index, (scope, scoped_query_type)) in
                 scopes.iter().zip(classifications).enumerate()
             {
@@ -375,44 +362,42 @@ fn run_inner_scopes(
                 };
                 match read_file_query(&path, scope, section, full, cache) {
                     Ok(output) => {
-                        let output = apply_budget(output, budget_tokens);
-                        outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
+                        if multi_scope {
+                            let output = apply_budget(output, budget_tokens);
+                            outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
+                        } else {
+                            outputs.push(output);
+                        }
                     }
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
+                    Err(error) => failures.push(crate::types::ScopeError {
+                        scope: scope.clone(),
+                        error,
+                    }),
                 }
             }
-            if outputs.is_empty() {
-                return Err(first_error.unwrap_or_else(|| TilthError::NotFound {
-                    path: PathBuf::from(query),
-                    suggestion: None,
-                }));
-            }
-            return Ok(apply_budget(outputs.join("\n\n---\n"), budget_tokens));
+            return finish_scoped_operations(query, &outputs, failures, budget_tokens);
         }
-        QueryType::FilePath(path) => read_file_query(&path, &scopes[0], section, full, cache)?,
-        QueryType::Glob(pattern) if multi_scope => {
+        QueryType::Glob(pattern) => {
             let mut outputs = Vec::new();
-            let mut first_error = None;
+            let mut failures = Vec::new();
             for scope in scopes {
                 match search::search_glob(&pattern, scope) {
                     Ok(output) => {
-                        let output = apply_budget(output, budget_tokens);
-                        outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
+                        if multi_scope {
+                            let output = apply_budget(output, budget_tokens);
+                            outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
+                        } else {
+                            outputs.push(output);
+                        }
                     }
-                    Err(error) if first_error.is_none() => first_error = Some(error),
-                    Err(_) => {}
+                    Err(error) => failures.push(crate::types::ScopeError {
+                        scope: scope.clone(),
+                        error,
+                    }),
                 }
             }
-            if outputs.is_empty() {
-                return Err(first_error.unwrap_or_else(|| TilthError::NotFound {
-                    path: PathBuf::from(query),
-                    suggestion: None,
-                }));
-            }
-            return Ok(apply_budget(outputs.join("\n\n---\n"), budget_tokens));
+            return finish_scoped_operations(query, &outputs, failures, budget_tokens);
         }
-        QueryType::Glob(pattern) => search::search_glob(&pattern, &scopes[0])?,
         _ if use_expanded => {
             let ctx = ExpandedCtx {
                 session: session::Session::new(),
@@ -463,6 +448,37 @@ fn apply_budget(output: String, budget_tokens: Option<u64>) -> String {
     }
 }
 
+fn finish_scoped_operations(
+    query: &str,
+    outputs: &[String],
+    mut failures: Vec<crate::types::ScopeError>,
+    budget_tokens: Option<u64>,
+) -> Result<String, TilthError> {
+    if outputs.is_empty() {
+        return match failures.len() {
+            0 => Err(TilthError::NotFound {
+                path: PathBuf::from(query),
+                suggestion: None,
+            }),
+            1 => Err(failures.pop().expect("one scope failure").error),
+            _ => Err(TilthError::ScopedFailures { failures }),
+        };
+    }
+    let joined = outputs.join("\n\n---\n");
+    if failures.is_empty() {
+        return Ok(apply_budget(joined, budget_tokens));
+    }
+    let mut prelude = format!("# Search: \"{query}\"\n\n## Scope errors\n");
+    for failure in failures {
+        use std::fmt::Write as _;
+        let _ = writeln!(prelude, "- {}: {}", failure.scope.display(), failure.error);
+    }
+    Ok(apply_budget(
+        format!("{}\n\n{joined}", prelude.trim_end()),
+        budget_tokens,
+    ))
+}
+
 fn run_query_expanded(
     query_type: &QueryType,
     scopes: &[PathBuf],
@@ -470,20 +486,7 @@ fn run_query_expanded(
     ctx: &ExpandedCtx,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
-    let scope = &scopes[0];
     match query_type {
-        QueryType::Symbol(name) if scopes.len() == 1 => search::search_symbol_expanded(
-            name,
-            scope,
-            cache,
-            &ctx.session,
-            &ctx.bloom,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
         QueryType::Symbol(name) => search::search_symbol_scopes_expanded(
             name,
             scopes,
@@ -496,19 +499,6 @@ fn run_query_expanded(
             ctx.full_search,
             ctx.budget,
         ),
-        QueryType::Concept(text) if text.contains(' ') && scopes.len() == 1 => {
-            search::search_content_expanded(
-                text,
-                scope,
-                cache,
-                &ctx.session,
-                ctx.expand,
-                None,
-                glob,
-                ctx.full_search,
-                ctx.budget,
-            )
-        }
         QueryType::Concept(text) if text.contains(' ') => search::search_content_scopes_expanded(
             text,
             scopes,
@@ -520,20 +510,6 @@ fn run_query_expanded(
             ctx.full_search,
             ctx.budget,
         ),
-        QueryType::Concept(text) | QueryType::Fallthrough(text) if scopes.len() == 1 => {
-            search::search_symbol_expanded(
-                text,
-                scope,
-                cache,
-                &ctx.session,
-                &ctx.bloom,
-                ctx.expand,
-                None,
-                glob,
-                ctx.full_search,
-                ctx.budget,
-            )
-        }
         QueryType::Concept(text) | QueryType::Fallthrough(text) => {
             search::search_symbol_scopes_expanded(
                 text,
@@ -548,31 +524,9 @@ fn run_query_expanded(
                 ctx.budget,
             )
         }
-        QueryType::Content(text) if scopes.len() == 1 => search::search_content_expanded(
-            text,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
         QueryType::Content(text) => search::search_content_scopes_expanded(
             text,
             scopes,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
-        QueryType::Regex(pattern) if scopes.len() == 1 => search::search_regex_expanded(
-            pattern,
-            scope,
             cache,
             &ctx.session,
             ctx.expand,
@@ -608,9 +562,6 @@ fn run_query_basic(
     full_search: bool,
 ) -> Result<String, TilthError> {
     match query_type {
-        QueryType::Symbol(name) if scopes.len() == 1 => {
-            search::search_symbol(name, &scopes[0], cache, glob, full_search)
-        }
         QueryType::Symbol(name) => {
             let result = search_symbol_raw_for_scopes(name, scopes, glob, full_search)?;
             format_raw_result_for_scopes(&result, scopes, cache)
@@ -621,15 +572,9 @@ fn run_query_basic(
         QueryType::Concept(text) => {
             single_query_search(text, scopes, cache, true, glob, full_search)
         }
-        QueryType::Content(text) if scopes.len() == 1 => {
-            search::search_content(text, &scopes[0], cache, glob, full_search)
-        }
         QueryType::Content(text) => {
             let result = search_content_raw_for_scopes(text, scopes, glob, full_search)?;
             format_raw_result_for_scopes(&result, scopes, cache)
-        }
-        QueryType::Regex(pattern) if scopes.len() == 1 => {
-            search::search_regex(pattern, &scopes[0], cache, glob, full_search)
         }
         QueryType::Regex(pattern) => {
             let result = search_regex_raw_for_scopes(pattern, scopes, glob, full_search)?;
@@ -650,11 +595,7 @@ fn search_symbol_raw_for_scopes(
     glob: Option<&str>,
     full_search: bool,
 ) -> Result<SearchResult, TilthError> {
-    if scopes.len() == 1 {
-        search::search_symbol_raw(query, &scopes[0], glob, full_search)
-    } else {
-        search::search_symbol_raw_scopes(query, scopes, glob, full_search)
-    }
+    search::search_symbol_raw_scopes(query, scopes, glob, full_search)
 }
 
 fn search_content_raw_for_scopes(
@@ -663,11 +604,7 @@ fn search_content_raw_for_scopes(
     glob: Option<&str>,
     full_search: bool,
 ) -> Result<SearchResult, TilthError> {
-    if scopes.len() == 1 {
-        search::search_content_raw(query, &scopes[0], glob, full_search)
-    } else {
-        search::search_content_raw_scopes(query, scopes, glob, full_search)
-    }
+    search::search_content_raw_scopes(query, scopes, glob, full_search)
 }
 
 fn search_regex_raw_for_scopes(
@@ -676,11 +613,7 @@ fn search_regex_raw_for_scopes(
     glob: Option<&str>,
     full_search: bool,
 ) -> Result<SearchResult, TilthError> {
-    if scopes.len() == 1 {
-        search::search_regex_raw(pattern, &scopes[0], glob, full_search)
-    } else {
-        search::search_regex_raw_scopes(pattern, scopes, glob, full_search)
-    }
+    search::search_regex_raw_scopes(pattern, scopes, glob, full_search)
 }
 
 fn format_raw_result_for_scopes(
@@ -688,10 +621,23 @@ fn format_raw_result_for_scopes(
     scopes: &[PathBuf],
     cache: &OutlineCache,
 ) -> Result<String, TilthError> {
-    if scopes.len() == 1 {
-        search::format_raw_result(result, cache)
-    } else {
-        search::format_raw_result_scopes(result, scopes, cache)
+    search::format_raw_result_scopes(result, scopes, cache)
+}
+
+fn inherit_scope_failures(target: &mut SearchResult, source: &mut SearchResult) {
+    for failure in source.scope_errors.drain(..) {
+        if !target
+            .scope_errors
+            .iter()
+            .any(|existing| existing.scope == failure.scope)
+        {
+            target.scope_errors.push(failure);
+        }
+    }
+    if !target.scope_errors.is_empty() {
+        target.count_estimate = crate::types::CountEstimate::Observed {
+            count: target.total_found,
+        };
     }
 }
 
@@ -704,7 +650,7 @@ fn single_query_search(
     glob: Option<&str>,
     full_search: bool,
 ) -> Result<String, TilthError> {
-    let symbol_result = search_symbol_raw_for_scopes(text, scopes, glob, full_search)?;
+    let mut symbol_result = search_symbol_raw_for_scopes(text, scopes, glob, full_search)?;
     let accept_symbol = if prefer_definitions {
         symbol_result.definitions > 0
     } else {
@@ -715,12 +661,14 @@ fn single_query_search(
         return format_raw_result_for_scopes(&symbol_result, scopes, cache);
     }
 
-    let content_result = search_content_raw_for_scopes(text, scopes, glob, full_search)?;
+    let mut content_result = search_content_raw_for_scopes(text, scopes, glob, full_search)?;
+    inherit_scope_failures(&mut content_result, &mut symbol_result);
     if content_result.total_found > 0 {
         return format_raw_result_for_scopes(&content_result, scopes, cache);
     }
 
     if prefer_definitions && symbol_result.total_found > 0 {
+        inherit_scope_failures(&mut symbol_result, &mut content_result);
         return format_raw_result_for_scopes(&symbol_result, scopes, cache);
     }
 
@@ -732,7 +680,7 @@ fn single_query_search(
     } else {
         None
     };
-    Err(TilthError::NotFound { path, suggestion })
+    finish_concept_no_hit(&content_result, scopes, cache, path, suggestion)
 }
 
 /// Multi-word concept search: exact phrase first, then relaxed word proximity.
@@ -767,6 +715,7 @@ fn multi_word_concept_search(
     };
 
     let mut relaxed_result = search_regex_raw_for_scopes(&relaxed, scopes, glob, full_search)?;
+    inherit_scope_failures(&mut relaxed_result, &mut content_result);
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
         return format_raw_result_for_scopes(&relaxed_result, scopes, cache);
@@ -781,12 +730,193 @@ fn multi_word_concept_search(
     } else {
         None
     };
-    Err(TilthError::NotFound { path, suggestion })
+    finish_concept_no_hit(&relaxed_result, scopes, cache, path, suggestion)
+}
+
+fn finish_concept_no_hit(
+    result: &SearchResult,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    path: PathBuf,
+    suggestion: Option<String>,
+) -> Result<String, TilthError> {
+    if result.scope_errors.is_empty() {
+        Err(TilthError::NotFound { path, suggestion })
+    } else {
+        format_raw_result_for_scopes(result, scopes, cache)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concept_phases_choose_definition_and_exact_phrase_across_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("notes.txt"), "concept_priority_target\n").unwrap();
+        std::fs::write(
+            second.join("definition.rs"),
+            "pub fn concept_priority_target() {}\n",
+        )
+        .unwrap();
+        let scopes = [first.clone(), second.clone()];
+        let output = single_query_search(
+            "concept_priority_target",
+            &scopes,
+            &OutlineCache::new(),
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(output.contains("definition.rs"), "{output}");
+        assert!(output.contains("definition"), "{output}");
+
+        std::fs::write(first.join("exact.txt"), "exact precedence phrase\n").unwrap();
+        std::fs::write(
+            second.join("relaxed.txt"),
+            "phrase before exact precedence\n",
+        )
+        .unwrap();
+        let output = multi_word_concept_search(
+            "exact precedence phrase",
+            &scopes,
+            &OutlineCache::new(),
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(output.contains("exact.txt"), "{output}");
+        assert!(!output.contains("relaxed.txt"), "{output}");
+    }
+
+    #[test]
+    fn comma_query_zero_expand_keeps_cli_library_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )
+        .unwrap();
+        let out = run_expanded_scopes(
+            "alpha,beta",
+            &[tmp.path().to_path_buf()],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &OutlineCache::new(),
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("# Search: \"alpha\""), "{out}");
+        assert!(out.contains("# Search: \"beta\""), "{out}");
+        assert!(out.contains("```"), "{out}");
+    }
+
+    #[test]
+    fn scoped_file_and_glob_reducer_preserves_failures() {
+        let failed = PathBuf::from("/failed");
+        let failure = || crate::types::ScopeError {
+            scope: failed.clone(),
+            error: TilthError::PermissionDenied {
+                path: failed.clone(),
+            },
+        };
+        let out = finish_scoped_operations(
+            "target.rs",
+            &["# Scope: /good\n\nfound".to_string()],
+            vec![failure()],
+            Some(80),
+        )
+        .unwrap();
+        assert!(out.contains("## Scope errors"), "{out}");
+        assert!(out.contains("/failed"), "{out}");
+        assert!(out.contains("found"), "{out}");
+
+        let error = finish_scoped_operations("target.rs", &[], vec![failure(), failure()], None)
+            .unwrap_err();
+        assert!(matches!(error, TilthError::ScopedFailures { .. }));
+    }
+
+    #[test]
+    fn concept_phase_error_inheritance_keeps_typed_code_and_lower_bound() {
+        let failed = PathBuf::from("/failed");
+        let make_result = |query: &str, total_found: usize| SearchResult {
+            query: query.to_string(),
+            scope: PathBuf::from("/"),
+            matches: Vec::new(),
+            total_found,
+            definitions: 0,
+            usages: total_found,
+            facet_totals: crate::types::FacetTotals::default(),
+            scope_counts: Vec::new(),
+            count_estimate: crate::types::CountEstimate::Exact(total_found),
+            scope_errors: Vec::new(),
+            file_ledger: None,
+            alias_paths: std::collections::HashMap::new(),
+        };
+        let mut symbol = make_result("target", 0);
+        symbol.scope_errors.push(crate::types::ScopeError {
+            scope: failed.clone(),
+            error: TilthError::PermissionDenied {
+                path: failed.clone(),
+            },
+        });
+        let mut content = make_result("target", 2);
+        inherit_scope_failures(&mut content, &mut symbol);
+        assert!(symbol.scope_errors.is_empty());
+        assert_eq!(content.scope_errors.len(), 1);
+        assert_eq!(content.scope_errors[0].scope, failed);
+        assert_eq!(content.scope_errors[0].error.exit_code(), 4);
+        assert_eq!(
+            content.count_estimate,
+            crate::types::CountEstimate::Observed { count: 2 }
+        );
+    }
+
+    #[test]
+    fn concept_no_hit_keeps_partial_scope_failure_instead_of_not_found() {
+        let root = tempfile::tempdir().unwrap();
+        let good = root.path().join("good");
+        let failed = root.path().join("failed");
+        let result = SearchResult {
+            query: "missing phrase".to_string(),
+            scope: root.path().to_path_buf(),
+            matches: Vec::new(),
+            total_found: 0,
+            definitions: 0,
+            usages: 0,
+            facet_totals: crate::types::FacetTotals::default(),
+            scope_counts: vec![(good.clone(), 0)],
+            count_estimate: crate::types::CountEstimate::Observed { count: 0 },
+            scope_errors: vec![crate::types::ScopeError {
+                scope: failed.clone(),
+                error: TilthError::PermissionDenied {
+                    path: failed.clone(),
+                },
+            }],
+            file_ledger: None,
+            alias_paths: std::collections::HashMap::new(),
+        };
+        let out = finish_concept_no_hit(
+            &result,
+            &[good, failed],
+            &OutlineCache::new(),
+            PathBuf::from("missing phrase"),
+            None,
+        )
+        .unwrap();
+        assert!(out.contains("at least 0 matches"), "{out}");
+        assert!(out.contains("## Scope errors"), "{out}");
+        assert!(out.contains("[permission denied]"), "{out}");
+    }
 
     /// 15 files, each carrying one instance of every query shape that reaches
     /// `run_inner` with `expand == 0`, so one fixture covers them all.
@@ -937,13 +1067,16 @@ mod tests {
         // only query that exercises the content stage of the cascade.
         let marks = search::search_symbol_raw("marks", scope, None, false).expect("symbol search");
         assert_eq!(marks.definitions, 0, "marks must have no definition");
-        let marks_text = search::search_content_raw("marks", scope, None, false).expect("content");
+        let marks_text =
+            search::search_content_raw_scopes("marks", &[scope.to_path_buf()], None, false)
+                .expect("content");
         assert!(marks_text.total_found > 0, "marks must have content hits");
 
         // "widget 424242" must not appear verbatim, or the multi-word search
         // stops at the exact-phrase stage and never reaches the relaxed regex.
         let phrase =
-            search::search_content_raw("widget 424242", scope, None, false).expect("content");
+            search::search_content_raw_scopes("widget 424242", &[scope.to_path_buf()], None, false)
+                .expect("content");
         assert_eq!(phrase.total_found, 0, "the phrase must not match verbatim");
     }
 
@@ -1188,6 +1321,131 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.matches("absolute file content").count(), 1, "{out}");
+    }
+
+    #[test]
+    fn multi_scope_relative_file_path_reads_each_root_specific_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(first.join("src")).unwrap();
+        std::fs::create_dir_all(second.join("src")).unwrap();
+        std::fs::write(first.join("src/x.rs"), "first relative target\n").unwrap();
+        std::fs::write(second.join("src/x.rs"), "second relative target\n").unwrap();
+
+        let out = run_expanded_scopes(
+            "src/x.rs",
+            &[first.clone(), second.clone()],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &OutlineCache::new(),
+            false,
+        )
+        .expect("each scope should resolve its own relative file");
+
+        assert!(out.contains("first relative target"), "{out}");
+        assert!(out.contains("second relative target"), "{out}");
+        assert!(
+            out.contains(&format!("# Scope: {}", first.display())),
+            "{out}"
+        );
+        assert!(
+            out.contains(&format!("# Scope: {}", second.display())),
+            "{out}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn multi_scope_duplicate_canonical_file_roots_read_once_and_keep_first_label() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let alias = tmp.path().join("alias");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("same.txt"), "one physical file read\n").unwrap();
+        symlink(&first, &alias).unwrap();
+
+        let out = run_expanded_scopes(
+            "same.txt",
+            &[first.clone(), alias.clone()],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &OutlineCache::new(),
+            false,
+        )
+        .expect("duplicate canonical roots should succeed");
+
+        assert_eq!(out.matches("one physical file read").count(), 1, "{out}");
+        assert!(out.contains(&first.display().to_string()), "{out}");
+        assert!(!out.contains("# Scope:"), "{out}");
+        assert!(!out.contains(&alias.display().to_string()), "{out}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_canonical_glob_roots_use_single_root_presentation() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let alias = tmp.path().join("alias");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::write(first.join("only.rs"), "pub fn only() {}\n").unwrap();
+        symlink(&first, &alias).unwrap();
+        let out = run_expanded_scopes(
+            "*.rs",
+            &[first.clone(), alias],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &OutlineCache::new(),
+            false,
+        )
+        .unwrap();
+        assert!(out.contains("only.rs"), "{out}");
+        assert!(!out.contains("# Scope:"), "{out}");
+    }
+
+    #[test]
+    fn one_root_scope_entry_point_preserves_legacy_output() {
+        let dir = fixture();
+        let cache = OutlineCache::new();
+        let direct = run_expanded(
+            "424242",
+            dir.path(),
+            None,
+            None,
+            false,
+            0,
+            Some("*.rs"),
+            &cache,
+            false,
+        )
+        .expect("single-root search should succeed");
+        let through_scopes = run_expanded_scopes(
+            "424242",
+            &[dir.path().to_path_buf()],
+            None,
+            None,
+            false,
+            0,
+            Some("*.rs"),
+            &cache,
+            false,
+        )
+        .expect("one-element scope search should succeed");
+
+        assert_eq!(through_scopes, direct);
     }
 
     #[test]

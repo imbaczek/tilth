@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::time::SystemTime;
 
 /// What kind of query the user issued.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum QueryType {
     FilePath(PathBuf),
     Glob(String),
@@ -144,6 +144,34 @@ pub struct SearchResult {
     pub facet_totals: FacetTotals,
     /// Matches found in each explicit scope before the display cap.
     pub scope_counts: Vec<(PathBuf, usize)>,
+    /// Completeness of the requested aggregate. A failed scope or skipped
+    /// eligible symbol work makes `total_found` a lower bound.
+    pub count_estimate: CountEstimate,
+    pub scope_errors: Vec<ScopeError>,
+    /// Complete per-physical-file counts for Content and Regex searches.
+    pub file_ledger: Option<std::collections::HashMap<PathBuf, FileTotals>>,
+    /// Every lexical path admitted for a physical file in this root.
+    /// Alias rows may be suppressed before candidate retention, but their
+    /// actual ranking observations still contribute during reduction.
+    pub alias_paths: std::collections::HashMap<(PathBuf, bool), Vec<PathBuf>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CountEstimate {
+    Exact(usize),
+    Observed { count: usize },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileTotals {
+    pub hits: usize,
+    pub tests: usize,
+}
+
+#[derive(Debug)]
+pub struct ScopeError {
+    pub scope: PathBuf,
+    pub error: crate::error::TilthError,
 }
 
 /// Pre-cap counts per subfacet. Defaults to all-zero for callers that don't

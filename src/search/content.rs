@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -7,7 +7,7 @@ use super::file_metadata;
 
 use crate::error::TilthError;
 use crate::search::rank;
-use crate::types::{FacetTotals, Match, SearchResult};
+use crate::types::{CountEstimate, FacetTotals, FileTotals, Match, SearchResult};
 use grep_regex::RegexMatcher;
 use grep_searcher::sinks::UTF8;
 use grep_searcher::Searcher;
@@ -79,27 +79,6 @@ fn search_capped(
 }
 
 /// Search each physical file once across scopes, before counting or capping hits.
-pub(super) fn search_collected_scoped(
-    pattern: &str,
-    scope: &Path,
-    is_regex: bool,
-    context: Option<&Path>,
-    glob: Option<&str>,
-    visited: &Mutex<HashSet<PathBuf>>,
-) -> Result<SearchResult, TilthError> {
-    let cap = FULL_MAX_MATCHES * COLLECTED_MATCH_FACTOR;
-    search_capped_with_visited(
-        pattern,
-        scope,
-        is_regex,
-        context,
-        glob,
-        cap,
-        cap,
-        Some(visited),
-    )
-}
-
 fn search_capped_with_visited(
     pattern: &str,
     scope: &Path,
@@ -121,6 +100,10 @@ fn search_capped_with_visited(
     })?;
 
     let matches: Mutex<Vec<Match>> = Mutex::new(Vec::new());
+    let local_visited = Mutex::new(HashSet::new());
+    let visited = visited.unwrap_or(&local_visited);
+    let observed_paths: Mutex<HashMap<PathBuf, Vec<PathBuf>>> = Mutex::new(HashMap::new());
+    let file_ledger: Mutex<HashMap<PathBuf, FileTotals>> = Mutex::new(HashMap::new());
     // Relaxed is correct: walker.run() joins all threads before we read the final value.
     let total_found = AtomicUsize::new(0);
     let tests_found = AtomicUsize::new(0);
@@ -132,6 +115,8 @@ fn search_capped_with_visited(
         let matches = &matches;
         let total_found = &total_found;
         let tests_found = &tests_found;
+        let file_ledger = &file_ledger;
+        let observed_paths = &observed_paths;
 
         Box::new(move |entry| {
             let Ok(entry) = entry else {
@@ -183,15 +168,22 @@ fn search_capped_with_visited(
 
             // Deduplicate only files admitted by this scope's glob/ignore rules
             // and the content filters above, before counting or capping hits.
-            if let Some(visited) = visited {
-                let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-                if !visited
+            let identity = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            {
+                let mut paths = observed_paths
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(identity)
-                {
-                    return ignore::WalkState::Continue;
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let aliases = paths.entry(identity.clone()).or_default();
+                if !aliases.iter().any(|observed| observed == path) {
+                    aliases.push(path.to_path_buf());
                 }
+            }
+            if !visited
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(identity.clone())
+            {
+                return ignore::WalkState::Continue;
             }
 
             let mut file_matches = Vec::new();
@@ -219,14 +211,26 @@ fn search_capped_with_visited(
             );
 
             if !file_matches.is_empty() {
+                let file_tests = file_matches
+                    .iter()
+                    .filter(|m| {
+                        let mut canonical = (*m).clone();
+                        canonical.path.clone_from(&identity);
+                        super::facets::is_test_match(&canonical)
+                    })
+                    .count();
+                file_ledger
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        identity,
+                        FileTotals {
+                            hits: file_matches.len(),
+                            tests: file_tests,
+                        },
+                    );
                 total_found.fetch_add(file_matches.len(), Ordering::Relaxed);
-                tests_found.fetch_add(
-                    file_matches
-                        .iter()
-                        .filter(|m| super::facets::is_test_match(m))
-                        .count(),
-                    Ordering::Relaxed,
-                );
+                tests_found.fetch_add(file_tests, Ordering::Relaxed);
                 // Carry only this file's own top `per_file_cap` forward. The
                 // global top-N is always a subset of the per-file top-Ns under
                 // the same comparator, so nothing displayed changes, while the
@@ -252,8 +256,22 @@ fn search_capped_with_visited(
     let mut all_matches = matches
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let observed_paths = observed_paths
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for m in &mut all_matches {
+        let identity = m.path.canonicalize().unwrap_or_else(|_| m.path.clone());
+        if let Some(paths) = observed_paths.get(&identity) {
+            if let Some(path) = paths
+                .iter()
+                .min_by(|a, b| compare_observed_paths(a, b, &identity))
+            {
+                m.path.clone_from(path);
+            }
+        }
+    }
 
-    rank::sort(&mut all_matches, pattern, scope, context);
+    rank::sort_with_alias_paths(&mut all_matches, pattern, scope, context, &observed_paths);
     // Content matches have no primary definition, so every non-test usage is
     // cross-package. Count both facets before either collection cap is applied.
     let tests = tests_found.load(Ordering::Relaxed);
@@ -275,7 +293,42 @@ fn search_capped_with_visited(
         usages: total,
         facet_totals,
         scope_counts: Vec::new(),
+        count_estimate: CountEstimate::Exact(total),
+        scope_errors: Vec::new(),
+        file_ledger: Some(
+            file_ledger
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        ),
+        alias_paths: observed_paths
+            .into_iter()
+            .map(|(physical, paths)| ((physical, false), paths))
+            .collect(),
     })
+}
+
+pub(super) fn preferred_path(candidate: &Path, current: &Path, canonical: &Path) -> bool {
+    if candidate == canonical {
+        return current != canonical;
+    }
+    if current == canonical {
+        return false;
+    }
+    let candidate = std::path::absolute(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    let current = std::path::absolute(current).unwrap_or_else(|_| current.to_path_buf());
+    let candidate = candidate.to_string_lossy();
+    let current = current.to_string_lossy();
+    (candidate.len(), candidate.as_ref()) < (current.len(), current.as_ref())
+}
+
+fn compare_observed_paths(a: &Path, b: &Path, canonical: &Path) -> std::cmp::Ordering {
+    if preferred_path(a, b, canonical) {
+        std::cmp::Ordering::Less
+    } else if preferred_path(b, a, canonical) {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
 }
 
 #[cfg(test)]

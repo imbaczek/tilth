@@ -15,12 +15,13 @@ pub struct FacetedResult {
 /// Partitions by definition type, test status, and package locality.
 pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
     // Find primary definition's package root for local/cross determination
-    let primary_pkg = matches
-        .iter()
-        .find(|m| m.is_definition)
-        .and_then(|m| m.path.parent())
-        .and_then(crate::lang::package_root)
-        .map(std::path::Path::to_path_buf);
+    let primary_pkg = matches.iter().find(|m| m.is_definition).and_then(|m| {
+        let physical = m.path.canonicalize().unwrap_or_else(|_| m.path.clone());
+        physical
+            .parent()
+            .and_then(crate::lang::package_root)
+            .map(Path::to_path_buf)
+    });
 
     let mut definitions = Vec::new();
     let mut implementations = Vec::new();
@@ -54,7 +55,8 @@ pub fn facet_matches(matches: Vec<Match>, _scope: &Path) -> FacetedResult {
 /// Check if a match is in a test file or contains test markers.
 pub(super) fn is_test_match(m: &Match) -> bool {
     // Path-based detection
-    let path_str = m.path.to_string_lossy();
+    let physical = m.path.canonicalize().unwrap_or_else(|_| m.path.clone());
+    let path_str = physical.to_string_lossy();
     if path_str.contains("_test.")
         || path_str.contains("/test/")
         || path_str.contains("/tests/")
@@ -83,7 +85,9 @@ fn is_same_package(path: &Path, primary_pkg: Option<&PathBuf>) -> bool {
         return false;
     };
 
-    path.parent()
+    let physical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    physical
+        .parent()
         .and_then(crate::lang::package_root)
         .is_some_and(|p| p == pkg_root.as_path())
 }

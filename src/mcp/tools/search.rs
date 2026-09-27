@@ -555,6 +555,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_symbol_zero_expand_keeps_mcp_adapter_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn alpha() {}\npub fn beta() {}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "query": "alpha,beta",
+            "kind": "symbol",
+            "root": tmp.path().to_str().unwrap(),
+            "expand": 0,
+        });
+        let out = tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap();
+        assert!(out.contains("# Search: \"alpha\""), "{out}");
+        assert!(out.contains("# Search: \"beta\""), "{out}");
+        assert!(!out.contains("```"), "{out}");
+    }
+
+    #[test]
+    fn one_root_regex_keeps_mcp_expansion() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn alpha42() {\n    println!(\"alpha42\");\n}\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({
+            "query": "alpha[0-9]+",
+            "kind": "regex",
+            "root": tmp.path().to_str().unwrap(),
+            "expand": 2,
+            "scope": ".",
+        });
+        let out = tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap();
+        assert!(out.contains("alpha42"), "{out}");
+        assert!(out.contains("lib.rs:1"), "{out}");
+        assert!(out.contains("lib.rs:2"), "{out}");
+    }
+
     /// WHY: the require-root discipline fires ONLY when a caller EXPLICITLY
     /// passes a relative scope/path without an absolute root. A bare
     /// `tilth_search(query)` call with no scope is the default flow of every

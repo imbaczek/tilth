@@ -10,6 +10,52 @@ pub const DEFAULT_BUDGET: u64 = 24_000;
 /// 2. Truncate content at section boundaries to avoid broken output
 /// 3. Never exceed the budget
 pub fn apply(output: &str, budget: u64) -> String {
+    if let Some(errors_start) = output.find("\n\n## Scope errors\n") {
+        let lines_start = errors_start + "\n\n## Scope errors\n".len();
+        let lines_end = output[lines_start..]
+            .find("\n\n")
+            .map_or(output.len(), |offset| lines_start + offset);
+        let error_lines: Vec<&str> = output[lines_start..lines_end]
+            .lines()
+            .filter(|line| line.starts_with("- "))
+            .collect();
+        if !error_lines.is_empty() && estimate_tokens(output.len() as u64) > budget {
+            let mut protected = output[..lines_start].to_string();
+            let byte_limit = budget.saturating_mul(4) as usize;
+            let mut included = 0usize;
+            for line in &error_lines {
+                if protected.len() + line.len() + 1 > byte_limit {
+                    break;
+                }
+                protected.push_str(line);
+                protected.push('\n');
+                included += 1;
+            }
+            let mut omitted = error_lines.len() - included;
+            if omitted > 0 {
+                let mut marker = format!("... {omitted} scope errors omitted");
+                while included > 0 && protected.len() + marker.len() > byte_limit {
+                    let cut = protected
+                        .rfind("\n- ")
+                        .expect("included scope error has a line boundary");
+                    protected.truncate(cut + 1);
+                    included -= 1;
+                    omitted += 1;
+                    marker = format!("... {omitted} scope errors omitted");
+                }
+                if protected.len() + marker.len() > byte_limit {
+                    return "... truncated".to_string();
+                }
+                protected.push_str(&marker);
+            } else if lines_end < output.len() {
+                let marker = "... truncated optional results";
+                if protected.len() + marker.len() <= byte_limit {
+                    protected.push_str(marker);
+                }
+            }
+            return protected.trim_end().to_string();
+        }
+    }
     let current = estimate_tokens(output.len() as u64);
     if current <= budget {
         return output.to_string();
@@ -60,6 +106,30 @@ pub fn apply(output: &str, budget: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scope_error_budget_keeps_whole_entries_or_reports_omission() {
+        let output = "# Search: \"target\"\n\n## Scope errors\n- /a: denied\n- /b: io failure\n\n## Matches\nvery long optional result".repeat(8);
+        let short = apply(&output, 14);
+        assert!(!short.contains("very long optional result"));
+        assert!(!short.contains("- /b: io failur\n"));
+        assert!(short.contains("scope errors omitted") || short.contains("... truncated"));
+
+        let enough = apply(&output, 30);
+        assert!(enough.contains("- /a: denied"));
+        assert!(enough.contains("- /b: io failure"));
+    }
+
+    #[test]
+    fn multi_symbol_final_budget_protects_error_prelude() {
+        let output = format!(
+            "# Search: multiple symbols\n\n## Scope errors\n- /missing: not found\n\n{}",
+            "# Search: \"alpha\"\n\n## Matches\noptional expansion\n\n---\n".repeat(30)
+        );
+        let result = apply(&output, 40);
+        assert!(result.contains("- /missing: not found"), "{result}");
+        assert!(!result.contains("optional expansion"), "{result}");
+    }
     use std::fmt::Write as _;
 
     #[test]
