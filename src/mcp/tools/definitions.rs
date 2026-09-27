@@ -384,6 +384,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         }));
     }
 
+    for tool in &mut tools {
+        tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
+            "type": "boolean",
+            "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting."
+        });
+    }
+
     tools
 }
 
