@@ -90,6 +90,10 @@ thread_local! {
     static CALL_GITIGNORE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
 }
 
+pub(crate) fn call_gitignore_override() -> Option<bool> {
+    CALL_GITIGNORE_OVERRIDE.with(|current| current.get())
+}
+
 pub(crate) fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<bool>);
     impl Drop for Restore {
