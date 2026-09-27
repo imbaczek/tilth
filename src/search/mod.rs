@@ -86,6 +86,22 @@ const GITIGNORE_OVERRIDE_DISABLED: u8 = 1;
 const GITIGNORE_OVERRIDE_ENABLED: u8 = 2;
 static GITIGNORE_OVERRIDE: AtomicU8 = AtomicU8::new(GITIGNORE_OVERRIDE_UNSET);
 
+thread_local! {
+    static CALL_GITIGNORE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CALL_GITIGNORE_OVERRIDE.with(|current| current.set(self.0));
+        }
+    }
+    let previous = CALL_GITIGNORE_OVERRIDE.with(|current| current.replace(value));
+    let _restore = Restore(previous);
+    f()
+}
+
 fn gitignore_from_env() -> Option<bool> {
     std::env::var("TILTH_RESPECT_GITIGNORE").ok().map(|v| {
         matches!(
@@ -96,6 +112,10 @@ fn gitignore_from_env() -> Option<bool> {
 }
 
 pub(crate) fn gitignore_config() -> (bool, &'static str) {
+    if let Some(value) = CALL_GITIGNORE_OVERRIDE.with(|current| current.get()) {
+        return (value, "call");
+    }
+
     match GITIGNORE_OVERRIDE.load(Ordering::Relaxed) {
         GITIGNORE_OVERRIDE_DISABLED => (false, "runtime"),
         GITIGNORE_OVERRIDE_ENABLED => (true, "runtime"),
