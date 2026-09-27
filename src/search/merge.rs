@@ -529,6 +529,45 @@ mod tests {
     }
 
     #[test]
+    fn multi_scope_gitignore_override_preserves_explicit_ignored_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let ignored = root.join("ignored");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::write(root.join("visible.rs"), "gitignore_multiscope_needle\n").unwrap();
+        std::fs::write(ignored.join("inside.rs"), "gitignore_multiscope_needle\n").unwrap();
+
+        for (respect_gitignore, parent_count) in [(true, 1), (false, 2)] {
+            crate::search::with_gitignore_override(Some(respect_gitignore), || {
+                let parent = content_raw_scopes(
+                    "gitignore_multiscope_needle",
+                    std::slice::from_ref(&root),
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(parent.total_found, parent_count);
+
+                let combined = content_raw_scopes(
+                    "gitignore_multiscope_needle",
+                    &[root.clone(), ignored.clone()],
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert_eq!(combined.total_found, 2);
+                assert_eq!(combined.matches.len(), 2);
+                assert_eq!(combined.scope_counts[0].1, parent_count);
+                assert_eq!(combined.scope_counts[1].1, 1);
+            });
+        }
+    }
+
+    #[test]
     fn overlapping_scopes_report_independent_content_and_regex_counts() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
