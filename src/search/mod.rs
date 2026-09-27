@@ -87,6 +87,22 @@ const GITIGNORE_OVERRIDE_DISABLED: u8 = 1;
 const GITIGNORE_OVERRIDE_ENABLED: u8 = 2;
 static GITIGNORE_OVERRIDE: AtomicU8 = AtomicU8::new(GITIGNORE_OVERRIDE_UNSET);
 
+thread_local! {
+    static CALL_GITIGNORE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn with_gitignore_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CALL_GITIGNORE_OVERRIDE.with(|current| current.set(self.0));
+        }
+    }
+    let previous = CALL_GITIGNORE_OVERRIDE.with(|current| current.replace(value));
+    let _restore = Restore(previous);
+    f()
+}
+
 fn gitignore_from_env() -> Option<bool> {
     std::env::var("TILTH_RESPECT_GITIGNORE").ok().map(|v| {
         matches!(
@@ -97,6 +113,10 @@ fn gitignore_from_env() -> Option<bool> {
 }
 
 pub(crate) fn gitignore_config() -> (bool, &'static str) {
+    if let Some(value) = CALL_GITIGNORE_OVERRIDE.with(|current| current.get()) {
+        return (value, "call");
+    }
+
     match GITIGNORE_OVERRIDE.load(Ordering::Relaxed) {
         GITIGNORE_OVERRIDE_DISABLED => (false, "runtime"),
         GITIGNORE_OVERRIDE_ENABLED => (true, "runtime"),
@@ -145,6 +165,15 @@ fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> Wa
     builder
 }
 
+fn include_entry(entry: &ignore::DirEntry) -> bool {
+    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+        if let Some(name) = entry.file_name().to_str() {
+            return !SKIP_DIRS.contains(&name);
+        }
+    }
+    true
+}
+
 /// Build a parallel directory walker over `.tilthignore`-filtered files except
 /// known junk directories. Gitignore-style files are opt-in.
 /// When `glob` is Some, applies a file-pattern override (whitelist or negation).
@@ -156,7 +185,8 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
             std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 6))
         });
 
-    let mut builder = base_walk_builder(scope);
+    let respect_gitignore = gitignore_config().0;
+    let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
     builder.threads(threads);
 
     if let Some(pattern) = glob {
@@ -168,10 +198,24 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
                     query: pattern.to_string(),
                     reason: format!("invalid glob: {e}"),
                 })?;
-            builder.overrides(overrides.build().map_err(|e| TilthError::InvalidQuery {
+            let overrides = overrides.build().map_err(|e| TilthError::InvalidQuery {
                 query: pattern.to_string(),
                 reason: format!("invalid glob: {e}"),
-            })?);
+            })?;
+            if respect_gitignore {
+                // A glob narrows the walk without whitelisting ignored entries.
+                builder.filter_entry(move |entry| {
+                    include_entry(entry)
+                        && !overrides
+                            .matched(
+                                entry.path(),
+                                entry.file_type().is_some_and(|ft| ft.is_dir()),
+                            )
+                            .is_ignore()
+                });
+            } else {
+                builder.overrides(overrides);
+            }
         }
     }
 
