@@ -25,6 +25,8 @@ Outline format: `[<start>-<end>]  <symbol>`. Full/section format: `<line> │ <c
 
 ## Search
 
+With multiple `--scope` arguments, a relative query that resolves to a file in any scope reads the matching file(s); it does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
+
 ```bash
 tilth <symbol> --scope <dir>                # definitions + usages
 tilth <symbol> --scope src --scope tests    # search multiple scopes
