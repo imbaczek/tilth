@@ -952,6 +952,81 @@ mod tests {
         counts
     }
 
+    #[test]
+    fn expanded_dispatch_routes_query_shapes_for_single_and_multiple_scopes() {
+        let empty = tempfile::tempdir().unwrap();
+        let populated = fixture();
+        let scopes = [empty.path().to_path_buf(), populated.path().to_path_buf()];
+        let cache = OutlineCache::new();
+        let queries = [
+            ("WidgetThing", "symbol", true),
+            ("widget", "single-word concept", true),
+            ("424242", "content", true),
+            ("/4242[0-9]{2}/", "regex", true),
+            ("tag 424242", "phrase concept", true),
+            ("missing/widget.rs", "fallthrough", false),
+        ];
+
+        for &(query, route, has_matches) in &queries {
+            if route == "fallthrough" {
+                assert!(matches!(
+                    classify(query, populated.path()),
+                    QueryType::Fallthrough(_)
+                ));
+            }
+
+            let single = run_expanded(
+                query,
+                populated.path(),
+                None,
+                None,
+                false,
+                1,
+                Some("*.rs"),
+                &cache,
+                false,
+            )
+            .unwrap_or_else(|err| panic!("single-scope {route} query {query:?}: {err}"));
+            let single_counts = header_match_counts(&single);
+            assert_eq!(single_counts.len(), 1, "single-scope {route}: {single}");
+            assert_eq!(
+                single_counts[0] > 0,
+                has_matches,
+                "single-scope {route} query {query:?}: {single}"
+            );
+            assert_eq!(
+                single.contains("```"),
+                has_matches,
+                "single-scope {route} query {query:?} should inline source iff it matches"
+            );
+
+            let multiple = run_expanded_scopes(
+                query,
+                &scopes,
+                None,
+                None,
+                false,
+                1,
+                Some("*.rs"),
+                &cache,
+                false,
+            )
+            .unwrap_or_else(|err| panic!("multi-scope {route} query {query:?}: {err}"));
+            let multiple_counts = header_match_counts(&multiple);
+            assert_eq!(multiple_counts.len(), 1, "multi-scope {route}: {multiple}");
+            assert_eq!(
+                multiple_counts[0] > 0,
+                has_matches,
+                "multi-scope {route} query {query:?}: {multiple}"
+            );
+            assert_eq!(
+                multiple.contains("```"),
+                has_matches,
+                "multi-scope {route} query {query:?} should inline source iff it matches"
+            );
+        }
+    }
+
     /// Three fixture properties are load-bearing for the coverage above and
     /// easy to break by editing the file body. Pin them here so such an edit
     /// fails loudly instead of quietly collapsing three cascade stages into
@@ -1086,6 +1161,32 @@ mod tests {
             !out.contains("noise.rs"),
             "missing-scope file path must not be reclassified as a search: {out}"
         );
+    }
+
+    #[test]
+    fn multi_scope_file_path_keeps_later_success_when_earlier_read_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(first.join("target.txt")).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("target.txt"), "readable later-scope content\n").unwrap();
+
+        let cache = OutlineCache::new();
+        let out = run_expanded_scopes(
+            "target.txt",
+            &[first, second],
+            None,
+            None,
+            false,
+            0,
+            None,
+            &cache,
+            false,
+        )
+        .expect("a failed file read in one scope should not discard another scope's result");
+
+        assert!(out.contains("readable later-scope content"), "{out}");
     }
 
     #[test]
