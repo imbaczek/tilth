@@ -65,7 +65,7 @@ use std::path::{Path, PathBuf};
 use cache::OutlineCache;
 use classify::classify;
 use error::TilthError;
-use types::QueryType;
+use types::{QueryType, SearchResult};
 
 #[must_use]
 pub fn apply_output_budget(output: &str, budget_tokens: u64) -> String {
@@ -265,98 +265,18 @@ fn run_inner(
     cache: &OutlineCache,
     cli_full: bool,
 ) -> Result<String, TilthError> {
-    let query_type = classify(query, scope);
-
-    let use_expanded =
-        expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
-
-    // Multi-symbol: comma-separated identifiers, 2..=5 items
-    // Check before main dispatch. Only activate when all parts look like identifiers
-    // to avoid hijacking regex (/foo,bar/) or glob (*.{rs,ts}) queries.
-    if query.contains(',')
-        && !matches!(
-            query_type,
-            QueryType::Regex(_) | QueryType::Glob(_) | QueryType::FilePath(_)
-        )
-    {
-        let parts: Vec<&str> = query
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
-        if parts.len() > 5 && all_identifiers {
-            return Err(TilthError::InvalidQuery {
-                query: query.to_string(),
-                reason: "multi-symbol search supports 2-5 symbols".to_string(),
-            });
-        }
-        if parts.len() >= 2 && parts.len() <= 5 && all_identifiers {
-            let session = session::Session::new();
-            let bloom = index::bloom::BloomFilterCache::new();
-            let expand = if expand > 0 { expand } else { 2 };
-            let output = search::search_multi_symbol_expanded(
-                &parts,
-                scope,
-                cache,
-                &session,
-                &bloom,
-                expand,
-                None,
-                glob,
-                cli_full,
-                budget_tokens,
-            )?;
-            // fit_to_budget (inside search_multi_symbol_expanded) already applied
-            // the real budget_tokens with value-based selection; budget::apply's
-            // own fast path is a no-op once output is already under budget.
-            return match budget_tokens {
-                Some(b) => Ok(budget::apply(&output, b)),
-                None => Ok(output),
-            };
-        }
-    }
-
-    // FilePath and Glob are read operations, not search — handle before expanded dispatch
-    let output = match query_type {
-        QueryType::FilePath(path) => {
-            let mut out = read::read_file(&path, section, full, cache, false)?;
-            if section.is_none() && !full && read::would_outline(&path) {
-                let related = read::imports::resolve_related_files(&path);
-                if !related.is_empty() {
-                    let hints: Vec<String> = related
-                        .iter()
-                        .filter_map(|p| p.strip_prefix(scope).ok().or(Some(p.as_path())))
-                        .map(|p| p.display().to_string())
-                        .collect();
-                    out.push_str("\n\n> Related: ");
-                    out.push_str(&hints.join(", "));
-                }
-            }
-            out
-        }
-        QueryType::Glob(pattern) => search::search_glob(&pattern, scope)?,
-        _ if use_expanded => {
-            let ctx = ExpandedCtx {
-                session: session::Session::new(),
-                bloom: index::bloom::BloomFilterCache::new(),
-                expand,
-                full_search: cli_full,
-                budget: budget_tokens,
-            };
-            run_query_expanded(&query_type, scope, cache, &ctx, glob)?
-        }
-        _ => run_query_basic(&query_type, scope, cache, glob, cli_full)?,
-    };
-
-    // For the expanded-search branch, fit_to_budget already applied
-    // budget_tokens with value-based selection — this pass is then a no-op
-    // (already under budget). For FilePath/Glob (no fit_to_budget path),
-    // this remains the only enforcement, unchanged from before this fix.
-    match budget_tokens {
-        Some(b) => Ok(budget::apply(&output, b)),
-        None => Ok(output),
-    }
+    let scopes = [scope.to_path_buf()];
+    run_inner_scopes(
+        query,
+        &scopes,
+        section,
+        budget_tokens,
+        full,
+        expand,
+        glob,
+        cache,
+        cli_full,
+    )
 }
 
 fn run_inner_scopes(
@@ -370,17 +290,20 @@ fn run_inner_scopes(
     cache: &OutlineCache,
     cli_full: bool,
 ) -> Result<String, TilthError> {
-    let query_type = if scopes
+    let mut classifications: Vec<_> = scopes.iter().map(|scope| classify(query, scope)).collect();
+    let multi_scope = scopes.len() > 1;
+    let has_file_path = classifications
         .iter()
-        .any(|scope| matches!(classify(query, scope), QueryType::FilePath(_)))
-    {
+        .any(|query_type| matches!(query_type, QueryType::FilePath(_)));
+    let query_type = if multi_scope && has_file_path {
         QueryType::FilePath(PathBuf::from(query))
     } else {
-        classify(query, &scopes[0])
+        classifications.remove(0)
     };
     let use_expanded =
         expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
 
+    // Multi-symbol queries keep their own expansion floor, including with expand=0.
     if query.contains(',')
         && !matches!(
             query_type,
@@ -390,101 +313,106 @@ fn run_inner_scopes(
         let parts: Vec<&str> = query
             .split(',')
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|part| !part.is_empty())
             .collect();
-        let all_identifiers = parts.iter().all(|p| classify::is_identifier(p));
+        let all_identifiers = parts.iter().all(|part| classify::is_identifier(part));
         if parts.len() > 5 && all_identifiers {
             return Err(TilthError::InvalidQuery {
                 query: query.to_string(),
                 reason: "multi-symbol search supports 2-5 symbols".to_string(),
             });
         }
-        if parts.len() >= 2 && parts.len() <= 5 && all_identifiers {
+        if (2..=5).contains(&parts.len()) && all_identifiers {
             let session = session::Session::new();
             let bloom = index::bloom::BloomFilterCache::new();
             let expand = if expand > 0 { expand } else { 2 };
-            let output = search::search_multi_symbol_scopes_expanded(
-                &parts,
-                scopes,
-                cache,
-                &session,
-                &bloom,
-                expand,
-                None,
-                glob,
-                cli_full,
-                budget_tokens,
-            )?;
+            let output = if multi_scope {
+                search::search_multi_symbol_scopes_expanded(
+                    &parts,
+                    scopes,
+                    cache,
+                    &session,
+                    &bloom,
+                    expand,
+                    None,
+                    glob,
+                    cli_full,
+                    budget_tokens,
+                )?
+            } else {
+                search::search_multi_symbol_expanded(
+                    &parts,
+                    &scopes[0],
+                    cache,
+                    &session,
+                    &bloom,
+                    expand,
+                    None,
+                    glob,
+                    cli_full,
+                    budget_tokens,
+                )?
+            };
             return match budget_tokens {
-                Some(b) => Ok(budget::apply(&output, b)),
+                Some(budget) => Ok(budget::apply(&output, budget)),
                 None => Ok(output),
             };
         }
     }
 
     let output = match query_type {
-        QueryType::FilePath(_) => {
+        QueryType::FilePath(_) if multi_scope => {
             let mut outputs = Vec::new();
-            let mut first_err = None;
-            for (scope_index, scope) in scopes.iter().enumerate() {
+            let mut first_error = None;
+            for (scope_index, (scope, scoped_query_type)) in
+                scopes.iter().zip(classifications).enumerate()
+            {
                 if Path::new(query).is_absolute() && scope_index > 0 {
                     break;
                 }
-                if !matches!(classify(query, scope), QueryType::FilePath(_)) {
+                let QueryType::FilePath(path) = scoped_query_type else {
                     continue;
-                }
-                match run_inner(
-                    query,
-                    scope,
-                    section,
-                    budget_tokens,
-                    full,
-                    expand,
-                    glob,
-                    cache,
-                    cli_full,
-                ) {
-                    Ok(output) => outputs.push(format!("# Scope: {}\n\n{output}", scope.display())),
-                    Err(err) if first_err.is_none() => first_err = Some(err),
+                };
+                match read_file_query(&path, scope, section, full, cache) {
+                    Ok(output) => {
+                        let output = apply_budget(output, budget_tokens);
+                        outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
                     Err(_) => {}
                 }
             }
             if outputs.is_empty() {
-                return Err(first_err.unwrap_or_else(|| TilthError::NotFound {
+                return Err(first_error.unwrap_or_else(|| TilthError::NotFound {
                     path: PathBuf::from(query),
                     suggestion: None,
                 }));
             }
-            outputs.join("\n\n---\n")
+            return Ok(outputs.join("\n\n---\n"));
         }
-        QueryType::Glob(_) => {
+        QueryType::FilePath(path) => read_file_query(&path, &scopes[0], section, full, cache)?,
+        QueryType::Glob(pattern) if multi_scope => {
             let mut outputs = Vec::new();
-            let mut first_err = None;
+            let mut first_error = None;
             for scope in scopes {
-                match run_inner(
-                    query,
-                    scope,
-                    section,
-                    budget_tokens,
-                    full,
-                    expand,
-                    glob,
-                    cache,
-                    cli_full,
-                ) {
-                    Ok(output) => outputs.push(format!("# Scope: {}\n\n{output}", scope.display())),
-                    Err(err) if first_err.is_none() => first_err = Some(err),
+                match search::search_glob(&pattern, scope) {
+                    Ok(output) => {
+                        let output = apply_budget(output, budget_tokens);
+                        outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
+                    }
+                    Err(error) if first_error.is_none() => first_error = Some(error),
                     Err(_) => {}
                 }
             }
             if outputs.is_empty() {
-                return Err(first_err.unwrap_or_else(|| TilthError::NotFound {
+                return Err(first_error.unwrap_or_else(|| TilthError::NotFound {
                     path: PathBuf::from(query),
                     suggestion: None,
                 }));
             }
-            outputs.join("\n\n---\n")
+            return Ok(outputs.join("\n\n---\n"));
         }
+        QueryType::Glob(pattern) => search::search_glob(&pattern, &scopes[0])?,
         _ if use_expanded => {
             let ctx = ExpandedCtx {
                 session: session::Session::new(),
@@ -493,28 +421,58 @@ fn run_inner_scopes(
                 full_search: cli_full,
                 budget: budget_tokens,
             };
-            run_query_expanded_scopes(&query_type, scopes, cache, &ctx, glob)?
+            run_query_expanded(&query_type, scopes, cache, &ctx, glob)?
         }
-        _ => run_query_basic_scopes(&query_type, scopes, cache, glob, cli_full)?,
+        _ => run_query_basic(&query_type, scopes, cache, glob, cli_full)?,
     };
 
+    // Expanded search already fits to budget; this preserves the no-op fast path.
     match budget_tokens {
-        Some(b) => Ok(budget::apply(&output, b)),
+        Some(budget) => Ok(budget::apply(&output, budget)),
         None => Ok(output),
     }
 }
 
-/// Dispatch search queries in expanded mode (inline source for top N matches).
-/// Only called for search query types — FilePath/Glob are handled before this.
+fn read_file_query(
+    path: &Path,
+    scope: &Path,
+    section: Option<&str>,
+    full: bool,
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    let mut output = read::read_file(path, section, full, cache, false)?;
+    if section.is_none() && !full && read::would_outline(path) {
+        let related = read::imports::resolve_related_files(path);
+        if !related.is_empty() {
+            let hints: Vec<String> = related
+                .iter()
+                .filter_map(|path| path.strip_prefix(scope).ok().or(Some(path.as_path())))
+                .map(|path| path.display().to_string())
+                .collect();
+            output.push_str("\n\n> Related: ");
+            output.push_str(&hints.join(", "));
+        }
+    }
+    Ok(output)
+}
+
+fn apply_budget(output: String, budget_tokens: Option<u64>) -> String {
+    match budget_tokens {
+        Some(budget) => budget::apply(&output, budget),
+        None => output,
+    }
+}
+
 fn run_query_expanded(
     query_type: &QueryType,
-    scope: &Path,
+    scopes: &[PathBuf],
     cache: &OutlineCache,
     ctx: &ExpandedCtx,
     glob: Option<&str>,
 ) -> Result<String, TilthError> {
+    let scope = &scopes[0];
     match query_type {
-        QueryType::Symbol(name) => search::search_symbol_expanded(
+        QueryType::Symbol(name) if scopes.len() == 1 => search::search_symbol_expanded(
             name,
             scope,
             cache,
@@ -526,105 +484,6 @@ fn run_query_expanded(
             ctx.full_search,
             ctx.budget,
         ),
-        QueryType::Concept(text) if text.contains(' ') => search::search_content_expanded(
-            text,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
-        // Single-word Concept and Fallthrough share the same expanded path:
-        // both go straight to symbol_expanded, intentionally bypassing the
-        // definitions>0 / content fallback cascade in single_query_search.
-        // The expanded variant already provides richer results with inline source.
-        QueryType::Concept(text) | QueryType::Fallthrough(text) => search::search_symbol_expanded(
-            text,
-            scope,
-            cache,
-            &ctx.session,
-            &ctx.bloom,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
-        QueryType::Content(text) => search::search_content_expanded(
-            text,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
-        QueryType::Regex(pattern) => search::search_regex_expanded(
-            pattern,
-            scope,
-            cache,
-            &ctx.session,
-            ctx.expand,
-            None,
-            glob,
-            ctx.full_search,
-            ctx.budget,
-        ),
-        // FilePath/Glob never reach here (gated by use_expanded)
-        QueryType::FilePath(_) | QueryType::Glob(_) => {
-            unreachable!("non-search query type in expanded path")
-        }
-    }
-}
-
-/// Dispatch search queries in basic mode (no expansion).
-/// Only called for search query types — FilePath/Glob are handled before this.
-/// `full_search` is the parsed `--full` flag. It is named apart from
-/// `run_inner`'s `full`, which means full-*file* display: this one raises the
-/// match cap and the walker's early-quit thresholds and expands nothing,
-/// which is exactly what `--full --expand=0` asks for.
-fn run_query_basic(
-    query_type: &QueryType,
-    scope: &Path,
-    cache: &OutlineCache,
-    glob: Option<&str>,
-    full_search: bool,
-) -> Result<String, TilthError> {
-    match query_type {
-        QueryType::Symbol(name) => search::search_symbol(name, scope, cache, glob, full_search),
-        QueryType::Concept(text) if text.contains(' ') => {
-            multi_word_concept_search(text, scope, cache, glob, full_search)
-        }
-        QueryType::Concept(text) => {
-            // Single-word concept: prefer definitions, then content, then any match.
-            single_query_search(text, scope, cache, true, glob, full_search)
-        }
-        QueryType::Content(text) => search::search_content(text, scope, cache, glob, full_search),
-        QueryType::Regex(pattern) => search::search_regex(pattern, scope, cache, glob, full_search),
-        QueryType::Fallthrough(text) => {
-            // Accept any symbol match immediately (no definitions preference).
-            single_query_search(text, scope, cache, false, glob, full_search)
-        }
-        // FilePath/Glob never reach here
-        QueryType::FilePath(_) | QueryType::Glob(_) => {
-            unreachable!("non-search query type in basic path")
-        }
-    }
-}
-
-fn run_query_expanded_scopes(
-    query_type: &QueryType,
-    scopes: &[PathBuf],
-    cache: &OutlineCache,
-    ctx: &ExpandedCtx,
-    glob: Option<&str>,
-) -> Result<String, TilthError> {
-    match query_type {
         QueryType::Symbol(name) => search::search_symbol_scopes_expanded(
             name,
             scopes,
@@ -637,6 +496,19 @@ fn run_query_expanded_scopes(
             ctx.full_search,
             ctx.budget,
         ),
+        QueryType::Concept(text) if text.contains(' ') && scopes.len() == 1 => {
+            search::search_content_expanded(
+                text,
+                scope,
+                cache,
+                &ctx.session,
+                ctx.expand,
+                None,
+                glob,
+                ctx.full_search,
+                ctx.budget,
+            )
+        }
         QueryType::Concept(text) if text.contains(' ') => search::search_content_scopes_expanded(
             text,
             scopes,
@@ -648,6 +520,20 @@ fn run_query_expanded_scopes(
             ctx.full_search,
             ctx.budget,
         ),
+        QueryType::Concept(text) | QueryType::Fallthrough(text) if scopes.len() == 1 => {
+            search::search_symbol_expanded(
+                text,
+                scope,
+                cache,
+                &ctx.session,
+                &ctx.bloom,
+                ctx.expand,
+                None,
+                glob,
+                ctx.full_search,
+                ctx.budget,
+            )
+        }
         QueryType::Concept(text) | QueryType::Fallthrough(text) => {
             search::search_symbol_scopes_expanded(
                 text,
@@ -662,9 +548,31 @@ fn run_query_expanded_scopes(
                 ctx.budget,
             )
         }
+        QueryType::Content(text) if scopes.len() == 1 => search::search_content_expanded(
+            text,
+            scope,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            None,
+            glob,
+            ctx.full_search,
+            ctx.budget,
+        ),
         QueryType::Content(text) => search::search_content_scopes_expanded(
             text,
             scopes,
+            cache,
+            &ctx.session,
+            ctx.expand,
+            None,
+            glob,
+            ctx.full_search,
+            ctx.budget,
+        ),
+        QueryType::Regex(pattern) if scopes.len() == 1 => search::search_regex_expanded(
+            pattern,
+            scope,
             cache,
             &ctx.session,
             ctx.expand,
@@ -690,7 +598,9 @@ fn run_query_expanded_scopes(
     }
 }
 
-fn run_query_basic_scopes(
+/// Dispatch basic search queries. Search result collection and formatting are
+/// shared with expanded dispatch; only the search operation changes by mode.
+fn run_query_basic(
     query_type: &QueryType,
     scopes: &[PathBuf],
     cache: &OutlineCache,
@@ -698,26 +608,35 @@ fn run_query_basic_scopes(
     full_search: bool,
 ) -> Result<String, TilthError> {
     match query_type {
+        QueryType::Symbol(name) if scopes.len() == 1 => {
+            search::search_symbol(name, &scopes[0], cache, glob, full_search)
+        }
         QueryType::Symbol(name) => {
-            let result = search::search_symbol_raw_scopes(name, scopes, glob, full_search)?;
-            search::format_raw_result_scopes(&result, scopes, cache)
+            let result = search_symbol_raw_for_scopes(name, scopes, glob, full_search)?;
+            format_raw_result_for_scopes(&result, scopes, cache)
         }
         QueryType::Concept(text) if text.contains(' ') => {
-            multi_word_concept_search_scopes(text, scopes, cache, glob, full_search)
+            multi_word_concept_search(text, scopes, cache, glob, full_search)
         }
         QueryType::Concept(text) => {
-            single_query_search_scopes(text, scopes, cache, true, glob, full_search)
+            single_query_search(text, scopes, cache, true, glob, full_search)
+        }
+        QueryType::Content(text) if scopes.len() == 1 => {
+            search::search_content(text, &scopes[0], cache, glob, full_search)
         }
         QueryType::Content(text) => {
-            let result = search::search_content_raw_scopes(text, scopes, glob, full_search)?;
-            search::format_raw_result_scopes(&result, scopes, cache)
+            let result = search_content_raw_for_scopes(text, scopes, glob, full_search)?;
+            format_raw_result_for_scopes(&result, scopes, cache)
+        }
+        QueryType::Regex(pattern) if scopes.len() == 1 => {
+            search::search_regex(pattern, &scopes[0], cache, glob, full_search)
         }
         QueryType::Regex(pattern) => {
-            let result = search::search_regex_raw_scopes(pattern, scopes, glob, full_search)?;
-            search::format_raw_result_scopes(&result, scopes, cache)
+            let result = search_regex_raw_for_scopes(pattern, scopes, glob, full_search)?;
+            format_raw_result_for_scopes(&result, scopes, cache)
         }
         QueryType::Fallthrough(text) => {
-            single_query_search_scopes(text, scopes, cache, false, glob, full_search)
+            single_query_search(text, scopes, cache, false, glob, full_search)
         }
         QueryType::FilePath(_) | QueryType::Glob(_) => {
             unreachable!("non-search query type in basic path")
@@ -725,98 +644,111 @@ fn run_query_basic_scopes(
     }
 }
 
-/// Shared cascade for single-word queries: symbol → content → not found.
-///
-/// When `prefer_definitions` is true (Concept path), only accept symbol results
-/// that contain actual definitions; fall back to content otherwise.
-/// When false (Fallthrough path), accept any symbol match immediately.
-fn single_query_search(
-    text: &str,
-    scope: &Path,
-    cache: &cache::OutlineCache,
-    prefer_definitions: bool,
+fn search_symbol_raw_for_scopes(
+    query: &str,
+    scopes: &[PathBuf],
     glob: Option<&str>,
     full_search: bool,
-) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw(text, scope, glob, full_search)?;
-    let accept_sym = if prefer_definitions {
-        sym_result.definitions > 0
+) -> Result<SearchResult, TilthError> {
+    if scopes.len() == 1 {
+        search::search_symbol_raw(query, &scopes[0], glob, full_search)
     } else {
-        sym_result.total_found > 0
-    };
-
-    if accept_sym {
-        return search::format_raw_result(&sym_result, cache);
+        search::search_symbol_raw_scopes(query, scopes, glob, full_search)
     }
-
-    let content_result = search::search_content_raw(text, scope, glob, full_search)?;
-    if content_result.total_found > 0 {
-        return search::format_raw_result(&content_result, cache);
-    }
-
-    // For concept queries: if symbol had usages but no definitions, show those
-    if prefer_definitions && sym_result.total_found > 0 {
-        return search::format_raw_result(&sym_result, cache);
-    }
-
-    Err(error::TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, text),
-    })
 }
 
-fn single_query_search_scopes(
+fn search_content_raw_for_scopes(
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full_search: bool,
+) -> Result<SearchResult, TilthError> {
+    if scopes.len() == 1 {
+        search::search_content_raw(query, &scopes[0], glob, full_search)
+    } else {
+        search::search_content_raw_scopes(query, scopes, glob, full_search)
+    }
+}
+
+fn search_regex_raw_for_scopes(
+    pattern: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    full_search: bool,
+) -> Result<SearchResult, TilthError> {
+    if scopes.len() == 1 {
+        search::search_regex_raw(pattern, &scopes[0], glob, full_search)
+    } else {
+        search::search_regex_raw_scopes(pattern, scopes, glob, full_search)
+    }
+}
+
+fn format_raw_result_for_scopes(
+    result: &SearchResult,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    if scopes.len() == 1 {
+        search::format_raw_result(result, cache)
+    } else {
+        search::format_raw_result_scopes(result, scopes, cache)
+    }
+}
+
+/// Shared cascade for single-word Concept and Fallthrough queries.
+fn single_query_search(
     text: &str,
     scopes: &[PathBuf],
-    cache: &cache::OutlineCache,
+    cache: &OutlineCache,
     prefer_definitions: bool,
     glob: Option<&str>,
     full_search: bool,
-) -> Result<String, error::TilthError> {
-    let sym_result = search::search_symbol_raw_scopes(text, scopes, glob, full_search)?;
-    let accept_sym = if prefer_definitions {
-        sym_result.definitions > 0
+) -> Result<String, TilthError> {
+    let symbol_result = search_symbol_raw_for_scopes(text, scopes, glob, full_search)?;
+    let accept_symbol = if prefer_definitions {
+        symbol_result.definitions > 0
     } else {
-        sym_result.total_found > 0
+        symbol_result.total_found > 0
     };
 
-    if accept_sym {
-        return search::format_raw_result_scopes(&sym_result, scopes, cache);
+    if accept_symbol {
+        return format_raw_result_for_scopes(&symbol_result, scopes, cache);
     }
 
-    let content_result = search::search_content_raw_scopes(text, scopes, glob, full_search)?;
+    let content_result = search_content_raw_for_scopes(text, scopes, glob, full_search)?;
     if content_result.total_found > 0 {
-        return search::format_raw_result_scopes(&content_result, scopes, cache);
+        return format_raw_result_for_scopes(&content_result, scopes, cache);
     }
 
-    if prefer_definitions && sym_result.total_found > 0 {
-        return search::format_raw_result_scopes(&sym_result, scopes, cache);
+    if prefer_definitions && symbol_result.total_found > 0 {
+        return format_raw_result_for_scopes(&symbol_result, scopes, cache);
     }
 
-    Err(error::TilthError::NotFound {
-        path: scopes
-            .first()
-            .map_or_else(|| PathBuf::from(text), |scope| scope.join(text)),
-        suggestion: None,
-    })
+    let path = scopes
+        .first()
+        .map_or_else(|| PathBuf::from(text), |scope| scope.join(text));
+    let suggestion = if scopes.len() == 1 {
+        read::suggest_similar_file(&scopes[0], text)
+    } else {
+        None
+    };
+    Err(TilthError::NotFound { path, suggestion })
 }
 
 /// Multi-word concept search: exact phrase first, then relaxed word proximity.
 fn multi_word_concept_search(
     text: &str,
-    scope: &Path,
-    cache: &cache::OutlineCache,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
     glob: Option<&str>,
     full_search: bool,
-) -> Result<String, error::TilthError> {
-    // Try exact phrase match first
-    let mut content_result = search::search_content_raw(text, scope, glob, full_search)?;
+) -> Result<String, TilthError> {
+    let mut content_result = search_content_raw_for_scopes(text, scopes, glob, full_search)?;
     content_result.query = text.to_string();
     if content_result.total_found > 0 {
-        return search::format_raw_result(&content_result, cache);
+        return format_raw_result_for_scopes(&content_result, scopes, cache);
     }
 
-    // Relaxed: match all words in any order
     let words: Vec<&str> = text.split_whitespace().collect();
     let relaxed = if words.len() == 2 {
         format!(
@@ -827,69 +759,29 @@ fn multi_word_concept_search(
             regex_syntax::escape(words[0]),
         )
     } else {
-        // 3+ words: match any word (OR), rely on multi_word_boost in ranking
         words
             .iter()
-            .map(|w| regex_syntax::escape(w))
+            .map(|word| regex_syntax::escape(word))
             .collect::<Vec<_>>()
             .join("|")
     };
 
-    let mut relaxed_result = search::search_regex_raw(&relaxed, scope, glob, full_search)?;
+    let mut relaxed_result = search_regex_raw_for_scopes(&relaxed, scopes, glob, full_search)?;
     relaxed_result.query = text.to_string();
     if relaxed_result.total_found > 0 {
-        return search::format_raw_result(&relaxed_result, cache);
+        return format_raw_result_for_scopes(&relaxed_result, scopes, cache);
     }
 
     let first_word = words.first().copied().unwrap_or(text);
-    Err(error::TilthError::NotFound {
-        path: scope.join(text),
-        suggestion: read::suggest_similar_file(scope, first_word),
-    })
-}
-
-fn multi_word_concept_search_scopes(
-    text: &str,
-    scopes: &[PathBuf],
-    cache: &cache::OutlineCache,
-    glob: Option<&str>,
-    full_search: bool,
-) -> Result<String, error::TilthError> {
-    let mut content_result = search::search_content_raw_scopes(text, scopes, glob, full_search)?;
-    content_result.query = text.to_string();
-    if content_result.total_found > 0 {
-        return search::format_raw_result_scopes(&content_result, scopes, cache);
-    }
-
-    let words: Vec<&str> = text.split_whitespace().collect();
-    let relaxed = if words.len() == 2 {
-        format!(
-            "{}.*{}|{}.*{}",
-            regex_syntax::escape(words[0]),
-            regex_syntax::escape(words[1]),
-            regex_syntax::escape(words[1]),
-            regex_syntax::escape(words[0]),
-        )
+    let path = scopes
+        .first()
+        .map_or_else(|| PathBuf::from(text), |scope| scope.join(text));
+    let suggestion = if scopes.len() == 1 {
+        read::suggest_similar_file(&scopes[0], first_word)
     } else {
-        words
-            .iter()
-            .map(|w| regex_syntax::escape(w))
-            .collect::<Vec<_>>()
-            .join("|")
+        None
     };
-
-    let mut relaxed_result = search::search_regex_raw_scopes(&relaxed, scopes, glob, full_search)?;
-    relaxed_result.query = text.to_string();
-    if relaxed_result.total_found > 0 {
-        return search::format_raw_result_scopes(&relaxed_result, scopes, cache);
-    }
-
-    Err(error::TilthError::NotFound {
-        path: scopes
-            .first()
-            .map_or_else(|| PathBuf::from(text), |scope| scope.join(text)),
-        suggestion: None,
-    })
+    Err(TilthError::NotFound { path, suggestion })
 }
 
 #[cfg(test)]
