@@ -99,9 +99,42 @@ pub fn apply(output: &str, budget: u64) -> String {
     let omitted_bytes = output.len() - header_end - cut_point;
     let remaining_tokens = estimate_tokens(omitted_bytes as u64);
     if header.starts_with("# Search:") {
-        format!(
-            "{header}{clean_body}\n\n... total omitted: {remaining_tokens} tokens (budget: {budget})"
-        )
+        // Each query may already have a total before the joined response is
+        // budgeted. Preserve those totals even when their sections are cut.
+        let mut prior_tokens = 0u64;
+        for line in output.lines() {
+            if let Some(count) = line
+                .strip_prefix("... total omitted: ")
+                .and_then(|rest| rest.split_once(" tokens (budget: "))
+                .and_then(|(count, rest)| rest.strip_suffix(')').map(|_| count))
+                .and_then(|count| count.parse::<u64>().ok())
+            {
+                prior_tokens = prior_tokens.saturating_add(count);
+            }
+        }
+        let diagnostic_bytes: usize = output[header_end + cut_point..]
+            .split_inclusive('\n')
+            .filter(|line| {
+                let line = line.trim_start_matches('\n');
+                line.starts_with("... total omitted: ")
+                    || line.starts_with("!! expansion omitted")
+                    || (line.starts_with("... ")
+                        && line.contains("lower-value match(es) omitted to fit budget"))
+            })
+            .map(str::len)
+            .sum();
+        let clean_body: String = clean_body
+            .split_inclusive('\n')
+            .filter(|line| {
+                !line
+                    .trim_end_matches('\n')
+                    .starts_with("... total omitted: ")
+            })
+            .collect();
+        let total = prior_tokens.saturating_add(estimate_tokens(
+            omitted_bytes.saturating_sub(diagnostic_bytes) as u64,
+        ));
+        format!("{header}{clean_body}\n\n... total omitted: {total} tokens (budget: {budget})")
     } else {
         format!(
             "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})"
@@ -167,6 +200,54 @@ mod tests {
         assert!(out.contains("... total omitted: "), "missing total: {out}");
         assert!(out.contains("tokens (budget: 80)"), "missing count: {out}");
         assert!(!out.contains("... truncated"), "old marker remained: {out}");
+    }
+
+    #[test]
+    fn search_budget_carries_totals_from_all_sections() {
+        let input = format!(
+            "# Search: \"two queries\"\n\n## First\n{}\n\n... total omitted: 100 tokens (budget: 80)\n\n---\n\n## Second\n{}\n\n!! expansion omitted (~90 tokens; budget)\n\n... total omitted: 200 tokens (budget: 80)",
+            "first match\n".repeat(20),
+            "second match\n".repeat(20),
+        );
+        let out = apply(&input, 150);
+        assert_eq!(out.matches("... total omitted:").count(), 1, "{out}");
+        assert!(out.contains("## First"), "{out}");
+        assert!(!out.contains("## Second"), "{out}");
+        assert!(!out.contains("100 tokens (budget: 80)"), "{out}");
+        let total = out
+            .split("... total omitted: ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .unwrap();
+        let omitted = &input[input.find("\n\n## Second").unwrap()..];
+        let source_bytes = omitted.len()
+            - "!! expansion omitted (~90 tokens; budget)\n".len()
+            - "... total omitted: 200 tokens (budget: 80)".len();
+        assert_eq!(total, 300 + estimate_tokens(source_bytes as u64), "{out}");
+    }
+
+    #[test]
+    fn search_budget_preserves_expansion_note_and_prior_total() {
+        let input = format!(
+            "# Search: \"one query\"\n\n## Match\n!! expansion omitted (~90 tokens; budget)\n{}\n\n... total omitted: 200 tokens (budget: 80)",
+            "source line\n".repeat(30),
+        );
+        let out = apply(&input, 100);
+        assert!(
+            out.contains("!! expansion omitted (~90 tokens; budget)"),
+            "{out}"
+        );
+        assert_eq!(out.matches("... total omitted:").count(), 1, "{out}");
+        let prefix = out.split("\n\n... total omitted:").next().unwrap();
+        assert!(input.starts_with(prefix), "unexpected cut: {out}");
+        let omitted = &input[prefix.len()..];
+        let source_bytes = omitted.len() - "... total omitted: 200 tokens (budget: 80)".len();
+        let expected = 200 + estimate_tokens(source_bytes as u64);
+        assert!(
+            out.contains(&format!("... total omitted: {expected} tokens")),
+            "{out}"
+        );
     }
     #[test]
     fn apply_emoji_no_newline_does_not_panic() {
