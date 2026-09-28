@@ -322,7 +322,47 @@ pub fn search_multi_symbol_expanded(
         // budget.unwrap_or(DEFAULT_BUDGET): keeps the no-budget path byte-
         // identical to before this fix (see format_search_result's own comment).
         let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-        out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
+        let top_marker = if expand > 0 {
+            expansion_fallback_marker(result.matches.first(), &result.scope)
+        } else {
+            None
+        };
+        out = fit_with_expansion_fallback(
+            &out,
+            &segments,
+            budget_tokens,
+            top_marker,
+            false,
+            |compact_budget| {
+                let mut compact_out = one_root_multi_symbol_header(&result);
+                let mut compact_segments = Vec::new();
+                let mut no_expansion = 0usize;
+                let mut compact_expanded_files = HashSet::new();
+                format_matches(
+                    &result.matches,
+                    &result.scope,
+                    cache,
+                    Some(session),
+                    bloom,
+                    &mut no_expansion,
+                    &mut compact_expanded_files,
+                    &mut compact_out,
+                    &mut compact_segments,
+                );
+                if result.total_found > result.matches.len() {
+                    let omitted = result.total_found - result.matches.len();
+                    let _ = write!(
+                        compact_out,
+                        "\n\n... {omitted} more matches. Narrow with scope."
+                    );
+                }
+                Ok(crate::search::alloc::fit_to_budget(
+                    &compact_out,
+                    &compact_segments,
+                    compact_budget,
+                ))
+            },
+        )?;
         sections.push(out);
     }
 
@@ -531,11 +571,65 @@ fn format_multi_symbol_scope_results(
             );
         }
         let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-        sections.push(crate::search::alloc::fit_to_budget(
+        let top_marker = if expand > 0 {
+            expansion_fallback_marker(result.matches.first(), &result.scope)
+        } else {
+            None
+        };
+        let out = fit_with_expansion_fallback(
             &out,
             &segments,
             budget_tokens,
-        ));
+            top_marker,
+            false,
+            |compact_budget| {
+                let mut compact_out = if scopes.len() == 1 {
+                    one_root_multi_symbol_header(result)
+                } else {
+                    search_header_for_scopes(result, scopes)
+                };
+                if scopes.len() == 1
+                    && matches!(
+                        result.count_estimate,
+                        crate::types::CountEstimate::Observed { .. }
+                    )
+                {
+                    compact_out = compact_out.replacen(
+                        &format!("{} matches", result.total_found),
+                        &format!("at least {} matches", result.total_found),
+                        1,
+                    );
+                }
+                let mut compact_segments = Vec::new();
+                let mut no_expansion = 0usize;
+                let mut compact_expanded_files = HashSet::new();
+                format_matches(
+                    &result.matches,
+                    &result.scope,
+                    cache,
+                    Some(session),
+                    bloom,
+                    &mut no_expansion,
+                    &mut compact_expanded_files,
+                    &mut compact_out,
+                    &mut compact_segments,
+                );
+                if result.total_found > result.matches.len() {
+                    let omitted = result.total_found - result.matches.len();
+                    let _ = write!(
+                        compact_out,
+                        "\n\n... {omitted} more matches. Narrow with {}.",
+                        if scopes.len() == 1 { "scope" } else { "scopes" }
+                    );
+                }
+                Ok(crate::search::alloc::fit_to_budget(
+                    &compact_out,
+                    &compact_segments,
+                    compact_budget,
+                ))
+            },
+        )?;
+        sections.push(out);
     }
     let joined = sections.join("\n\n---\n");
     if scope_errors.is_empty() {
@@ -1628,7 +1722,28 @@ fn format_search_result_impl(
     // to before this fix — DEFAULT_BUDGET remains the default, it is simply no
     // longer a hardcode that shadows a real caller-supplied budget.
     let budget_tokens = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-    out = crate::search::alloc::fit_to_budget(&out, &segments, budget_tokens);
+    out = fit_with_expansion_fallback(
+        &out,
+        &segments,
+        budget_tokens,
+        if expand > 0 {
+            expansion_fallback_marker(result.matches.first(), &result.scope)
+        } else {
+            None
+        },
+        true,
+        |compact_budget| {
+            format_search_result_impl(
+                result,
+                searched_scopes,
+                cache,
+                session,
+                bloom,
+                0,
+                Some(compact_budget),
+            )
+        },
+    )?;
 
     let tokens = estimate_tokens(out.len() as u64);
     let token_str = format_token_count(tokens);
@@ -1953,6 +2068,68 @@ fn format_glob_result(result: &glob::GlobResult, scope: &Path) -> Result<String,
     }
 
     Ok(out)
+}
+
+fn expansion_fallback_marker(first: Option<&Match>, scope: &Path) -> Option<String> {
+    let first = first?;
+    if !first.is_definition {
+        return None;
+    }
+    let (start, end) = first.def_range?;
+    Some(format!(
+        "{}:{start}-{end} [definition]",
+        rel(&first.path, scope)
+    ))
+}
+
+fn fit_with_expansion_fallback<F>(
+    expanded_body: &str,
+    expanded_segments: &[(i64, usize, usize)],
+    budget_tokens: u64,
+    top_marker: Option<String>,
+    has_token_footer: bool,
+    compact: F,
+) -> Result<String, TilthError>
+where
+    F: FnOnce(u64) -> Result<String, TilthError>,
+{
+    let expanded =
+        crate::search::alloc::fit_to_budget(expanded_body, expanded_segments, budget_tokens);
+    let Some(top_marker) = top_marker else {
+        return Ok(expanded);
+    };
+    if expanded.contains(&top_marker) {
+        return Ok(expanded);
+    }
+
+    let note = "\n\n... expansion omitted (budget)";
+    let compact_budget = budget_tokens.saturating_sub(estimate_tokens(note.len() as u64));
+    let compact_output = compact(compact_budget)?;
+    let (compact_body, footer_start) = if has_token_footer {
+        let Some(footer_start) = compact_output
+            .rfind("\n\n(")
+            .filter(|&start| compact_output[start..].ends_with(" tokens)"))
+        else {
+            return Ok(expanded);
+        };
+        (&compact_output[..footer_start], Some(footer_start))
+    } else {
+        (&compact_output[..], None)
+    };
+
+    let mut fallback = compact_body.to_string();
+    fallback.push_str(note);
+    if !compact_body.contains(&top_marker) || estimate_tokens(fallback.len() as u64) > budget_tokens
+    {
+        return Ok(expanded);
+    }
+
+    if footer_start.is_some() {
+        let tokens = estimate_tokens(fallback.len() as u64);
+        let token_str = format_token_count(tokens);
+        let _ = write!(fallback, "\n\n({token_str} tokens)");
+    }
+    Ok(fallback)
 }
 
 #[cfg(test)]

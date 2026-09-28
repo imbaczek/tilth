@@ -252,3 +252,250 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod expansion_budget_fallback_tests {
+    use crate::cache::OutlineCache;
+    use crate::index::bloom::BloomFilterCache;
+    use crate::types::{estimate_tokens, SearchResult};
+    use std::fmt::Write as _;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        SearchResult,
+        OutlineCache,
+        BloomFilterCache,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = String::from("pub fn large_target() {\n");
+        for line in 0..300 {
+            writeln!(source, "    let _padding_{line} = {line};").unwrap();
+        }
+        source.push_str("}\n\nfn small_usage() {\n    large_target();\n}\n");
+        std::fs::write(tmp.path().join("large.rs"), source).unwrap();
+
+        let result =
+            super::super::search_symbol_raw("large_target", tmp.path(), Some("*.rs"), false)
+                .unwrap();
+        assert!(
+            result.matches.first().is_some_and(|m| m.is_definition),
+            "expected the first-ranked match to be the large definition: {:?}",
+            result.matches
+        );
+        assert!(
+            result.matches.iter().any(|m| !m.is_definition),
+            "expected a smaller usage match: {:?}",
+            result.matches
+        );
+
+        (tmp, result, OutlineCache::new(), BloomFilterCache::new())
+    }
+
+    fn top_definition_marker(result: &SearchResult) -> String {
+        let top = &result.matches[0];
+        let (start, end) = top.def_range.expect("top definition should have a range");
+        format!("large.rs:{start}-{end} [definition]")
+    }
+
+    fn compact_output(
+        result: &SearchResult,
+        cache: &OutlineCache,
+        bloom: &BloomFilterCache,
+    ) -> String {
+        super::super::format_search_result(result, cache, None, bloom, 0, None).unwrap()
+    }
+
+    #[test]
+    fn tiny_budget_falls_back_to_compact_top_definition() {
+        verify_sufficient_budget_keeps_expansion_without_note();
+        verify_budget_below_compact_output_keeps_final_truncation_behavior();
+        let (_tmp, result, cache, bloom) = fixture();
+        let marker = top_definition_marker(&result);
+        let compact = compact_output(&result, &cache, &bloom);
+        let budget = estimate_tokens(compact.len() as u64) + 25;
+
+        let output =
+            super::super::format_search_result(&result, &cache, None, &bloom, 1, Some(budget))
+                .unwrap();
+
+        assert!(
+            output.contains(&marker),
+            "the compact top-ranked definition should survive; output was:\n{output}"
+        );
+        assert!(
+            output.contains("... expansion omitted (budget)"),
+            "expected an expansion budget note; output was:\n{output}"
+        );
+    }
+
+    fn verify_sufficient_budget_keeps_expansion_without_note() {
+        let (_tmp, result, cache, bloom) = fixture();
+        let marker = top_definition_marker(&result);
+        let compact = compact_output(&result, &cache, &bloom);
+
+        let output =
+            super::super::format_search_result(&result, &cache, None, &bloom, 1, Some(100_000))
+                .unwrap();
+
+        assert!(
+            output.contains(&marker),
+            "expanded top definition missing: {output}"
+        );
+        assert!(
+            output.len() > compact.len() + 500,
+            "expected expanded output to be longer than compact output"
+        );
+        assert!(!output.contains("expansion omitted (budget)"));
+    }
+
+    fn verify_budget_below_compact_output_keeps_final_truncation_behavior() {
+        let (_tmp, result, cache, bloom) = fixture();
+        let compact = compact_output(&result, &cache, &bloom);
+        let tiny_budget = 1;
+        assert!(estimate_tokens(compact.len() as u64) > tiny_budget);
+
+        let output =
+            super::super::format_search_result(&result, &cache, None, &bloom, 1, Some(tiny_budget))
+                .unwrap();
+        let truncated = crate::budget::apply(&output, tiny_budget);
+
+        assert!(truncated.contains("... truncated"), "{truncated}");
+    }
+}
+
+#[cfg(test)]
+mod multi_query_expansion_fallback_tests {
+    use std::fmt::Write as _;
+
+    use crate::cache::OutlineCache;
+    use crate::index::bloom::BloomFilterCache;
+    use crate::session::Session;
+    use crate::types::estimate_tokens;
+
+    #[test]
+    fn multi_query_path_falls_back_to_compact_top_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = String::from("pub fn large_target() {\n");
+        for line in 0..300 {
+            writeln!(source, "    let _padding_{line} = {line};").unwrap();
+        }
+        source.push_str("}\n\nfn small_usage() {\n    large_target();\n}\n");
+        std::fs::write(tmp.path().join("large.rs"), source).unwrap();
+
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = BloomFilterCache::new();
+        let queries = ["large_target"];
+        let compact = super::super::search_multi_symbol_expanded(
+            &queries,
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            0,
+            None,
+            Some("*.rs"),
+            false,
+            None,
+        )
+        .unwrap();
+        let budget = estimate_tokens(compact.len() as u64) + 25;
+
+        let output = super::super::search_multi_symbol_expanded(
+            &queries,
+            tmp.path(),
+            &cache,
+            &session,
+            &bloom,
+            1,
+            None,
+            Some("*.rs"),
+            false,
+            Some(budget),
+        )
+        .unwrap();
+
+        assert!(
+            output.contains("large.rs:1-302 [definition]"),
+            "multi-query compact top definition should survive; output was:\n{output}"
+        );
+        assert!(
+            output.contains("... expansion omitted (budget)"),
+            "expected multi-query expansion budget note; output was:\n{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_scope_expansion_fallback_tests {
+    use std::fmt::Write as _;
+
+    use crate::cache::OutlineCache;
+    use crate::index::bloom::BloomFilterCache;
+    use crate::session::Session;
+    use crate::types::estimate_tokens;
+
+    #[test]
+    fn multi_scope_path_falls_back_to_compact_top_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usage_scope = tmp.path().join("first");
+        let definition_scope = tmp.path().join("second");
+        std::fs::create_dir_all(&usage_scope).unwrap();
+        std::fs::create_dir_all(&definition_scope).unwrap();
+
+        std::fs::write(
+            usage_scope.join("usage.rs"),
+            "fn small_usage() { large_target(); }\n",
+        )
+        .unwrap();
+        let mut definition = String::from("pub fn large_target() {\n");
+        for line in 0..300 {
+            writeln!(definition, "    let _padding_{line} = {line};").unwrap();
+        }
+        definition.push_str("}\n");
+        std::fs::write(definition_scope.join("large.rs"), definition).unwrap();
+
+        let scopes = [usage_scope, definition_scope];
+        let queries = ["large_target"];
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = BloomFilterCache::new();
+        let compact = super::super::search_multi_symbol_scopes_expanded(
+            &queries,
+            &scopes,
+            &cache,
+            &session,
+            &bloom,
+            0,
+            None,
+            Some("*.rs"),
+            false,
+            None,
+        )
+        .unwrap();
+        let budget = estimate_tokens(compact.len() as u64) + 25;
+
+        let output = super::super::search_multi_symbol_scopes_expanded(
+            &queries,
+            &scopes,
+            &cache,
+            &session,
+            &bloom,
+            1,
+            None,
+            Some("*.rs"),
+            false,
+            Some(budget),
+        )
+        .unwrap();
+
+        assert!(
+            output.contains("large.rs:1-302 [definition]"),
+            "multi-scope compact top definition should survive; output was:\n{output}"
+        );
+        assert!(
+            output.contains("... expansion omitted (budget)"),
+            "expected multi-scope expansion budget note; output was:\n{output}"
+        );
+    }
+}
