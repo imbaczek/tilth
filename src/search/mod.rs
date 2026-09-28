@@ -333,6 +333,7 @@ pub fn search_multi_symbol_expanded(
             budget_tokens,
             top_marker,
             false,
+            true,
             |compact_budget| {
                 let mut compact_out = one_root_multi_symbol_header(&result);
                 let mut compact_segments = Vec::new();
@@ -582,6 +583,7 @@ fn format_multi_symbol_scope_results(
             budget_tokens,
             top_marker,
             false,
+            true,
             |compact_budget| {
                 let mut compact_out = if scopes.len() == 1 {
                     one_root_multi_symbol_header(result)
@@ -1441,7 +1443,7 @@ fn format_search_result(
     expand: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    format_search_result_impl(result, None, cache, session, bloom, expand, budget)
+    format_search_result_impl(result, None, cache, session, bloom, expand, budget, true)
 }
 
 fn format_search_result_scopes(
@@ -1462,6 +1464,7 @@ fn format_search_result_scopes(
         bloom,
         expand,
         budget,
+        true,
     )
 }
 
@@ -1473,6 +1476,7 @@ fn format_search_result_impl(
     bloom: &crate::index::bloom::BloomFilterCache,
     expand: usize,
     budget: Option<u64>,
+    report_total: bool,
 ) -> Result<String, TilthError> {
     let mut header = searched_scopes.map_or_else(
         || {
@@ -1732,6 +1736,7 @@ fn format_search_result_impl(
             None
         },
         true,
+        report_total,
         |compact_budget| {
             format_search_result_impl(
                 result,
@@ -1741,6 +1746,7 @@ fn format_search_result_impl(
                 bloom,
                 0,
                 Some(compact_budget),
+                false,
             )
         },
     )?;
@@ -2082,12 +2088,47 @@ fn expansion_fallback_marker(first: Option<&Match>, scope: &Path) -> Option<Stri
     ))
 }
 
+fn with_omitted_total(
+    original_body: &str,
+    mut fitted: String,
+    budget_tokens: u64,
+    report_total: bool,
+) -> String {
+    if !report_total || fitted == original_body {
+        return fitted;
+    }
+    // Omission notes describe removed content; exclude their own bytes from the total.
+    let diagnostic_bytes: usize = fitted
+        .lines()
+        .filter(|line| {
+            line.starts_with("!! expansion omitted")
+                || (line.starts_with("... ")
+                    && line.contains("lower-value match(es) omitted to fit budget"))
+        })
+        .map(|line| line.len().saturating_add(1))
+        .sum();
+    let omitted_bytes = original_body
+        .len()
+        .saturating_add(diagnostic_bytes)
+        .saturating_sub(fitted.len());
+    if omitted_bytes == 0 {
+        return fitted;
+    }
+    let omitted_tokens = estimate_tokens(omitted_bytes as u64);
+    let _ = write!(
+        fitted,
+        "\n\n... total omitted: {omitted_tokens} tokens (budget: {budget_tokens})"
+    );
+    fitted
+}
+
 fn fit_with_expansion_fallback<F>(
     expanded_body: &str,
     expanded_segments: &[(i64, usize, usize)],
     budget_tokens: u64,
     top_marker: Option<String>,
     has_token_footer: bool,
+    report_total: bool,
     compact: F,
 ) -> Result<String, TilthError>
 where
@@ -2096,21 +2137,45 @@ where
     let expanded =
         crate::search::alloc::fit_to_budget(expanded_body, expanded_segments, budget_tokens);
     let Some(top_marker) = top_marker else {
-        return Ok(expanded);
+        return Ok(with_omitted_total(
+            expanded_body,
+            expanded,
+            budget_tokens,
+            report_total,
+        ));
     };
     if expanded.contains(&top_marker) {
-        return Ok(expanded);
+        return Ok(with_omitted_total(
+            expanded_body,
+            expanded,
+            budget_tokens,
+            report_total,
+        ));
     }
 
-    let note = "\n!! expansion omitted (budget)";
-    let compact_budget = budget_tokens.saturating_sub(estimate_tokens(note.len() as u64));
+    // Reserve room for both notices before formatting the compact fallback.
+    let max_omitted_tokens = estimate_tokens(expanded_body.len() as u64);
+    let note_reserve = format!("\n!! expansion omitted (~{max_omitted_tokens} tokens; budget)");
+    let total_reserve = if report_total {
+        format!("\n\n... total omitted: {max_omitted_tokens} tokens (budget: {budget_tokens})")
+    } else {
+        String::new()
+    };
+    let compact_budget = budget_tokens.saturating_sub(estimate_tokens(
+        (note_reserve.len() + total_reserve.len()) as u64,
+    ));
     let compact_output = compact(compact_budget)?;
     let compact_body = if has_token_footer {
         let Some(footer_start) = compact_output
             .rfind("\n\n(")
             .filter(|&start| compact_output[start..].ends_with(" tokens)"))
         else {
-            return Ok(expanded);
+            return Ok(with_omitted_total(
+                expanded_body,
+                expanded,
+                budget_tokens,
+                report_total,
+            ));
         };
         &compact_output[..footer_start]
     } else {
@@ -2119,7 +2184,12 @@ where
 
     let heading = format!("### {top_marker}");
     let Some(heading_start) = compact_body.find(&heading) else {
-        return Ok(expanded);
+        return Ok(with_omitted_total(
+            expanded_body,
+            expanded,
+            budget_tokens,
+            report_total,
+        ));
     };
     let after_heading = heading_start + heading.len();
     let match_end = compact_body[after_heading..]
@@ -2134,14 +2204,32 @@ where
                 .map(|next| after_heading + arrow + next)
         })
         .unwrap_or(match_end);
+    let expanded_match_bytes = expanded_segments
+        .iter()
+        .find(|&&(_, start, end)| expanded_body[start..end].contains(&heading))
+        .map_or(expanded_body.len(), |&(_, start, end)| end - start);
+    let compact_match_bytes = match_end.saturating_sub(heading_start).saturating_add(2);
+    let omitted_expansion_tokens =
+        estimate_tokens(expanded_match_bytes.saturating_sub(compact_match_bytes) as u64);
+    let note = format!("\n!! expansion omitted (~{omitted_expansion_tokens} tokens; budget)");
     let mut fallback = String::with_capacity(compact_body.len() + note.len());
     fallback.push_str(&compact_body[..insert_at]);
-    fallback.push_str(note);
+    fallback.push_str(&note);
     fallback.push_str(&compact_body[insert_at..]);
-    if estimate_tokens(fallback.len() as u64) > budget_tokens {
-        return Ok(expanded);
+    if estimate_tokens((fallback.len() + total_reserve.len()) as u64) > budget_tokens {
+        return Ok(with_omitted_total(
+            expanded_body,
+            expanded,
+            budget_tokens,
+            report_total,
+        ));
     }
-    Ok(fallback)
+    Ok(with_omitted_total(
+        expanded_body,
+        fallback,
+        budget_tokens,
+        report_total,
+    ))
 }
 
 #[cfg(test)]

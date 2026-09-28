@@ -115,21 +115,24 @@ pub(crate) fn fit_to_budget(
     let mut out = String::with_capacity(body.len());
     let mut cursor = 0usize;
     let mut dropped = 0usize;
+    let mut omitted_bytes = 0usize;
     for (i, &(_, start, end)) in blocks.iter().enumerate() {
         out.push_str(&body[cursor..start]); // structural gap before this block
         if keep[i] {
             out.push_str(&body[start..end]);
         } else {
             dropped += 1;
+            omitted_bytes = omitted_bytes.saturating_add(end - start);
         }
         cursor = end;
     }
     out.push_str(&body[cursor..]); // trailing structural bytes
 
     if dropped > 0 {
+        let omitted_tokens = estimate_tokens(omitted_bytes as u64);
         let _ = write!(
             out,
-            "\n\n... {dropped} lower-value match(es) omitted to fit budget"
+            "\n\n... {dropped} lower-value match(es) omitted to fit budget ({omitted_tokens} tokens omitted)"
         );
     }
     out
@@ -228,6 +231,10 @@ mod tests {
             out.contains("omitted to fit budget"),
             "omitted marker expected: {out}"
         );
+        assert!(
+            out.contains("50 tokens omitted"),
+            "omitted match estimate should reflect its 200 bytes: {out}"
+        );
     }
 
     #[test]
@@ -308,7 +315,7 @@ mod expansion_budget_fallback_tests {
     #[test]
     fn tiny_budget_falls_back_to_compact_top_definition() {
         verify_sufficient_budget_keeps_expansion_without_note();
-        verify_budget_below_compact_output_keeps_final_truncation_behavior();
+        verify_budget_below_compact_output_keeps_final_omission_total();
         let (_tmp, result, cache, bloom) = fixture();
         let marker = top_definition_marker(&result);
         let compact = compact_output(&result, &cache, &bloom);
@@ -323,7 +330,7 @@ mod expansion_budget_fallback_tests {
             "the compact top-ranked definition should survive; output was:\n{output}"
         );
         assert!(
-            output.contains("!! expansion omitted (budget)"),
+            output.contains("!! expansion omitted (~"),
             "expected an expansion budget note; output was:\n{output}"
         );
         assert_eq!(
@@ -331,12 +338,49 @@ mod expansion_budget_fallback_tests {
             1,
             "expected one token estimate; output was:\n{output}"
         );
-        let note_pos = output.find("!! expansion omitted (budget)").unwrap();
+        let note_pos = output.find("!! expansion omitted (~").unwrap();
+        let note_end = output[note_pos..]
+            .find('\n')
+            .map_or(output.len(), |offset| note_pos + offset);
+        let note = &output[note_pos..note_end];
+        let omitted_tokens = note
+            .strip_prefix("!! expansion omitted (~")
+            .and_then(|value| value.strip_suffix(" tokens; budget)"))
+            .and_then(|value| value.parse::<u64>().ok())
+            .expect("expansion note should contain a numeric token estimate");
+        assert!(
+            omitted_tokens > 100,
+            "expected a substantial omitted expansion: {note}"
+        );
         let signature_pos = output.find("pub fn large_target()").unwrap();
         let sibling_pos = output.find("small_usage").unwrap();
         assert!(
             signature_pos < note_pos && note_pos < sibling_pos,
             "expansion note should follow the signature before its sibling; output was:\n{output}"
+        );
+        let final_output = crate::budget::apply(&output, budget);
+        assert!(
+            final_output.contains(&marker),
+            "top definition lost: {final_output}"
+        );
+        assert!(
+            final_output.contains("!! expansion omitted"),
+            "note lost: {final_output}"
+        );
+        assert!(
+            final_output.contains("... total omitted: ")
+                && final_output.contains(&format!("tokens (budget: {budget})")),
+            "expected a final omitted-token total: {final_output}"
+        );
+        let total_tokens = final_output
+            .split("... total omitted: ")
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|count| count.parse::<u64>().ok())
+            .expect("final omitted total should be numeric");
+        assert!(
+            total_tokens >= omitted_tokens,
+            "final total should include the skipped expansion: {final_output}"
         );
     }
 
@@ -360,7 +404,7 @@ mod expansion_budget_fallback_tests {
         assert!(!output.contains("expansion omitted (budget)"));
     }
 
-    fn verify_budget_below_compact_output_keeps_final_truncation_behavior() {
+    fn verify_budget_below_compact_output_keeps_final_omission_total() {
         let (_tmp, result, cache, bloom) = fixture();
         let compact = compact_output(&result, &cache, &bloom);
         let tiny_budget = 1;
@@ -369,9 +413,12 @@ mod expansion_budget_fallback_tests {
         let output =
             super::super::format_search_result(&result, &cache, None, &bloom, 1, Some(tiny_budget))
                 .unwrap();
-        let truncated = crate::budget::apply(&output, tiny_budget);
+        let final_output = crate::budget::apply(&output, tiny_budget);
 
-        assert!(truncated.contains("... truncated"), "{truncated}");
+        assert!(
+            final_output.contains("... total omitted: "),
+            "{final_output}"
+        );
     }
 }
 
@@ -432,7 +479,7 @@ mod multi_query_expansion_fallback_tests {
             "multi-query compact top definition should survive; output was:\n{output}"
         );
         assert!(
-            output.contains("!! expansion omitted (budget)"),
+            output.contains("!! expansion omitted (~"),
             "expected multi-query expansion budget note; output was:\n{output}"
         );
     }
@@ -506,7 +553,7 @@ mod multi_scope_expansion_fallback_tests {
             "multi-scope compact top definition should survive; output was:\n{output}"
         );
         assert!(
-            output.contains("!! expansion omitted (budget)"),
+            output.contains("!! expansion omitted (~"),
             "expected multi-scope expansion budget note; output was:\n{output}"
         );
     }

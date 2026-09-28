@@ -58,7 +58,7 @@ fn repeated_scopes_full_expand_zero_still_obey_final_budget() {
         "--full --expand=0 with both scopes should retain more than one scope's default cap; header: {search_header}"
     );
     assert!(
-        stdout.contains("... truncated"),
+        stdout.contains("... total omitted: ") && stdout.contains("tokens (budget: 80)"),
         "--budget must cap the final output after both scopes are joined: {stdout}"
     );
 }

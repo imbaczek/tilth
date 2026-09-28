@@ -98,9 +98,15 @@ pub fn apply(output: &str, budget: u64) -> String {
 
     let omitted_bytes = output.len() - header_end - cut_point;
     let remaining_tokens = estimate_tokens(omitted_bytes as u64);
-    format!(
-        "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})"
-    )
+    if header.starts_with("# Search:") {
+        format!(
+            "{header}{clean_body}\n\n... total omitted: {remaining_tokens} tokens (budget: {budget})"
+        )
+    } else {
+        format!(
+            "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})"
+        )
+    }
 }
 
 #[cfg(test)]
@@ -151,6 +157,17 @@ mod tests {
         assert!(out.len() < input.len(), "must shrink: {out}");
     }
 
+    #[test]
+    fn search_budget_uses_total_omitted_marker() {
+        let mut input = String::from("# Search: \"needle\"\n\n");
+        for i in 0..200 {
+            let _ = writeln!(input, "### file{i}.rs:1 [usage]\nmatch");
+        }
+        let out = apply(&input, 80);
+        assert!(out.contains("... total omitted: "), "missing total: {out}");
+        assert!(out.contains("tokens (budget: 80)"), "missing count: {out}");
+        assert!(!out.contains("... truncated"), "old marker remained: {out}");
+    }
     #[test]
     fn apply_emoji_no_newline_does_not_panic() {
         // Single-line UTF-8 with no \n in the truncated region: `max_bytes` may land
