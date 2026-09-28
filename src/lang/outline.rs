@@ -99,6 +99,20 @@ fn node_to_entry(
     lang: Lang,
     depth: usize,
 ) -> Option<OutlineEntry> {
+    // Python decorators wrap the declaration in `decorated_definition`.
+    // Delegate to its function or class node to keep normal metadata and child traversal.
+    if node.kind() == "decorated_definition" && lang == Lang::Python {
+        let mut cursor = node.walk();
+        let declaration = node
+            .children(&mut cursor)
+            .find(|child| matches!(child.kind(), "function_definition" | "class_definition"))?;
+        let mut entry = node_to_entry(declaration, lines, lang, depth)?;
+        if entry.doc.is_none() {
+            entry.doc = extract_doc(node, lines);
+        }
+        return Some(entry);
+    }
+
     let kind_str = node.kind();
     let start_line = node.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
@@ -954,6 +968,93 @@ mod markdown_helper_tests {
         let lines: Vec<&str> = src.lines().collect();
         let headings = collect_headings(&tree);
         assert_eq!(heading_text(headings[0], &lines), "Foo");
+    }
+}
+
+#[cfg(test)]
+mod python_decorated_definition_tests {
+    use super::get_outline_entries;
+    use crate::types::{Lang, OutlineKind};
+
+    #[test]
+    fn decorated_definitions_keep_declaration_ranges_and_children() {
+        let source = concat!(
+            "def plain():\n",
+            "    return 0\n",
+            "\n",
+            "# Handler documentation\n",
+            "@decorator\n",
+            "def decorated_handler(value):\n",
+            "    return value\n",
+            "\n",
+            "class Service:\n",
+            "    @property\n",
+            "    def decorated_property(self):\n",
+            "        return 1\n",
+            "\n",
+            "    @classmethod\n",
+            "    def decorated_classmethod(cls):\n",
+            "        return cls()\n",
+            "\n",
+            "    def normal_method(self):\n",
+            "        return 2\n",
+            "\n",
+            "@decorator\n",
+            "class DecoratedClass:\n",
+            "    def nested_method(self):\n",
+            "        return 3\n",
+        );
+
+        let entries = get_outline_entries(source, Lang::Python);
+        let decorated_handler = entries
+            .iter()
+            .find(|entry| entry.name == "decorated_handler")
+            .unwrap();
+        assert_eq!(decorated_handler.kind, OutlineKind::Function);
+        assert_eq!(
+            (decorated_handler.start_line, decorated_handler.end_line),
+            (6, 7)
+        );
+        assert_eq!(
+            decorated_handler.signature.as_deref(),
+            Some("def decorated_handler(value)")
+        );
+        assert_eq!(
+            decorated_handler.doc.as_deref(),
+            Some("Handler documentation")
+        );
+
+        let service = entries
+            .iter()
+            .find(|entry| entry.name == "Service")
+            .unwrap();
+        assert_eq!(service.kind, OutlineKind::Class);
+        assert_eq!((service.start_line, service.end_line), (9, 19));
+        assert_eq!(service.children.len(), 3);
+
+        for (child, name, start_line, end_line) in [
+            (&service.children[0], "decorated_property", 11, 12),
+            (&service.children[1], "decorated_classmethod", 15, 16),
+            (&service.children[2], "normal_method", 18, 19),
+        ] {
+            assert_eq!(child.name, name);
+            assert_eq!(child.kind, OutlineKind::Function);
+            assert_eq!((child.start_line, child.end_line), (start_line, end_line));
+        }
+
+        let decorated_class = entries
+            .iter()
+            .find(|entry| entry.name == "DecoratedClass")
+            .unwrap();
+        assert_eq!(decorated_class.kind, OutlineKind::Class);
+        assert_eq!(
+            (decorated_class.start_line, decorated_class.end_line),
+            (22, 24)
+        );
+        assert_eq!(decorated_class.children.len(), 1);
+        let nested_method = &decorated_class.children[0];
+        assert_eq!(nested_method.name, "nested_method");
+        assert_eq!((nested_method.start_line, nested_method.end_line), (23, 24));
     }
 }
 
