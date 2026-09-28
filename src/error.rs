@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+pub use crate::types::ScopeError;
+
 /// Every error tilth can produce. Displayed as user-facing messages with suggestions.
 #[derive(Debug, Error)]
 pub enum TilthError {

@@ -436,28 +436,41 @@ where
     }
 
     let mut outputs = Vec::new();
-    let mut first_err = None;
+    let mut failures = Vec::new();
     for scope in scopes {
         match run(scope) {
             Ok(output) => outputs.push(format!("# Scope: {}\n\n{output}", scope.display())),
-            Err(err) => {
-                if first_err.is_none() {
-                    first_err = Some(err);
-                }
-            }
+            Err(error) => failures.push(tilth::error::ScopeError {
+                scope: scope.clone(),
+                error,
+            }),
         }
     }
 
     if outputs.is_empty() {
-        Err(
-            first_err.unwrap_or_else(|| tilth::error::TilthError::NotFound {
+        return match failures.len() {
+            0 => Err(tilth::error::TilthError::NotFound {
                 path: PathBuf::from(query),
                 suggestion: None,
             }),
-        )
-    } else {
-        Ok(apply_optional_budget(outputs.join("\n\n---\n"), budget))
+            1 => Err(failures.pop().expect("one scope failure").error),
+            _ => Err(tilth::error::TilthError::ScopedFailures { failures }),
+        };
     }
+
+    let results = outputs.join("\n\n---\n");
+    if failures.is_empty() {
+        return Ok(apply_optional_budget(results, budget));
+    }
+    let mut prelude = format!("# Search: \"{query}\"\n\n## Scope errors\n");
+    for failure in failures {
+        use std::fmt::Write as _;
+        let _ = writeln!(prelude, "- {}: {}", failure.scope.display(), failure.error);
+    }
+    Ok(apply_optional_budget(
+        format!("{}\n\n{results}", prelude.trim_end()),
+        budget,
+    ))
 }
 
 fn apply_optional_budget(output: String, budget: Option<u64>) -> String {
@@ -668,5 +681,64 @@ mod tests {
             output.contains("... truncated"),
             "joined output was not capped: {output}"
         );
+    }
+
+    #[test]
+    fn multi_scope_query_reports_partial_failure() {
+        let scopes = vec![PathBuf::from("valid"), PathBuf::from("missing")];
+        let output = run_query_for_scopes(&scopes, "target", None, |scope| {
+            if scope == Path::new("valid") {
+                Ok("found target".to_string())
+            } else {
+                Err(tilth::error::TilthError::NotFound {
+                    path: scope.to_path_buf(),
+                    suggestion: None,
+                })
+            }
+        })
+        .unwrap();
+        assert!(output.contains("found target"), "{output}");
+        assert!(output.contains("## Scope errors\n- missing:"), "{output}");
+        assert!(output.contains("missing"), "{output}");
+    }
+    #[test]
+    fn partial_failure_survives_small_budget() {
+        let scopes = vec![PathBuf::from("valid"), PathBuf::from("missing")];
+        let output = run_query_for_scopes(&scopes, "target", Some(90), |scope| {
+            if scope == Path::new("valid") {
+                Ok("found target\n".repeat(400))
+            } else {
+                Err(tilth::error::TilthError::NotFound {
+                    path: scope.to_path_buf(),
+                    suggestion: None,
+                })
+            }
+        })
+        .unwrap();
+        assert!(
+            output.contains("## Scope errors\n- missing: not found: missing"),
+            "{output}"
+        );
+        assert!(output.len() <= 90 * 4, "budget exceeded: {}", output.len());
+    }
+
+    #[test]
+    fn all_failed_scopes_return_each_error() {
+        let scopes = vec![PathBuf::from("first"), PathBuf::from("second")];
+        let error = run_query_for_scopes(&scopes, "target", None, |scope| {
+            Err(tilth::error::TilthError::NotFound {
+                path: scope.to_path_buf(),
+                suggestion: None,
+            })
+        })
+        .unwrap_err();
+        match error {
+            tilth::error::TilthError::ScopedFailures { failures } => {
+                assert_eq!(failures.len(), 2);
+                assert_eq!(failures[0].scope, scopes[0]);
+                assert_eq!(failures[1].scope, scopes[1]);
+            }
+            other => panic!("expected scoped failures, got {other}"),
+        }
     }
 }

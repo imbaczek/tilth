@@ -41,6 +41,24 @@ pub(in crate::mcp) fn tool_search(
     let glob = args.get("glob").and_then(|v| v.as_str());
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
 
+    // A relative file query may exist in a later scope. Dispatch all such
+    // queries through the shared reader before searching their text.
+    if kind == "symbol"
+        && scopes.len() > 1
+        && !query.contains(',')
+        && std::path::Path::new(query).is_relative()
+        && scopes.iter().any(|scope| scope.join(query).is_file())
+    {
+        session.record_search(query);
+        let output = crate::run_expanded_scopes(
+            query, &scopes, None, budget, full, expand, glob, cache, full,
+        )
+        .map_err(|e| e.to_string())?;
+        let mut result = scope_warning.unwrap_or_default();
+        result.push_str(&apply_budget(&output, budget));
+        return Ok(result);
+    }
+
     let output = match kind {
         "symbol" => {
             let queries: Vec<&str> = query
@@ -165,6 +183,76 @@ pub(in crate::mcp) fn tool_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_content_and_regex_search_named_file_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("foo.rs"), "pub fn from_file() {}\n").unwrap();
+        std::fs::write(second.join("bar.rs"), "// foo.rs referenced here\n").unwrap();
+        for (kind, query) in [("content", "foo.rs"), ("regex", "foo[.]rs")] {
+            let args = serde_json::json!({
+                "query": query, "kind": kind, "root": tmp.path(),
+                "scopes": ["first", "second"]
+            });
+            let out = tool_search(
+                &args,
+                &OutlineCache::new(),
+                &Session::new(),
+                &Arc::new(BloomFilterCache::new()),
+            )
+            .unwrap();
+            assert!(out.contains("bar.rs"), "{kind}: {out}");
+        }
+    }
+
+    #[test]
+    fn multi_scope_file_query_reads_file_without_searching_other_scope_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(first.join("foo.rs"), "pub fn from_file() {}\n").unwrap();
+        std::fs::write(second.join("bar.rs"), "// foo.rs referenced here\n").unwrap();
+        let args = serde_json::json!({
+            "query": "foo.rs", "root": tmp.path(), "scopes": ["first", "second"]
+        });
+        let out = tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap();
+        assert!(out.contains("from_file"), "{out}");
+        assert!(!out.contains("referenced here"), "{out}");
+    }
+
+    #[test]
+    fn missing_multi_scope_does_not_fall_back_to_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let valid = tmp.path().join("valid");
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(valid.join("lib.rs"), "pub fn needle() {}\n").unwrap();
+        std::fs::write(tmp.path().join("root.rs"), "pub fn needle() {}\n").unwrap();
+        let args = serde_json::json!({
+            "query": "needle", "root": tmp.path(), "scopes": ["valid", "missing"]
+        });
+        let out = tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap();
+        assert!(out.contains("lib.rs"), "{out}");
+        assert!(!out.contains("root.rs"), "{out}");
+        assert!(out.contains("missing"), "{out}");
+    }
     use crate::cache::OutlineCache;
     use crate::index::bloom::BloomFilterCache;
     use crate::session::Session;

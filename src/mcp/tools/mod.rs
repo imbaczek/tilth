@@ -165,25 +165,14 @@ pub(super) fn resolve_scopes(
     }
 
     let mut resolved = Vec::with_capacity(scopes.len());
-    let mut warning = String::new();
     for scope in scopes {
         let raw = scope
             .as_str()
             .ok_or("\"scopes\" must be an array of strings")?;
-        let scoped_args = serde_json::json!({ "scope": raw });
-        let (scope, scope_warning) = resolve_scope(&scoped_args, root)?;
-        resolved.push(scope);
-        if let Some(scope_warning) = scope_warning {
-            warning.push_str(&scope_warning);
-        }
+        let anchored = anchor_path(std::path::Path::new(raw), root, "scope")?;
+        resolved.push(anchored.canonicalize().unwrap_or(anchored));
     }
-
-    let warning = if warning.is_empty() {
-        None
-    } else {
-        Some(warning)
-    };
-    Ok((resolved, warning))
+    Ok((resolved, None))
 }
 
 /// Resolve a relative read path under the absolute-path discipline
