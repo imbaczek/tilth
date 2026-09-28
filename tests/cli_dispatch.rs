@@ -62,3 +62,73 @@ fn repeated_scopes_full_expand_zero_still_obey_final_budget() {
         "--budget must cap the final output after both scopes are joined: {stdout}"
     );
 }
+
+fn large_cli_source(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut source = String::new();
+    for i in 0..60 {
+        source.push_str(&format!("pub fn operation_{i}() {{\n"));
+        source.push_str(&"    let body_only_marker = 123456789;\n".repeat(20));
+        source.push_str("}\n\n");
+    }
+    let path = dir.join("large.rs");
+    fs::write(&path, source).unwrap();
+    path
+}
+
+#[test]
+fn captured_file_read_keeps_automatic_outline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = large_cli_source(tmp.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg(&path)
+        .output()
+        .expect("run captured CLI");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.contains("[outline]"),
+        "captured file read should use the normal smart view: {:?}",
+        stdout.lines().next()
+    );
+    assert!(
+        stdout.contains("operation_59"),
+        "last function must be visible"
+    );
+    assert!(
+        !stdout.contains("body_only_marker"),
+        "outline must omit bodies"
+    );
+}
+
+#[test]
+fn captured_file_read_honors_explicit_full() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = large_cli_source(tmp.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg(&path)
+        .arg("--full")
+        .output()
+        .expect("run captured CLI with --full");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[full]"));
+    assert!(stdout.contains("body_only_marker"));
+    assert!(stdout.contains("operation_59"));
+}
+
+#[test]
+fn captured_file_read_honors_explicit_section() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = large_cli_source(tmp.path());
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg(&path)
+        .args(["--section", "1-2"])
+        .output()
+        .expect("run captured CLI with --section");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("[section]"));
+    assert!(stdout.contains("operation_0"));
+    assert!(stdout.contains("body_only_marker"));
+    assert!(!stdout.contains("operation_59"));
+}

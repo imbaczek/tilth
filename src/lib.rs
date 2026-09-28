@@ -78,10 +78,8 @@ struct ExpandedCtx {
     session: session::Session,
     bloom: index::bloom::BloomFilterCache,
     expand: usize,
-    /// Raises the search match cap (10 → 100). Driven by the explicit `--full`
-    /// flag, NOT by `full = !is_tty`. Piped invocation must preserve the
-    /// concise outline — see the `piped_invocation_does_not_auto_expand`
-    /// pin in `main.rs` for the larger design rule this enforces.
+    /// Raises the search match cap (10 → 100) only for explicit `--full`.
+    /// File display mode and the output destination do not select this cap.
     full_search: bool,
     /// Caller's real token budget, threaded into `fit_to_budget` so
     /// value-based match selection engages at the caller's actual cap
@@ -112,13 +110,11 @@ pub fn run(
     )
 }
 
-/// Full variant — forces full file output, bypassing smart views.
-/// Forced full-file display covers piped-stdout promotion too, so it cannot
-/// gate the search match-cap bump; `cli_full` is the *parsed* `--full` flag
-/// and does that on its own (see `run_expanded`'s note). This is also the
-/// path `--full --expand=0` takes, so the cap has to be raised here even
-/// though the only branch that expands anything is the multi-symbol one,
-/// which carries its own floor of one match per symbol.
+/// Full variant forces full file output, bypassing smart views.
+/// `cli_full` separately controls the search match cap. Library callers may ask
+/// for full file display while retaining the default search cap. This is also
+/// the path `--full --expand=0` takes, so explicit `--full` raises the cap even
+/// without source expansion.
 pub fn run_full(
     query: &str,
     scope: &Path,
@@ -142,10 +138,9 @@ pub fn run_full(
 }
 
 /// Run with expanded search — inline source for top N matches.
-/// `full` controls full-file display for `FilePath` queries (driven by
-/// `cli.full || !is_tty`). `cli_full` is the *parsed* `--full` flag and
-/// alone gates the search match-cap bump; piped invocation must not raise
-/// the cap (see `piped_invocation_does_not_auto_expand` pin).
+/// `full` controls full-file display for `FilePath` queries. `cli_full` controls
+/// the search match cap; the CLI derives both from explicit `--full`, regardless
+/// of whether stdout is a terminal.
 pub fn run_expanded(
     query: &str,
     scope: &Path,
@@ -1125,11 +1120,8 @@ mod tests {
         }
     }
 
-    /// The other half of the contract: `run_full` is also the piped-stdout
-    /// promotion path (`full = !is_tty`, no `--full` typed), where `cli_full`
-    /// is false and the cap must stay at 10. This is the
-    /// `piped_invocation_does_not_auto_expand` rule one layer down, at the
-    /// place the cap is actually chosen.
+    /// Forcing full file display through the library must not raise the search
+    /// match cap unless `cli_full` is also set.
     #[test]
     fn run_full_keeps_default_cap_without_cli_full() {
         let dir = fixture();
@@ -1140,7 +1132,7 @@ mod tests {
             for shown in header_match_counts(&out) {
                 assert!(
                 shown <= 10,
-                "{path}: {query:?} piped without --full showed {shown} matches, want at most 10"
+                "{path}: {query:?} full file mode without cli_full showed {shown} matches, want at most 10"
             );
             }
         }
