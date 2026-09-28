@@ -323,8 +323,20 @@ mod expansion_budget_fallback_tests {
             "the compact top-ranked definition should survive; output was:\n{output}"
         );
         assert!(
-            output.contains("... expansion omitted (budget)"),
+            output.contains("!! expansion omitted (budget)"),
             "expected an expansion budget note; output was:\n{output}"
+        );
+        assert_eq!(
+            output.matches(" tokens)").count(),
+            1,
+            "expected one token estimate; output was:\n{output}"
+        );
+        let note_pos = output.find("!! expansion omitted (budget)").unwrap();
+        let signature_pos = output.find("pub fn large_target()").unwrap();
+        let sibling_pos = output.find("small_usage").unwrap();
+        assert!(
+            signature_pos < note_pos && note_pos < sibling_pos,
+            "expansion note should follow the signature before its sibling; output was:\n{output}"
         );
     }
 
@@ -420,7 +432,7 @@ mod multi_query_expansion_fallback_tests {
             "multi-query compact top definition should survive; output was:\n{output}"
         );
         assert!(
-            output.contains("... expansion omitted (budget)"),
+            output.contains("!! expansion omitted (budget)"),
             "expected multi-query expansion budget note; output was:\n{output}"
         );
     }
@@ -494,7 +506,7 @@ mod multi_scope_expansion_fallback_tests {
             "multi-scope compact top definition should survive; output was:\n{output}"
         );
         assert!(
-            output.contains("... expansion omitted (budget)"),
+            output.contains("!! expansion omitted (budget)"),
             "expected multi-scope expansion budget note; output was:\n{output}"
         );
     }

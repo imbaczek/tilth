@@ -2102,32 +2102,44 @@ where
         return Ok(expanded);
     }
 
-    let note = "\n\n... expansion omitted (budget)";
+    let note = "\n!! expansion omitted (budget)";
     let compact_budget = budget_tokens.saturating_sub(estimate_tokens(note.len() as u64));
     let compact_output = compact(compact_budget)?;
-    let (compact_body, footer_start) = if has_token_footer {
+    let compact_body = if has_token_footer {
         let Some(footer_start) = compact_output
             .rfind("\n\n(")
             .filter(|&start| compact_output[start..].ends_with(" tokens)"))
         else {
             return Ok(expanded);
         };
-        (&compact_output[..footer_start], Some(footer_start))
+        &compact_output[..footer_start]
     } else {
-        (&compact_output[..], None)
+        &compact_output[..]
     };
 
-    let mut fallback = compact_body.to_string();
-    fallback.push_str(note);
-    if !compact_body.contains(&top_marker) || estimate_tokens(fallback.len() as u64) > budget_tokens
-    {
+    let heading = format!("### {top_marker}");
+    let Some(heading_start) = compact_body.find(&heading) else {
         return Ok(expanded);
-    }
-
-    if footer_start.is_some() {
-        let tokens = estimate_tokens(fallback.len() as u64);
-        let token_str = format_token_count(tokens);
-        let _ = write!(fallback, "\n\n({token_str} tokens)");
+    };
+    let after_heading = heading_start + heading.len();
+    let match_end = compact_body[after_heading..]
+        .find("\n\n")
+        .map_or(compact_body.len(), |offset| after_heading + offset);
+    let match_body = &compact_body[after_heading..match_end];
+    let insert_at = match_body
+        .find("\n-> [")
+        .and_then(|arrow| {
+            match_body[arrow..]
+                .find("\n  [")
+                .map(|next| after_heading + arrow + next)
+        })
+        .unwrap_or(match_end);
+    let mut fallback = String::with_capacity(compact_body.len() + note.len());
+    fallback.push_str(&compact_body[..insert_at]);
+    fallback.push_str(note);
+    fallback.push_str(&compact_body[insert_at..]);
+    if estimate_tokens(fallback.len() as u64) > budget_tokens {
+        return Ok(expanded);
     }
     Ok(fallback)
 }
