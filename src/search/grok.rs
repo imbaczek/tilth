@@ -2,7 +2,7 @@
 //! dance into one structured response. A1 ships target resolution; A2 assembles
 //! callees/callers/siblings/tests; A3 will format.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -476,11 +476,48 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let raw_callers = find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?;
+    let ts_importers = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+        Some(super::deps::find_importers(&canonical_target, scope)?)
+    } else {
+        None
+    };
+    let raw_callers = if let Some(importers) = &ts_importers {
+        let mut candidates = importers.clone();
+        candidates.insert(canonical_target.clone());
+        super::callers::find_callers_in_files(&candidates, scope, &symbols)
+    } else {
+        find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?
+    };
+    let ts_owner = if ts_importers.is_some() {
+        enclosing_class_name(&entries, target.start_line)
+    } else {
+        None
+    };
+    let mut ts_aliases: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    if let Some(owner) = ts_owner {
+        let mut resolver = TsExportResolver::new(&canonical_target, owner, &content, lang);
+        for (_, caller) in &raw_callers {
+            ts_aliases.entry(caller.path.clone()).or_insert_with(|| {
+                ts_owner_aliases(&caller.path, &caller.content, &target.name, &mut resolver)
+            });
+        }
+    }
 
     let prod_and_test: Vec<CallerMatch> = raw_callers
         .into_iter()
         .map(|(_, m)| m)
+        .filter(|m| {
+            ts_importers
+                .as_ref()
+                .is_none_or(|importers| m.path == canonical_target || importers.contains(&m.path))
+        })
+        .filter(|m| {
+            ts_owner.is_none_or(|_| {
+                ts_aliases
+                    .get(&m.path)
+                    .is_some_and(|aliases| ts_receiver_matches(m, &target, aliases))
+            })
+        })
         .filter(|m| !is_recursive_call_site(m, &canonical_target, &target))
         .collect();
 
@@ -596,6 +633,574 @@ pub fn grok(
         total_tests,
         delegate_body,
     })
+}
+
+fn enclosing_class_name(entries: &[OutlineEntry], line: u32) -> Option<&str> {
+    for entry in entries {
+        if entry.start_line <= line && line <= entry.end_line {
+            if let Some(nested) = enclosing_class_name(&entry.children, line) {
+                return Some(nested);
+            }
+            if entry.kind == OutlineKind::Class {
+                return Some(&entry.name);
+            }
+        }
+    }
+    None
+}
+
+struct TsExportResolver {
+    target: PathBuf,
+    owner: String,
+    target_default: bool,
+    cache: HashMap<(PathBuf, String), bool>,
+}
+
+impl TsExportResolver {
+    fn new(target: &Path, owner: &str, content: &str, lang: Lang) -> Self {
+        let mut target_default = false;
+        if let Some(grammar) = crate::lang::outline::outline_language(lang) {
+            let mut parser = tree_sitter::Parser::new();
+            if parser.set_language(&grammar).is_ok() {
+                if let Some(tree) = parser.parse(content, None) {
+                    let mut cursor = tree.root_node().walk();
+                    for statement in tree.root_node().named_children(&mut cursor) {
+                        if statement.kind() != "export_statement" {
+                            continue;
+                        }
+                        let Ok(text) = statement.utf8_text(content.as_bytes()) else {
+                            continue;
+                        };
+                        if !text.contains("default") {
+                            continue;
+                        }
+                        let mut child_cursor = statement.walk();
+                        target_default |=
+                            statement.named_children(&mut child_cursor).any(|child| {
+                                matches!(child.kind(), "class_declaration" | "class")
+                                    && child
+                                        .child_by_field_name("name")
+                                        .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+                                        == Some(owner)
+                            });
+                        target_default |=
+                            text.trim().starts_with(&format!("export default {owner}"));
+                    }
+                }
+            }
+        }
+        Self {
+            target: target.to_path_buf(),
+            owner: owner.to_string(),
+            target_default,
+            cache: HashMap::new(),
+        }
+    }
+
+    fn resolves(&mut self, module: &Path, exported: &str) -> bool {
+        self.resolve_inner(module, exported, &mut HashSet::new(), 0)
+    }
+
+    fn resolve_inner(
+        &mut self,
+        module: &Path,
+        exported: &str,
+        visiting: &mut HashSet<(PathBuf, String)>,
+        depth: usize,
+    ) -> bool {
+        if module == self.target {
+            return exported == self.owner || (exported == "default" && self.target_default);
+        }
+        if depth >= 16 {
+            return false;
+        }
+        let key = (module.to_path_buf(), exported.to_string());
+        if let Some(cached) = self.cache.get(&key) {
+            return *cached;
+        }
+        if !visiting.insert(key.clone()) {
+            return false;
+        }
+        let result = self.reexports_as(module, exported, visiting, depth);
+        visiting.remove(&key);
+        self.cache.insert(key, result);
+        result
+    }
+
+    fn reexports_as(
+        &mut self,
+        module: &Path,
+        exported: &str,
+        visiting: &mut HashSet<(PathBuf, String)>,
+        depth: usize,
+    ) -> bool {
+        let FileType::Code(lang) = detect_file_type(module) else {
+            return false;
+        };
+        let Ok(content) = fs::read_to_string(module) else {
+            return false;
+        };
+        let Some(grammar) = crate::lang::outline::outline_language(lang) else {
+            return false;
+        };
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&grammar).is_err() {
+            return false;
+        }
+        let Some(tree) = parser.parse(&content, None) else {
+            return false;
+        };
+
+        let mut imports = HashMap::new();
+        let mut cursor = tree.root_node().walk();
+        for statement in tree.root_node().named_children(&mut cursor) {
+            if statement.kind() != "import_statement" {
+                continue;
+            }
+            let Some(source) = statement.child_by_field_name("source") else {
+                continue;
+            };
+            let Ok(source) = source.utf8_text(content.as_bytes()) else {
+                continue;
+            };
+            let Some(imported) = crate::read::imports::resolve_import_source(
+                module,
+                source.trim_matches(['\'', '"']),
+                lang,
+            ) else {
+                continue;
+            };
+            let Ok(text) = statement.utf8_text(content.as_bytes()) else {
+                continue;
+            };
+            for (local, symbol) in crate::read::imports::js_import_bindings(text) {
+                imports.insert(local, (imported.clone(), symbol));
+            }
+        }
+
+        let mut star_sources = Vec::new();
+        let mut cursor = tree.root_node().walk();
+        for statement in tree.root_node().named_children(&mut cursor) {
+            if statement.kind() != "export_statement" {
+                continue;
+            }
+            let Ok(text) = statement.utf8_text(content.as_bytes()) else {
+                continue;
+            };
+            let source = statement
+                .child_by_field_name("source")
+                .and_then(|source| source.utf8_text(content.as_bytes()).ok())
+                .and_then(|source| {
+                    crate::read::imports::resolve_import_source(
+                        module,
+                        source.trim_matches(['\'', '"']),
+                        lang,
+                    )
+                });
+            if let Some(imported) = source.as_ref() {
+                if text.trim_start().starts_with("export * from") {
+                    star_sources.push(imported.clone());
+                    continue;
+                }
+                if let Some(namespace) = text.trim_start().strip_prefix("export * as ") {
+                    if let Some(namespace) = namespace.split_whitespace().next() {
+                        if let Some(symbol) = exported.strip_prefix(&format!("{namespace}.")) {
+                            return self.resolve_inner(imported, symbol, visiting, depth + 1);
+                        }
+                        if exported == namespace {
+                            return false;
+                        }
+                    }
+                }
+            }
+            for (local, public) in crate::read::imports::js_export_bindings(text) {
+                if public == exported {
+                    return if let Some(imported) = source.as_ref() {
+                        self.resolve_inner(imported, &local, visiting, depth + 1)
+                    } else if let Some((imported, symbol)) = imports.get(&local) {
+                        self.resolve_inner(imported, symbol, visiting, depth + 1)
+                    } else {
+                        false
+                    };
+                }
+                if let Some(symbol) = exported.strip_prefix(&format!("{public}.")) {
+                    if let Some((imported, imported_name)) = imports.get(&local) {
+                        if imported_name == "*" {
+                            return self.resolve_inner(imported, symbol, visiting, depth + 1);
+                        }
+                    }
+                }
+            }
+            if source.is_none() {
+                let mut children = statement.walk();
+                for child in statement.named_children(&mut children) {
+                    if matches!(child.kind(), "class_declaration" | "function_declaration")
+                        && child
+                            .child_by_field_name("name")
+                            .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+                            == Some(exported)
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        exported != "default"
+            && star_sources
+                .iter()
+                .any(|source| self.resolve_inner(source, exported, visiting, depth + 1))
+    }
+}
+
+fn ts_owner_aliases(
+    path: &Path,
+    content: &str,
+    method: &str,
+    resolver: &mut TsExportResolver,
+) -> HashSet<String> {
+    let mut aliases = HashSet::new();
+    if path == resolver.target {
+        aliases.insert(resolver.owner.clone());
+    }
+    let FileType::Code(lang) = detect_file_type(path) else {
+        return aliases;
+    };
+    let Some(grammar) = crate::lang::outline::outline_language(lang) else {
+        return aliases;
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return aliases;
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return aliases;
+    };
+    let mut cursor = tree.root_node().walk();
+    for statement in tree.root_node().named_children(&mut cursor) {
+        if statement.kind() != "import_statement" {
+            continue;
+        }
+        let Some(source) = statement.child_by_field_name("source") else {
+            continue;
+        };
+        let Ok(source) = source.utf8_text(content.as_bytes()) else {
+            continue;
+        };
+        let source = source.trim_matches(['\'', '"']);
+        let Some(imported_path) = crate::read::imports::resolve_import_source(path, source, lang)
+        else {
+            continue;
+        };
+        let Ok(statement_text) = statement.utf8_text(content.as_bytes()) else {
+            continue;
+        };
+        if let (Some(start), Some(end)) = (statement_text.find('{'), statement_text.find('}')) {
+            for entry in statement_text[start + 1..end].split(',') {
+                let entry = entry.trim().strip_prefix("type ").unwrap_or(entry.trim());
+                let mut words = entry.split_whitespace();
+                let Some(imported_name) = words.next() else {
+                    continue;
+                };
+                let local_name = if words.next() == Some("as") {
+                    words.next().unwrap_or(imported_name)
+                } else {
+                    imported_name
+                };
+                if resolver.resolves(&imported_path, imported_name) {
+                    aliases.insert(local_name.to_string());
+                }
+                let member = format!("{imported_name}.{}", resolver.owner);
+                if resolver.resolves(&imported_path, &member) {
+                    aliases.insert(format!("{local_name}.{}", resolver.owner));
+                }
+            }
+        }
+
+        let clause = statement_text
+            .trim_start()
+            .strip_prefix("import")
+            .unwrap_or(statement_text)
+            .trim_start();
+        let clause = clause.strip_prefix("type ").unwrap_or(clause);
+        if let Some(namespace) = clause.strip_prefix("* as ") {
+            if let Some(namespace) = namespace.split_whitespace().next() {
+                let owner = resolver.owner.clone();
+                if resolver.resolves(&imported_path, &owner) {
+                    aliases.insert(format!("{namespace}.{owner}"));
+                }
+            }
+        } else if let Some(default_name) =
+            clause.split(|c: char| c.is_whitespace() || c == ',').next()
+        {
+            if !default_name.is_empty()
+                && !matches!(default_name, "{" | "*" | "from")
+                && resolver.resolves(&imported_path, "default")
+            {
+                aliases.insert(default_name.to_string());
+            }
+        }
+    }
+    // Add local subclasses only when they inherit this method without overriding it.
+    let mut classes = Vec::new();
+    collect_ts_subclasses(tree.root_node(), content.as_bytes(), method, &mut classes);
+    loop {
+        let mut changed = false;
+        for (name, base) in &classes {
+            if aliases.contains(base) {
+                changed |= aliases.insert(name.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    aliases
+}
+
+fn collect_ts_subclasses(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    method: &str,
+    classes: &mut Vec<(String, String)>,
+) {
+    if matches!(node.kind(), "class_declaration" | "class") {
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok());
+        let mut cursor = node.walk();
+        let heritage = node
+            .named_children(&mut cursor)
+            .find(|n| n.kind() == "class_heritage");
+        let base = heritage.and_then(|n| {
+            let mut cursor = n.walk();
+            let base = n
+                .named_children(&mut cursor)
+                .find(|n| n.kind() == "extends_clause")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .and_then(|s| s.trim().strip_prefix("extends"))
+                .map(str::trim)
+                .map(|s| {
+                    s.split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '$' | '.')))
+                        .next()
+                        .unwrap_or("")
+                });
+            base
+        });
+        let overrides = node.child_by_field_name("body").is_some_and(|body| {
+            let mut cursor = body.walk();
+            let overrides = body.named_children(&mut cursor).any(|n| {
+                n.child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+                    == Some(method)
+            });
+            overrides
+        });
+        if let (Some(name), Some(base)) = (name, base) {
+            if !overrides && !base.is_empty() {
+                classes.push((name.to_string(), base.to_string()));
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_ts_subclasses(child, bytes, method, classes);
+    }
+}
+
+fn ts_receiver_matches(
+    caller: &CallerMatch,
+    target: &ResolvedTarget,
+    aliases: &HashSet<String>,
+) -> bool {
+    let Some(receiver) = caller.receiver.as_deref() else {
+        return false;
+    };
+    if receiver == "this" {
+        return ts_this_matches(caller, target, aliases);
+    }
+    if let Some(ty) = caller.receiver_type.as_deref() {
+        return ts_type_matches(caller, target, aliases, ty, caller.receiver_type_site);
+    }
+    ts_type_matches(caller, target, aliases, receiver, caller.receiver_site)
+}
+
+fn ts_type_matches(
+    caller: &CallerMatch,
+    target: &ResolvedTarget,
+    aliases: &HashSet<String>,
+    ty: &str,
+    site: Option<usize>,
+) -> bool {
+    let Some(site) = site else {
+        return false;
+    };
+    let FileType::Code(lang) = detect_file_type(&caller.path) else {
+        return false;
+    };
+    let Some(grammar) = crate::lang::outline::outline_language(lang) else {
+        return false;
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(caller.content.as_str(), None) else {
+        return false;
+    };
+    let Some(node) = tree.root_node().named_descendant_for_byte_range(site, site) else {
+        return false;
+    };
+    let bytes = caller.content.as_bytes();
+    if let Some(class) = ts_local_binding(node, ty, bytes) {
+        let canonical = target
+            .path
+            .canonicalize()
+            .unwrap_or_else(|_| target.path.clone());
+        return ts_class_matches(class, bytes, caller.path == canonical, target, aliases, 0);
+    }
+    aliases.contains(ty)
+}
+
+fn ts_this_matches(
+    caller: &CallerMatch,
+    target: &ResolvedTarget,
+    aliases: &HashSet<String>,
+) -> bool {
+    let FileType::Code(lang) = detect_file_type(&caller.path) else {
+        return false;
+    };
+    let Some(grammar) = crate::lang::outline::outline_language(lang) else {
+        return false;
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return false;
+    }
+    let Some(tree) = parser.parse(caller.content.as_str(), None) else {
+        return false;
+    };
+    let Some((start, end)) = caller.enclosing_type_range else {
+        return false;
+    };
+    let Some(class) = tree.root_node().named_descendant_for_byte_range(start, end) else {
+        return false;
+    };
+    let canonical_target = target
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| target.path.clone());
+    ts_class_matches(
+        class,
+        caller.content.as_bytes(),
+        caller.path == canonical_target,
+        target,
+        aliases,
+        0,
+    )
+}
+
+fn ts_class_matches(
+    class: tree_sitter::Node,
+    bytes: &[u8],
+    in_target: bool,
+    target: &ResolvedTarget,
+    aliases: &HashSet<String>,
+    depth: usize,
+) -> bool {
+    if !matches!(class.kind(), "class_declaration" | "class") {
+        return false;
+    }
+    if depth >= 16 {
+        return false;
+    }
+    if in_target
+        && (class.start_position().row as u32) < target.start_line
+        && target.end_line <= class.end_position().row as u32 + 1
+    {
+        return true;
+    }
+    let mut subclasses = Vec::new();
+    collect_ts_subclasses(class, bytes, &target.name, &mut subclasses);
+    let name = class
+        .child_by_field_name("name")
+        .and_then(|n| n.utf8_text(bytes).ok());
+    let Some((_, base)) = subclasses.iter().find(|(n, _)| Some(n.as_str()) == name) else {
+        return false;
+    };
+    if let Some(local) = ts_local_binding(class, base, bytes) {
+        return ts_class_matches(local, bytes, in_target, target, aliases, depth + 1);
+    }
+    aliases.contains(base)
+}
+
+fn ts_local_binding<'a>(
+    node: tree_sitter::Node<'a>,
+    name: &str,
+    bytes: &[u8],
+) -> Option<tree_sitter::Node<'a>> {
+    fn binding<'a>(
+        node: tree_sitter::Node<'a>,
+        name: &str,
+        bytes: &[u8],
+    ) -> Option<tree_sitter::Node<'a>> {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "class" | "function_declaration" | "variable_declarator"
+        ) && node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(bytes).ok())
+            == Some(name)
+        {
+            return Some(node);
+        }
+        if matches!(node.kind(), "required_parameter" | "optional_parameter") {
+            let parameter = node
+                .utf8_text(bytes)
+                .ok()?
+                .split(':')
+                .next()?
+                .trim()
+                .trim_end_matches('?');
+            if parameter == name {
+                return Some(node);
+            }
+        }
+        if matches!(
+            node.kind(),
+            "export_statement"
+                | "lexical_declaration"
+                | "variable_declaration"
+                | "formal_parameters"
+        ) {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                if let Some(found) = binding(child, name, bytes) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+    let mut ancestor = node.parent();
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "program"
+                | "statement_block"
+                | "function_declaration"
+                | "method_definition"
+                | "arrow_function"
+        ) {
+            let mut cursor = scope.walk();
+            for child in scope.named_children(&mut cursor) {
+                if let Some(found) = binding(child, name.split('.').next().unwrap_or(name), bytes) {
+                    return Some(found);
+                }
+            }
+        }
+        ancestor = scope.parent();
+    }
+    None
 }
 
 /// Slice the target's source body out of `content`. Caps at `max_lines` total
@@ -1168,6 +1773,285 @@ mod tests {
         let mut f = fs::File::create(&path).unwrap();
         f.write_all(body.as_bytes()).unwrap();
         path
+    }
+
+    #[test]
+    fn grok_ts_barrel_and_inheritance_regressions() {
+        for (barrel, client, expected) in [
+            ("import { Service } from './service'; export { Service };", "import { Service } from './index'; new Service().create();", true),
+            ("import { Service } from './service'; export default Service;", "import Service from './index'; new Service().create();", true),
+            ("export * from './service'; export class Service { create() {} }", "import { Service } from './index'; new Service().create();", false),
+            ("export * as svc from './service';", "import { svc } from './index'; new svc.Service().create();", true),
+            ("import * as svc from './service'; export { svc };", "import { svc } from './index'; new svc.Service().create();", true),
+            ("export { Service } from './service';", "import { Service as S } from './index'; class Sub extends S { run() { this.create(); } }", true),
+            ("export { Service } from './service';", "import { Service as S } from './index'; class Sub extends S { create() {} run() { this.create(); } }", false),
+            ("export { Service } from './service';", "import { Service as S } from './index'; class Sub extends S {} class Leaf extends Sub { run() { this.create(); } }", true),
+            ("export { Service } from './service';", "import { Service } from './index'; function f() { class Service { create() {} run() { this.create(); } } new Service().run(); }", false),
+            ("export { Service } from './service';", "import { Service } from './index'; function f() { class Service { create() {} } class Sub extends Service { run() { this.create(); } } }", false),
+            ("export { Service } from './service';", "import { Service } from './index'; function f() { class Service { create() {} } const s = new Service(); s.create(); }", false),
+            ("export { Service } from './service';", "import { Service } from './index'; function f() { class Service { static create() {} } Service.create(); }", false),
+            ("export { Service } from './service';", "import { Service } from './index'; function f(Service: any) { const s = new Service(); s.create(); }", false),
+            ("export { Service } from './service';", "import { Service } from './index'; function f() { const Service = Other; const s = new Service(); s.create(); }", false),
+            ("export { Service } from './service';", "import { Service } from './index'; const s = new Service(); function f() { class Service {} s.create(); }", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = write_fixture(tmp.path(), "service.ts", "export class Service {\n create() {}\n}\n");
+            write_fixture(tmp.path(), "index.ts", barrel);
+            write_fixture(tmp.path(), "client.ts", client);
+            let result = grok(
+                &format!("{}:2", target.display()), tmp.path(),
+                &BloomFilterCache::default(), &crate::session::Session::default(),
+                GrokCaps::default(),
+            ).unwrap();
+            assert_eq!(result.callers.iter().any(|c| c.path.ends_with("client.ts")), expected, "{barrel}\n{client}");
+        }
+    }
+
+    #[test]
+    fn grok_ts_method_follows_import_alias_and_lexical_shadowing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "tsconfig.json",
+            r#"{"compilerOptions":{"paths":{"@svc/*":["src/*"]}}}"#,
+        );
+        let target = write_fixture(
+            tmp.path(),
+            "src/service.ts",
+            "export class Service {\n  create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "src/index.ts",
+            "export { Service } from './service';\n",
+        );
+        write_fixture(tmp.path(), "src/client.ts", "import { Service as S } from '@svc/index';\nclass Other { create() {} }\nconst service = new S();\nservice.create();\n{ const service = new Other(); service.create(); }\n");
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let from_client: Vec<_> = result
+            .callers
+            .iter()
+            .filter(|caller| caller.path.ends_with("client.ts"))
+            .map(|caller| caller.line)
+            .collect();
+        assert_eq!(from_client, vec![4], "{from_client:?}");
+    }
+
+    #[test]
+    fn grok_ts_method_follows_constructor_parameter_property() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export class Service {\n  create() {}\n}\n",
+        );
+        write_fixture(tmp.path(), "client.ts",
+            "import { Service } from './service';\nclass Client {\n  constructor(private service: Service) {}\n  run() { this.service.create(); }\n}\n");
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(result
+            .callers
+            .iter()
+            .any(|caller| caller.path.ends_with("client.ts") && caller.line == 4));
+    }
+
+    #[test]
+    fn grok_ts_this_property_ignores_same_named_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export class Service {\n create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "client.ts",
+            "import { Service } from './service';\nclass Other { create() {} }\nclass Client {\n constructor(private service: Service) {}\n run() { const service = new Other(); this.service.create(); }\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "wrong.ts",
+            "import { Service } from './service';\nclass Other { create() {} }\nclass Client {\n constructor(private service: Other) {}\n run() { const service = new Service(); this.service.create(); }\n}\n",
+        );
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(result
+            .callers
+            .iter()
+            .any(|caller| caller.path.ends_with("client.ts") && caller.line == 5));
+        assert!(!result
+            .callers
+            .iter()
+            .any(|caller| caller.path.ends_with("wrong.ts")));
+    }
+
+    #[test]
+    fn grok_ts_method_follows_default_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export default class Service {\n create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "client.ts",
+            "import S from './service';\nconst service = new S();\nservice.create();\n",
+        );
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(result
+            .callers
+            .iter()
+            .any(|caller| caller.path.ends_with("client.ts") && caller.line == 3));
+    }
+
+    #[test]
+    fn grok_ts_method_follows_namespace_import() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export class Service {\n create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "client.ts",
+            "import * as NS from './service';\nconst service = new NS.Service();\nservice.create();\n",
+        );
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(result
+            .callers
+            .iter()
+            .any(|caller| caller.path.ends_with("client.ts") && caller.line == 3));
+    }
+
+    #[test]
+    fn grok_ts_method_rejects_other_export_with_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export class Service {\n create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "other.ts",
+            "export class Service {\n create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "index.ts",
+            "export { Service as TargetService } from './service';\nexport { Service } from './other';\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "client.ts",
+            "import { Service } from './index';\nconst service = new Service();\nservice.create();\n",
+        );
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert!(!result
+            .callers
+            .iter()
+            .any(|caller| caller.path.ends_with("client.ts")));
+    }
+
+    #[test]
+    fn grok_ts_method_excludes_unrelated_same_name_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "tsconfig.json",
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@svc/*":["src/*"]}}}"#,
+        );
+        let target = write_fixture(
+            tmp.path(),
+            "src/service.ts",
+            "export class Service {\n  create() {}\n}\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "src/index.ts",
+            "export { Service } from './service';\n",
+        );
+        write_fixture(tmp.path(), "src/real.ts",
+            "import { Service } from '@svc/index';\nconst service = new Service();\nservice.create();\nconst other = new Other();\nother.create();\n");
+        write_fixture(
+            tmp.path(),
+            "src/unrelated.ts",
+            "class Other { create() {} }\nnew Other().create();\n",
+        );
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &bloom,
+            &session,
+            GrokCaps::default(),
+        )
+        .unwrap();
+        let paths: Vec<_> = result
+            .callers
+            .iter()
+            .map(|caller| {
+                caller
+                    .path
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string()
+            })
+            .collect();
+        assert!(paths.contains(&"real.ts".to_string()), "{paths:?}");
+        assert!(!paths.contains(&"unrelated.ts".to_string()), "{paths:?}");
+        assert_eq!(
+            paths.iter().filter(|path| *path == "real.ts").count(),
+            1,
+            "{paths:?}"
+        );
     }
 
     #[test]

@@ -9,9 +9,12 @@ use std::path::{Path, PathBuf};
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
 use crate::lang::outline::{extract_import_source, get_outline_entries};
-use crate::read::imports::{is_external, is_import_line, resolve_related_files_with_content};
+use crate::read::imports::{
+    is_external, is_import_line, js_module_sources_from_file, resolve_import_source,
+    resolve_related_files_with_content,
+};
 use crate::search::callees::{extract_callee_names, resolve_callees};
-use crate::search::callers::find_callers_batch;
+use crate::search::callers::{find_callers_batch, find_callers_in_files};
 use crate::types::{FileType, OutlineKind};
 
 /// Maximum number of exported symbols to search for in the reverse direction.
@@ -160,7 +163,10 @@ pub fn analyze_deps(
         if source.is_empty() {
             continue;
         }
-        if is_external(&source, lang) && !is_stdlib(&source, lang) && is_valid_module_path(&source)
+        if is_external(&source, lang)
+            && resolve_import_source(path, &source, lang).is_none()
+            && !is_stdlib(&source, lang)
+            && is_valid_module_path(&source)
         {
             external_set.insert(source.clone());
         }
@@ -170,15 +176,38 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let mut used_by = if searched_count > 0 {
+    let mut used_by = if searched_count > 0
+        || matches!(
+            lang,
+            crate::types::Lang::TypeScript
+                | crate::types::Lang::Tsx
+                | crate::types::Lang::JavaScript
+        ) {
         let symbols_set: HashSet<String> = all_names.iter().cloned().collect();
-        let raw_matches = find_callers_batch(
-            &symbols_set,
-            scope,
-            bloom,
-            None,
-            crate::search::callers::BATCH_EARLY_QUIT,
-        )?;
+        // TypeScript dependencies are established by imports, including tsconfig
+        // aliases. A name-only call match is not evidence of a dependency.
+        let is_ts = matches!(
+            lang,
+            crate::types::Lang::TypeScript
+                | crate::types::Lang::Tsx
+                | crate::types::Lang::JavaScript
+        );
+        let importing_files = if is_ts {
+            find_importers(path, scope)?
+        } else {
+            HashSet::new()
+        };
+        let raw_matches = if is_ts {
+            find_callers_in_files(&importing_files, scope, &symbols_set)
+        } else {
+            find_callers_batch(
+                &symbols_set,
+                scope,
+                bloom,
+                None,
+                crate::search::callers::BATCH_EARLY_QUIT,
+            )?
+        };
 
         // Group by file path
         let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
@@ -192,6 +221,11 @@ pub fn analyze_deps(
                 matched_symbol,
                 caller_match.line,
             ));
+        }
+        for importer in importing_files {
+            if importer != *path {
+                by_file.entry(importer).or_default();
+            }
         }
 
         // Build Dependent list
@@ -239,6 +273,64 @@ pub fn analyze_deps(
     })
 }
 
+pub(crate) fn find_importers(target: &Path, scope: &Path) -> Result<HashSet<PathBuf>, TilthError> {
+    let edges = std::sync::Mutex::new(Vec::new());
+    super::walker(scope, None)?.run(|| {
+        let edges = &edges;
+        Box::new(move |entry| {
+            let Ok(entry) = entry else {
+                return ignore::WalkState::Continue;
+            };
+            if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                return ignore::WalkState::Continue;
+            }
+            let importer = entry.path();
+            let FileType::Code(
+                lang @ (crate::types::Lang::TypeScript
+                | crate::types::Lang::Tsx
+                | crate::types::Lang::JavaScript),
+            ) = detect_file_type(importer)
+            else {
+                return ignore::WalkState::Continue;
+            };
+            let file_edges: Vec<_> = js_module_sources_from_file(importer, lang)
+                .into_iter()
+                .filter_map(|(source, reexport)| {
+                    resolve_import_source(importer, &source, lang)
+                        .map(|imported| (importer.to_path_buf(), imported, reexport))
+                })
+                .collect();
+            if !file_edges.is_empty() {
+                edges
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend(file_edges);
+            }
+            ignore::WalkState::Continue
+        })
+    });
+    let edges = edges
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut exported_through = HashSet::from([target.to_path_buf()]);
+    loop {
+        let before = exported_through.len();
+        for (importer, imported, reexport) in &edges {
+            if *reexport && exported_through.contains(imported) {
+                exported_through.insert(importer.clone());
+            }
+        }
+        if exported_through.len() == before {
+            break;
+        }
+    }
+    Ok(edges
+        .into_iter()
+        .filter(|(_, imported, _)| exported_through.contains(imported))
+        .map(|(importer, _, _)| importer)
+        .collect())
+}
+
 /// Format a `DepsResult` as a compact, readable string.
 ///
 /// Budget truncation priority (when `budget` tokens is too tight):
@@ -275,7 +367,7 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
 
     let barrel_note = if result.exported_count > MAX_EXPORTED_SYMBOLS {
         format!(
-            "\n\n> ({} of {} exports shown — barrel file detected)",
+            "\n\n> ({} of {} exported symbols searched)",
             result.searched_count, result.exported_count
         )
     } else {
@@ -433,6 +525,10 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
             .unwrap_or(&dep.path)
             .display()
             .to_string();
+        if dep.symbols.is_empty() {
+            let _ = write!(out, "\n{rel} (imports file)");
+            continue;
+        }
         // Group by (caller, line) for readability — keep the earliest line per caller
         let mut by_caller: HashMap<&str, (u32, Vec<&str>)> = HashMap::new();
         for (caller, symbol, line) in &dep.symbols {
@@ -440,7 +536,9 @@ fn format_used_by(deps: &[&Dependent], scope: &Path, heading: &str) -> String {
                 .entry(caller.as_str())
                 .or_insert((*line, Vec::new()));
             entry.0 = entry.0.min(*line);
-            entry.1.push(symbol.as_str());
+            if !entry.1.contains(&symbol.as_str()) {
+                entry.1.push(symbol.as_str());
+            }
         }
         let mut callers: Vec<(&str, u32, Vec<&str>)> = by_caller
             .into_iter()
@@ -547,6 +645,127 @@ fn assemble(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_then_export_barrel_reports_transitive_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("service.ts");
+        fs::write(&target, "export class Service {}\n").unwrap();
+        fs::write(
+            root.join("index.ts"),
+            "import { Service } from './service'; export { Service };\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("client.ts"),
+            "import { Service } from './index';\nnew Service();\n",
+        )
+        .unwrap();
+        let result =
+            analyze_deps(&target, root, &crate::index::bloom::BloomFilterCache::new()).unwrap();
+        assert_eq!(result.total_dependents, 2);
+        assert!(result.used_by.iter().any(|d| d.path.ends_with("client.ts")));
+    }
+
+    #[test]
+    fn tsconfig_alias_imports_count_as_dependents_without_name_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{
+            // The project uses a path alias.
+            "compilerOptions": {"baseUrl": ".", "paths": {"@svc/*": ["src/*",],},},
+        }"#,
+        )
+        .unwrap();
+        let target = root.join("src/service.ts");
+        fs::write(&target, "export class Service { create() {} }\n").unwrap();
+        fs::write(root.join("src/a.ts"),
+            "import { Service } from '@svc/service';\nconst service = new Service(); service.create(); service.create();\n").unwrap();
+        fs::write(
+            root.join("src/b.ts"),
+            "import { Service } from '@svc/service';\nexport const service = Service;\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/unrelated.ts"),
+            "class Other { create() {} }\nnew Other().create();\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&target, root, &bloom).unwrap();
+        assert_eq!(result.total_dependents, 2);
+        let output = format_deps(&result, root, None);
+        assert!(output.contains("src/a.ts"), "{output}");
+        assert!(output.contains("src/b.ts"), "{output}");
+        assert!(!output.contains("src/unrelated.ts"), "{output}");
+        assert!(!output.contains("create, create"), "{output}");
+    }
+
+    #[test]
+    fn export_only_ts_file_still_reports_importers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@svc/*":["src/*"]}}}"#,
+        )
+        .unwrap();
+        let barrel = root.join("src/index.ts");
+        fs::write(&barrel, "export { Service } from './service';\n").unwrap();
+        fs::write(root.join("src/service.ts"), "export class Service {}\n").unwrap();
+        fs::write(
+            root.join("src/client.ts"),
+            "import { Service } from '@svc/index';\nconst service = new Service();\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&barrel, root, &bloom).unwrap();
+        assert_eq!(result.total_dependents, 1);
+        assert!(format_deps(&result, root, None).contains("src/client.ts"));
+    }
+
+    #[test]
+    fn ts_importers_are_not_limited_by_global_name_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("service.ts");
+        fs::write(&target, "export class Service { create() {} }\n").unwrap();
+        for index in 0..60 {
+            fs::write(
+                root.join(format!("caller{index}.ts")),
+                "import { Service } from './service';\nnew Service().create();\n",
+            )
+            .unwrap();
+        }
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let result = analyze_deps(&target, root, &bloom).unwrap();
+        assert_eq!(result.total_dependents, 60);
+    }
+
+    #[test]
+    fn ts_runtime_extension_import_counts_as_dependent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("service.ts");
+        fs::write(&target, "export class Service {}\n").unwrap();
+        fs::write(
+            root.join("client.ts"),
+            "import { Service } from './service.js';\nnew Service();\n",
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        assert_eq!(
+            analyze_deps(&target, root, &bloom)
+                .unwrap()
+                .total_dependents,
+            1
+        );
+    }
 
     #[test]
     fn go_stdlib_fmt_is_stdlib() {

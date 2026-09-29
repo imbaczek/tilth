@@ -3,6 +3,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::SystemTime;
 
 use crate::lang::detect_file_type;
 use crate::types::{FileType, Lang};
@@ -24,7 +26,7 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
         return Vec::new();
     };
 
-    let Some(dir) = file_path.parent() else {
+    let Some(_dir) = file_path.parent() else {
         return Vec::new();
     };
 
@@ -37,16 +39,434 @@ pub fn resolve_related_files_with_content(file_path: &Path, content: &str) -> Ve
             continue;
         }
         let source = crate::lang::outline::extract_import_source(line, Some(lang));
-        if source.is_empty() || is_external(&source, lang) {
+        if source.is_empty() {
             continue;
         }
-        if let Some(path) = resolve(dir, &source, lang) {
+        if let Some(path) = resolve_import_source(file_path, &source, lang) {
             if !results.contains(&path) {
                 results.push(path);
             }
         }
     }
     results
+}
+
+/// Resolve one import to a local file, including TypeScript `compilerOptions.paths`.
+/// The closest tsconfig is used, as TypeScript projects in a monorepo can have
+/// different aliases. Unresolvable package imports remain external.
+pub(crate) fn resolve_import_source(file: &Path, source: &str, lang: Lang) -> Option<PathBuf> {
+    let dir = file.parent()?;
+    if !is_external(source, lang) {
+        if let Some(path) = resolve(dir, source, lang) {
+            return Some(path);
+        }
+    }
+    if source.starts_with('.') || source.starts_with('/') {
+        return None;
+    }
+    if !matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+        return None;
+    }
+    let config = dir
+        .ancestors()
+        .map(|ancestor| ancestor.join("tsconfig.json"))
+        .find(|candidate| candidate.is_file())?;
+    let chain = tsconfig_chain(&config);
+    let base_url = chain.iter().find_map(|(path, json)| {
+        json.pointer("/compilerOptions/baseUrl")
+            .and_then(|value| value.as_str())
+            .and_then(|relative| path.parent().map(|dir| dir.join(relative)))
+    });
+    if let Some((path, paths)) = chain.iter().find_map(|(path, json)| {
+        json.pointer("/compilerOptions/paths")
+            .and_then(|value| value.as_object())
+            .map(|paths| (path, paths))
+    }) {
+        let base = base_url
+            .clone()
+            .unwrap_or_else(|| path.parent().unwrap_or(dir).to_path_buf());
+        let best = paths
+            .iter()
+            .filter_map(|(pattern, replacements)| {
+                match_alias(pattern, source).map(|capture| (pattern, replacements, capture))
+            })
+            .max_by_key(|(pattern, _, _)| {
+                // TypeScript prefers exact matches, then the longest prefix
+                // preceding a wildcard. Never fall back to a weaker pattern.
+                let (prefix, exact) = pattern
+                    .split_once('*')
+                    .map_or((pattern.as_str(), true), |(prefix, _)| (prefix, false));
+                (exact, prefix.len(), pattern.len())
+            });
+        if let Some((_, replacements, capture)) = best {
+            return replacements
+                .as_array()?
+                .iter()
+                .filter_map(|value| value.as_str())
+                .find_map(|replacement| {
+                    resolve_js(&base, &replacement.replace('*', capture))
+                        .map(|found| normalize_path(&found))
+                });
+        }
+    }
+    base_url.and_then(|base| resolve_js(&base, source).map(|found| normalize_path(&found)))
+}
+
+fn tsconfig_chain(start: &Path) -> Vec<(PathBuf, Arc<serde_json::Value>)> {
+    let mut result = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    append_tsconfig(start, &mut result, &mut seen, 0);
+    result
+}
+
+fn append_tsconfig(
+    config: &Path,
+    result: &mut Vec<(PathBuf, Arc<serde_json::Value>)>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+    depth: usize,
+) {
+    if depth >= 16 {
+        return;
+    }
+    let canonical = config
+        .canonicalize()
+        .unwrap_or_else(|_| config.to_path_buf());
+    if !seen.insert(canonical) {
+        return;
+    }
+    let Some(json) = tsconfig_json(config) else {
+        return;
+    };
+    let parents: Vec<_> = match json.get("extends") {
+        Some(serde_json::Value::String(name)) => vec![name.clone()],
+        Some(serde_json::Value::Array(names)) => names
+            .iter()
+            .filter_map(|name| name.as_str().map(str::to_owned))
+            .rev()
+            .collect(),
+        _ => Vec::new(),
+    };
+    result.push((config.to_path_buf(), json));
+    for parent in parents {
+        if let Some(path) = resolve_tsconfig_extends(config, &parent) {
+            append_tsconfig(&path, result, seen, depth + 1);
+        }
+    }
+}
+
+fn resolve_tsconfig_extends(config: &Path, name: &str) -> Option<PathBuf> {
+    let dir = config.parent()?;
+    if name.starts_with('.') || name.starts_with('/') {
+        return tsconfig_candidate(&dir.join(name));
+    }
+    for ancestor in dir.ancestors() {
+        if let Some(found) = tsconfig_candidate(&ancestor.join("node_modules").join(name)) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn tsconfig_candidate(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    if path.extension().is_none() {
+        let json = path.with_extension("json");
+        if json.is_file() {
+            return Some(json);
+        }
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    if let Ok(package) = fs::read_to_string(path.join("package.json")) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&package) {
+            if let Some(name) = json.get("tsconfig").and_then(|value| value.as_str()) {
+                if let Some(found) = tsconfig_candidate(&path.join(name)) {
+                    return Some(found);
+                }
+            }
+        }
+    }
+    path.join("tsconfig.json")
+        .is_file()
+        .then(|| path.join("tsconfig.json"))
+}
+
+/// Import specifiers from JS/TS syntax. Unlike line-based extraction this
+/// includes multiline imports and re-exports.
+/// The second field records whether the statement re-exports another module.
+/// Return (local binding, imported name) for a static import statement.
+pub(crate) fn js_import_bindings(text: &str) -> Vec<(String, String)> {
+    let clause = text
+        .trim_start()
+        .strip_prefix("import")
+        .unwrap_or("")
+        .trim_start();
+    let clause = clause.strip_prefix("type ").unwrap_or(clause);
+    let mut bindings = Vec::new();
+    if let Some(start) = clause.find('{') {
+        if let Some(end) = clause[start + 1..].find('}') {
+            for item in clause[start + 1..start + 1 + end].split(',') {
+                let item = item.trim().strip_prefix("type ").unwrap_or(item.trim());
+                let mut words = item.split_whitespace();
+                if let Some(imported) = words.next() {
+                    let local = if words.next() == Some("as") {
+                        words.next().unwrap_or(imported)
+                    } else {
+                        imported
+                    };
+                    bindings.push((local.to_string(), imported.to_string()));
+                }
+            }
+        }
+    }
+    if let Some(namespace) = clause.strip_prefix("* as ") {
+        if let Some(local) = namespace.split_whitespace().next() {
+            bindings.push((local.to_string(), "*".to_string()));
+        }
+    } else if !clause.starts_with(['{', '\'', '"']) {
+        if let Some(local) = clause
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .next()
+            .filter(|name| !name.is_empty())
+        {
+            bindings.push((local.to_string(), "default".to_string()));
+        }
+    }
+    bindings
+}
+
+/// Return (local binding, exported name) for a brace export list.
+pub(crate) fn js_export_bindings(text: &str) -> Vec<(String, String)> {
+    let clause = text
+        .trim()
+        .strip_prefix("export")
+        .unwrap_or("")
+        .trim_start();
+    if let Some(value) = clause.strip_prefix("default") {
+        let value = value.trim().trim_end_matches(';').trim();
+        if !value.is_empty()
+            && value
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '.'))
+        {
+            return vec![(value.to_string(), "default".to_string())];
+        }
+        return Vec::new();
+    }
+    if !clause
+        .strip_prefix("type ")
+        .unwrap_or(clause)
+        .trim_start()
+        .starts_with('{')
+    {
+        return Vec::new();
+    }
+    let (Some(start), Some(end)) = (text.find('{'), text.find('}')) else {
+        return Vec::new();
+    };
+    text[start + 1..end]
+        .split(',')
+        .filter_map(|item| {
+            let item = item.trim().strip_prefix("type ").unwrap_or(item.trim());
+            let mut words = item.split_whitespace();
+            let local = words.next()?;
+            let exported = if words.next() == Some("as") {
+                words.next().unwrap_or(local)
+            } else {
+                local
+            };
+            Some((local.to_string(), exported.to_string()))
+        })
+        .collect()
+}
+
+pub(crate) fn js_module_sources(content: &str, lang: Lang) -> Vec<(String, bool)> {
+    let Some(grammar) = crate::lang::outline::outline_language(lang) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let mut locally_exported = std::collections::HashSet::new();
+    let mut export_cursor = tree.root_node().walk();
+    for statement in tree.root_node().named_children(&mut export_cursor) {
+        if statement.kind() == "export_statement"
+            && statement.child_by_field_name("source").is_none()
+        {
+            if let Ok(text) = statement.utf8_text(content.as_bytes()) {
+                locally_exported
+                    .extend(js_export_bindings(text).into_iter().map(|(local, _)| local));
+            }
+        }
+    }
+    let mut result = Vec::new();
+    let mut cursor = tree.root_node().walk();
+    for statement in tree.root_node().named_children(&mut cursor) {
+        if !matches!(statement.kind(), "import_statement" | "export_statement") {
+            continue;
+        }
+        let Some(source) = statement.child_by_field_name("source") else {
+            continue;
+        };
+        let Ok(raw) = source.utf8_text(content.as_bytes()) else {
+            continue;
+        };
+        let value = raw.trim_matches(['\'', '"']);
+        if !value.is_empty() {
+            let reexport = statement.kind() == "export_statement"
+                || statement
+                    .utf8_text(content.as_bytes())
+                    .ok()
+                    .is_some_and(|text| {
+                        js_import_bindings(text)
+                            .iter()
+                            .any(|(local, _)| locally_exported.contains(local))
+                    });
+            result.push((value.to_string(), reexport));
+        }
+    }
+    result
+}
+
+type CachedImports = (SystemTime, u64, Arc<Vec<(String, bool)>>);
+static JS_IMPORT_CACHE: OnceLock<dashmap::DashMap<PathBuf, CachedImports>> = OnceLock::new();
+
+/// Avoid reparsing unchanged files on repeated dependency and grok queries.
+pub(crate) fn js_module_sources_from_file(path: &Path, lang: Lang) -> Vec<(String, bool)> {
+    let Ok(metadata) = fs::metadata(path) else {
+        return Vec::new();
+    };
+    let Ok(modified) = metadata.modified() else {
+        return Vec::new();
+    };
+    let cache = JS_IMPORT_CACHE.get_or_init(dashmap::DashMap::new);
+    if let Some(cached) = cache.get(path) {
+        if cached.0 == modified && cached.1 == metadata.len() {
+            return cached.2.as_ref().clone();
+        }
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let sources = if content.contains("import") || content.contains("export") {
+        js_module_sources(&content, lang)
+    } else {
+        Vec::new()
+    };
+    cache.insert(
+        path.to_path_buf(),
+        (modified, metadata.len(), Arc::new(sources.clone())),
+    );
+    sources
+}
+
+type CachedConfig = (SystemTime, u64, Arc<serde_json::Value>);
+static TSCONFIG_CACHE: OnceLock<dashmap::DashMap<PathBuf, CachedConfig>> = OnceLock::new();
+
+fn tsconfig_json(path: &Path) -> Option<Arc<serde_json::Value>> {
+    let metadata = fs::metadata(path).ok()?;
+    let modified = metadata.modified().ok()?;
+    let cache = TSCONFIG_CACHE.get_or_init(dashmap::DashMap::new);
+    if let Some(cached) = cache.get(path) {
+        if cached.0 == modified && cached.1 == metadata.len() {
+            return Some(Arc::clone(&cached.2));
+        }
+    }
+    let raw = fs::read_to_string(path).ok()?;
+    let parsed = Arc::new(serde_json::from_str(&strip_json_comments(&raw)).ok()?);
+    cache.insert(
+        path.to_path_buf(),
+        (modified, metadata.len(), Arc::clone(&parsed)),
+    );
+    Some(parsed)
+}
+
+fn match_alias<'a>(pattern: &str, source: &'a str) -> Option<&'a str> {
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        source.strip_prefix(prefix)?.strip_suffix(suffix)
+    } else if pattern == source {
+        Some("")
+    } else {
+        None
+    }
+}
+
+fn strip_json_comments(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    let mut quoted = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if quoted {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+            out.push(ch);
+        } else if ch == '/' && chars.peek() == Some(&'/') {
+            chars.next();
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    out.push('\n');
+                    break;
+                }
+            }
+        } else if ch == '/' && chars.peek() == Some(&'*') {
+            chars.next();
+            let mut previous = '\0';
+            for next in chars.by_ref() {
+                if next == '\n' {
+                    out.push('\n');
+                }
+                if previous == '*' && next == '/' {
+                    break;
+                }
+                previous = next;
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    // JSONC permits trailing commas, which are common in tsconfig files.
+    let mut cleaned = String::with_capacity(out.len());
+    let mut chars = out.chars().peekable();
+    let mut quoted = false;
+    let mut escaped = false;
+    while let Some(ch) = chars.next() {
+        if quoted {
+            cleaned.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                quoted = false;
+            }
+        } else if ch == '"' {
+            quoted = true;
+            cleaned.push(ch);
+        } else if ch == ',' {
+            if !matches!(chars.clone().find(|c| !c.is_whitespace()), Some('}' | ']')) {
+                cleaned.push(ch);
+            }
+        } else {
+            cleaned.push(ch);
+        }
+    }
+    cleaned
 }
 
 pub(crate) fn is_import_line(line: &str, lang: Lang) -> bool {
@@ -186,8 +606,22 @@ fn find_src_ancestor(start: &Path) -> Option<&Path> {
 
 fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
     let base = dir.join(source);
-    // Try with extensions
-    for ext in &[".ts", ".tsx", ".js", ".jsx"] {
+    // An explicit runtime extension can point to a TypeScript source file.
+    let substitute: &[&str] = match base.extension().and_then(|ext| ext.to_str()) {
+        Some("js") => &["ts", "tsx", "d.ts"],
+        Some("jsx") => &["tsx", "d.ts"],
+        Some("mjs") => &["mts", "d.mts"],
+        Some("cjs") => &["cts", "d.cts"],
+        _ => &[],
+    };
+    for ext in substitute {
+        let candidate = base.with_extension(ext);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    // Try extensions for extensionless imports.
+    for ext in &[".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] {
         let candidate = PathBuf::from(format!("{}{ext}", base.display()));
         if candidate.exists() {
             return Some(candidate);
@@ -198,7 +632,16 @@ fn resolve_js(dir: &Path, source: &str) -> Option<PathBuf> {
         return Some(base);
     }
     // Index files
-    for name in &["index.ts", "index.tsx", "index.js", "index.jsx"] {
+    for name in &[
+        "index.ts",
+        "index.tsx",
+        "index.mts",
+        "index.cts",
+        "index.js",
+        "index.jsx",
+        "index.mjs",
+        "index.cjs",
+    ] {
         let candidate = base.join(name);
         if candidate.exists() {
             return Some(candidate);
@@ -265,6 +708,155 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn tsconfig_prefers_specific_path_pattern() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::create_dir_all(root.join("wrong/@svc")).unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{
+            "*": ["wrong/*"], "@svc/*": ["src/*"]
+        }}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("src/service.ts"), "").unwrap();
+        fs::write(root.join("wrong/@svc/service.ts"), "").unwrap();
+        assert_eq!(
+            resolve_import_source(&root.join("client.ts"), "@svc/service", Lang::TypeScript),
+            Some(root.join("src/service.ts"))
+        );
+    }
+
+    #[test]
+    fn tsconfig_package_extends_resolves_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("node_modules/@org/config")).unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("node_modules/@org/config/package.json"),
+            r#"{"tsconfig":"base.json"}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("node_modules/@org/config/base.json"),
+            r#"{"compilerOptions":{"paths":{"@lib/*":["../../../src/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(root.join("tsconfig.json"), r#"{"extends":"@org/config"}"#).unwrap();
+        fs::write(root.join("src/util.ts"), "").unwrap();
+        assert_eq!(
+            resolve_import_source(&root.join("client.ts"), "@lib/util", Lang::TypeScript),
+            Some(root.join("src/util.ts"))
+        );
+    }
+
+    #[test]
+    fn tsconfig_array_extends_uses_later_base_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("first")).unwrap();
+        fs::create_dir_all(root.join("second")).unwrap();
+        fs::write(
+            root.join("base-a.json"),
+            r#"{"compilerOptions":{"paths":{"@lib/*":["first/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("base-b.json"),
+            r#"{"compilerOptions":{"paths":{"@lib/*":["second/*"]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends":["./base-a.json","./base-b.json"]}"#,
+        )
+        .unwrap();
+        fs::write(root.join("first/util.ts"), "").unwrap();
+        fs::write(root.join("second/util.ts"), "").unwrap();
+        assert_eq!(
+            resolve_import_source(&root.join("client.ts"), "@lib/util", Lang::TypeScript),
+            Some(root.join("second/util.ts"))
+        );
+    }
+
+    #[test]
+    fn js_runtime_extensions_resolve_typescript_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("service.ts"), "").unwrap();
+        fs::write(root.join("module.mts"), "").unwrap();
+        fs::write(root.join("common.cts"), "").unwrap();
+        assert_eq!(
+            resolve_js(root, "./service.js"),
+            Some(root.join("service.ts"))
+        );
+        assert_eq!(
+            resolve_js(root, "./module.mjs"),
+            Some(root.join("module.mts"))
+        );
+        assert_eq!(
+            resolve_js(root, "./common.cjs"),
+            Some(root.join("common.cts"))
+        );
+    }
+
+    #[test]
+    fn import_cache_refreshes_after_file_change() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("client.ts");
+        fs::write(&path, "import './one';\n").unwrap();
+        assert_eq!(
+            js_module_sources_from_file(&path, Lang::TypeScript)[0].0,
+            "./one"
+        );
+        fs::write(&path, "import './two-longer';\n").unwrap();
+        assert_eq!(
+            js_module_sources_from_file(&path, Lang::TypeScript)[0].0,
+            "./two-longer"
+        );
+    }
+
+    #[test]
+    fn tsconfig_alias_in_extended_config_resolves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("service/src")).unwrap();
+        fs::create_dir_all(root.join("shared")).unwrap();
+        fs::write(
+            root.join("tsconfig.base.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@shared/*":["shared/*",]}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("service/tsconfig.json"),
+            r#"{"extends":"../tsconfig.base.json"}"#,
+        )
+        .unwrap();
+        let target = root.join("shared/util.ts");
+        fs::write(&target, "export const util = 1;").unwrap();
+        let importer = root.join("service/src/main.ts");
+        assert_eq!(
+            resolve_import_source(&importer, "@shared/util", Lang::TypeScript),
+            Some(target)
+        );
+    }
+
+    #[test]
+    fn js_module_sources_handles_multiline_and_reexports() {
+        let source =
+            "import {\n  Service,\n} from '@svc/service';\nexport { Other } from './other';\n";
+        assert_eq!(
+            js_module_sources(source, Lang::TypeScript),
+            vec![
+                ("@svc/service".to_string(), false),
+                ("./other".to_string(), true)
+            ]
+        );
+    }
 
     #[test]
     fn normalize_collapses_dot_and_parent_components() {
