@@ -247,8 +247,9 @@ fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut 
         let start_idx = entry.start_line.saturating_sub(1) as usize;
         let end = entry.signature_end;
         let end_idx = end
-            .map(|position| position.line.saturating_sub(1) as usize)
-            .unwrap_or(start_idx)
+            .map_or(start_idx, |position| {
+                position.line.saturating_sub(1) as usize
+            })
             .max(start_idx)
             .min(lines.len().saturating_sub(1));
 

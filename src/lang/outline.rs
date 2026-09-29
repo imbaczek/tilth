@@ -473,9 +473,9 @@ fn body_introducer_len(body: tree_sitter::Node, lines: &[&str]) -> usize {
     // TypeScript return type is never considered a declaration body.
     if tail.starts_with('{') {
         1
-    } else if body.kind() == "do_block" && tail.starts_with("do") {
-        2
-    } else if body.kind() == "arrow_expression_clause" && tail.starts_with("=>") {
+    } else if (body.kind() == "do_block" && tail.starts_with("do"))
+        || (body.kind() == "arrow_expression_clause" && tail.starts_with("=>"))
+    {
         2
     } else {
         0

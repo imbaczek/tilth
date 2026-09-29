@@ -653,7 +653,7 @@ fn file_diffs_have_descendant_paths(file_diffs: &[FileDiff], directory: &Path) -
             || file_diff
                 .old_path
                 .as_deref()
-                .map_or(false, |old_path| is_path_descendant(old_path, directory))
+                .is_some_and(|old_path| is_path_descendant(old_path, directory))
     })
 }
 
@@ -672,7 +672,7 @@ fn overlay_matches_directory_scope(
                 && file_diff
                     .old_path
                     .as_deref()
-                    .map_or(false, |old_path| old_path.starts_with(directory))
+                    .is_some_and(|old_path| old_path.starts_with(directory))
         })
 }
 

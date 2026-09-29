@@ -54,6 +54,15 @@ pub struct CallerMatch {
     pub line: u32,
     pub calling_function: String,
     pub call_text: String,
+    /// Object before a JavaScript/TypeScript member call, if any.
+    pub receiver: Option<String>,
+    /// Type named by the receiver's nearest lexical binding, when available.
+    pub receiver_type: Option<String>,
+    /// Byte position where the receiver's type or constructor name is bound.
+    pub receiver_type_site: Option<usize>,
+    pub receiver_site: Option<usize>,
+    /// Exact byte range of the enclosing class, independent of line layout.
+    pub enclosing_type_range: Option<(usize, usize)>,
     /// Line range of the calling function (for expand).
     pub caller_range: Option<(u32, u32)>,
     /// The call sits in test code that only the source says is test code: a
@@ -193,7 +202,7 @@ pub(crate) fn find_callers_batch(
 
 /// Tree-sitter call site detection for a set of target symbols.
 /// Returns tuples of (`matched_target_name`, `CallerMatch`).
-fn find_callers_treesitter_batch(
+pub(crate) fn find_callers_treesitter_batch(
     path: &Path,
     scope: &Path,
     targets: &HashSet<String>,
@@ -274,6 +283,36 @@ fn find_callers_treesitter_batch(
                 let call_text: String = lines
                     .get(row)
                     .map_or_else(|| matched_target.clone(), |l| l.trim().to_string());
+                let receiver_node = if matches!(
+                    lang,
+                    crate::types::Lang::TypeScript
+                        | crate::types::Lang::Tsx
+                        | crate::types::Lang::JavaScript
+                ) {
+                    cap.node
+                        .parent()
+                        .filter(|parent| parent.kind() == "member_expression")
+                        .and_then(|parent| parent.child_by_field_name("object"))
+                } else {
+                    None
+                };
+                let receiver = receiver_node
+                    .and_then(|object| object.utf8_text(content_bytes).ok())
+                    .map(str::to_string);
+                let receiver_type = receiver_node
+                    .and_then(|object| js_receiver_type(object, cap.node, content_bytes));
+                let receiver_type_site = receiver_type.as_ref().map(|(_, site)| *site);
+                let receiver_type = receiver_type.map(|(ty, _)| ty);
+                let receiver_site = receiver_node.map(|node| node.start_byte());
+                let mut enclosing_type_range = None;
+                let mut ancestor = cap.node.parent();
+                while let Some(node) = ancestor {
+                    if matches!(node.kind(), "class_declaration" | "class") {
+                        enclosing_type_range = Some((node.start_byte(), node.end_byte()));
+                        break;
+                    }
+                    ancestor = node.parent();
+                }
 
                 // Walk up the tree to find the enclosing function
                 let (calling_function, caller_range) =
@@ -286,6 +325,11 @@ fn find_callers_treesitter_batch(
                         line,
                         calling_function,
                         call_text,
+                        receiver,
+                        receiver_type,
+                        receiver_type_site,
+                        receiver_site,
+                        enclosing_type_range,
                         caller_range,
                         in_test: test_site
                             .is_some_and(|in_test| in_test(&cap.node, content_bytes, path, scope)),
@@ -301,6 +345,235 @@ fn find_callers_treesitter_batch(
     };
 
     callers
+}
+
+fn js_receiver_type(
+    object: tree_sitter::Node,
+    call: tree_sitter::Node,
+    bytes: &[u8],
+) -> Option<(String, usize)> {
+    let mut this_property = false;
+    let name = match object.kind() {
+        "new_expression" => {
+            return new_expression_type(object, bytes).map(|ty| (ty, object.start_byte()))
+        }
+        "identifier" => object.utf8_text(bytes).ok()?,
+        "member_expression" => {
+            let base = object
+                .child_by_field_name("object")?
+                .utf8_text(bytes)
+                .ok()?;
+            if base != "this" {
+                return None;
+            }
+            this_property = true;
+            object
+                .child_by_field_name("property")?
+                .utf8_text(bytes)
+                .ok()?
+        }
+        _ => return None,
+    };
+    if this_property {
+        return this_property_type(call, name, bytes);
+    }
+    let call_byte = call.start_byte();
+    let mut ancestor = call.parent();
+    while let Some(scope) = ancestor {
+        if matches!(
+            scope.kind(),
+            "statement_block"
+                | "class_body"
+                | "function_declaration"
+                | "method_definition"
+                | "arrow_function"
+                | "program"
+        ) {
+            let mut best = None;
+            collect_js_binding(scope, name, call_byte, bytes, &mut best, true);
+            if let Some((site, ty)) = best {
+                return Some((ty, site));
+            }
+        }
+        ancestor = scope.parent();
+    }
+    None
+}
+
+fn this_property_type(
+    call: tree_sitter::Node,
+    name: &str,
+    bytes: &[u8],
+) -> Option<(String, usize)> {
+    let mut ancestor = call.parent();
+    while let Some(node) = ancestor {
+        if node.kind() == "class_body" {
+            let mut cursor = node.walk();
+            for method in node.named_children(&mut cursor) {
+                if matches!(
+                    method.kind(),
+                    "public_field_definition" | "field_definition"
+                ) {
+                    let mut best = None;
+                    collect_js_binding(method, name, usize::MAX, bytes, &mut best, true);
+                    if let Some((site, ty)) = best {
+                        return Some((ty, site));
+                    }
+                }
+                if method.kind() != "method_definition" {
+                    continue;
+                }
+                let method_name = method
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(bytes).ok());
+                if method_name != Some("constructor") {
+                    continue;
+                }
+                let mut method_cursor = method.walk();
+                let params = method
+                    .named_children(&mut method_cursor)
+                    .find(|child| child.kind() == "formal_parameters");
+                let Some(params) = params else { continue };
+                let mut params_cursor = params.walk();
+                for param in params.named_children(&mut params_cursor) {
+                    let Ok(text) = param.utf8_text(bytes) else {
+                        continue;
+                    };
+                    let Some((before, after)) = text.split_once(':') else {
+                        continue;
+                    };
+                    if !before
+                        .split_whitespace()
+                        .any(|word| matches!(word, "private" | "public" | "protected"))
+                    {
+                        continue;
+                    }
+                    if before
+                        .split_whitespace()
+                        .last()
+                        .map(|word| word.trim_end_matches('?'))
+                        == Some(name)
+                    {
+                        return type_name(after).map(|ty| (ty, param.start_byte()));
+                    }
+                }
+            }
+            return None;
+        }
+        ancestor = node.parent();
+    }
+    None
+}
+
+fn collect_js_binding(
+    node: tree_sitter::Node,
+    name: &str,
+    call_byte: usize,
+    bytes: &[u8],
+    best: &mut Option<(usize, String)>,
+    root: bool,
+) {
+    if node.start_byte() > call_byte {
+        return;
+    }
+    if !root
+        && matches!(
+            node.kind(),
+            "statement_block"
+                | "class_body"
+                | "function_declaration"
+                | "method_definition"
+                | "arrow_function"
+                | "class_declaration"
+                | "class"
+        )
+        && !(node.start_byte() <= call_byte && call_byte < node.end_byte())
+    {
+        return;
+    }
+    let declared_name = match node.kind() {
+        "variable_declarator" | "public_field_definition" => node
+            .child_by_field_name("name")
+            .and_then(|name| name.utf8_text(bytes).ok()),
+        "required_parameter" | "optional_parameter" => node
+            .utf8_text(bytes)
+            .ok()
+            .and_then(|text| text.split(':').next())
+            .and_then(|before| before.split_whitespace().last())
+            .map(|name| name.trim_end_matches('?')),
+        _ => None,
+    };
+    if declared_name == Some(name) {
+        let ty = node
+            .child_by_field_name("value")
+            .and_then(|value| new_expression_type(value, bytes))
+            .or_else(|| {
+                let mut cursor = node.walk();
+                let annotation = node
+                    .named_children(&mut cursor)
+                    .find(|child| child.kind() == "type_annotation")
+                    .and_then(|annotation| annotation.utf8_text(bytes).ok())
+                    .and_then(|text| type_name(text.trim_start_matches(':')));
+                annotation
+            })
+            .unwrap_or_default();
+        if best
+            .as_ref()
+            .is_none_or(|(byte, _)| node.start_byte() >= *byte)
+        {
+            *best = Some((node.start_byte(), ty));
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_js_binding(child, name, call_byte, bytes, best, false);
+    }
+}
+
+fn new_expression_type(node: tree_sitter::Node, bytes: &[u8]) -> Option<String> {
+    if node.kind() != "new_expression" {
+        return None;
+    }
+    let text = node.utf8_text(bytes).ok()?.strip_prefix("new ")?;
+    type_name(text)
+}
+
+fn type_name(text: &str) -> Option<String> {
+    let name: String = text
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '$' || *ch == '.')
+        .collect();
+    (!name.is_empty()).then_some(name)
+}
+
+/// Search a known set of files without a name-based early-exit threshold.
+/// Used after import resolution has identified the files that can reference a
+/// particular TypeScript module.
+pub(crate) fn find_callers_in_files(
+    files: &HashSet<std::path::PathBuf>,
+    scope: &Path,
+    targets: &HashSet<String>,
+) -> Vec<(String, CallerMatch)> {
+    let mut results = Vec::new();
+    for path in files {
+        let crate::types::FileType::Code(lang) = crate::lang::detect_file_type(path) else {
+            continue;
+        };
+        let Some(ts_lang) = crate::lang::outline::outline_language(lang) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        if !targets.iter().any(|target| content.contains(target)) {
+            continue;
+        }
+        results.extend(find_callers_treesitter_batch(
+            path, scope, targets, &ts_lang, &content, lang,
+        ));
+    }
+    results
 }
 
 /// Walk up the AST from a node to find the enclosing function definition.
