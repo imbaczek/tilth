@@ -242,11 +242,28 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
 
 fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut String) {
     for entry in entries {
-        let idx = entry.start_line.saturating_sub(1) as usize;
-        if let Some(line) = lines.get(idx) {
+        let start_idx = entry.start_line.saturating_sub(1) as usize;
+        let end = entry.signature_end;
+        let end_idx = end
+            .map(|position| position.line.saturating_sub(1) as usize)
+            .unwrap_or(start_idx)
+            .max(start_idx)
+            .min(lines.len().saturating_sub(1));
+
+        for idx in start_idx..=end_idx {
+            let Some(line) = lines.get(idx) else {
+                continue;
+            };
+            let visible = match end.filter(|_| idx == end_idx) {
+                Some(position) if position.column < line.len() => {
+                    line.get(..position.column).unwrap_or(line).trim_end()
+                }
+                _ => line,
+            };
             let hash = crate::format::line_hash(line.as_bytes());
-            let _ = writeln!(out, "{}:{hash:03x}|{line}", entry.start_line);
+            let _ = writeln!(out, "{}:{hash:03x}|{visible}", idx + 1);
         }
+
         render_signature_entries(&entry.children, lines, out);
     }
 }
@@ -745,5 +762,175 @@ mod tests {
             "section reads must not record a full-file baseline"
         );
         assert_eq!(saved, 0, "section reads must not record savings");
+    }
+}
+
+#[cfg(test)]
+mod multiline_signature_regression_tests {
+    use super::*;
+
+    #[test]
+    fn signature_view_preserves_multiline_declaration_with_valid_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multiline.rs");
+        let source = "pub fn multiline_handler(\n    request: &str,\n    retries: u8,\n) -> Result<usize, &'static str> {\n    let body_only_marker = 42;\n    Ok(request.len())\n}\n";
+        std::fs::write(&path, source).unwrap();
+
+        let output = tool_read(
+            &serde_json::json!({"path": path, "mode": "signature"}),
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+        )
+        .unwrap();
+
+        assert!(output.contains("[signature]"));
+        for (index, line) in source.lines().take(4).enumerate() {
+            let hash = crate::format::line_hash(line.as_bytes());
+            let expected = format!("{}:{hash:03x}|{line}", index + 1);
+            assert!(
+                output.contains(&expected),
+                "missing declaration line: {expected}"
+            );
+        }
+        assert!(!output.contains("body_only_marker"));
+        assert!(!output.contains("Ok(request.len())"));
+    }
+
+    #[test]
+    fn signature_view_preserves_multiline_typescript_object_return_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multiline.ts");
+        let source = "export function inspect(value: string): {\n    rendered: string;\n    count: number;\n} {\n    const body_only_marker = 42;\n    return { rendered: value, count: 1 };\n}\n";
+        std::fs::write(&path, source).unwrap();
+
+        let output = tool_read(
+            &serde_json::json!({"path": path, "mode": "signature"}),
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+        )
+        .unwrap();
+
+        for (index, line) in source.lines().take(4).enumerate() {
+            let hash = crate::format::line_hash(line.as_bytes());
+            let expected = format!("{}:{hash:03x}|{line}", index + 1);
+            assert!(
+                output.contains(&expected),
+                "missing TypeScript declaration line: {expected}"
+            );
+        }
+        assert!(!output.contains("body_only_marker"));
+    }
+
+    #[test]
+    fn signature_view_truncates_inline_body_after_opening_brace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("inline.rs");
+        let source = "pub fn inline_handler() { let inline_body_marker = 42; }\n";
+        let visible_signature = "pub fn inline_handler() {";
+        std::fs::write(&path, source).unwrap();
+
+        let output = tool_read(
+            &serde_json::json!({"path": path, "mode": "signature"}),
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+        )
+        .unwrap();
+
+        let source_line = source.lines().next().unwrap();
+        let hash = crate::format::line_hash(source_line.as_bytes());
+        let expected = format!("1:{hash:03x}|{visible_signature}");
+        assert!(
+            output.contains(&expected),
+            "missing inline signature: {expected}"
+        );
+        assert!(!output.contains("inline_body_marker"));
+    }
+}
+
+#[cfg(test)]
+mod outline_cache_regression_tests {
+    use super::*;
+    use std::fs;
+
+    fn read(path: &Path, cache: &OutlineCache, budget: Option<u64>) -> String {
+        tool_read(
+            &serde_json::json!({"path": path, "budget": budget}),
+            cache,
+            &Session::new(),
+            false,
+        )
+        .unwrap()
+    }
+    fn large_outline_fixture(root: &Path) -> std::path::PathBuf {
+        let path = root.join("sample.rs");
+        let mut source = String::new();
+        for i in 0..150 {
+            writeln!(source, "pub fn sample_{i:03}() {{").unwrap();
+            for j in 0..45 {
+                writeln!(source, "    let item_{j} = \"{}\";", "a".repeat(85)).unwrap();
+            }
+            source.push_str("}\n\n");
+        }
+        assert!(source.len() > 500_000 && source.len() < 2_000_000);
+        fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn file_overview(root: &Path, cache: &OutlineCache) -> String {
+        crate::search::search_symbol_expanded(
+            "sample",
+            root,
+            cache,
+            &Session::new(),
+            &crate::index::bloom::BloomFilterCache::new(),
+            0,
+            None,
+            None,
+            false,
+            Some(100_000),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn capped_read_is_independent_of_prior_uncapped_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = large_outline_fixture(dir.path());
+        let baseline = read(&path, &OutlineCache::new(), Some(100_000));
+        assert!(baseline.contains("outline truncated"));
+        assert!(!baseline.contains("sample_149"));
+        let cache = OutlineCache::new();
+        let overview = file_overview(dir.path(), &cache);
+        assert!(
+            overview.contains("sample_149"),
+            "fixture must prime an uncapped outline"
+        );
+        let after_search = read(&path, &cache, Some(100_000));
+        assert_eq!(
+            after_search.lines().count(),
+            baseline.lines().count(),
+            "prior search changed the read's cap"
+        );
+        assert_eq!(after_search, baseline);
+    }
+
+    #[test]
+    fn uncapped_search_is_independent_of_prior_capped_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = large_outline_fixture(dir.path());
+        let baseline = file_overview(dir.path(), &OutlineCache::new());
+        assert!(baseline.contains("sample_149"));
+        let cache = OutlineCache::new();
+        let first_read = read(&path, &cache, Some(100_000));
+        assert!(first_read.contains("outline truncated"));
+        let after_read = file_overview(dir.path(), &cache);
+        assert!(
+            after_read.contains("sample_149"),
+            "prior read hid the final symbol"
+        );
+        assert_eq!(after_read, baseline);
     }
 }

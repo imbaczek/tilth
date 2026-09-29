@@ -28,15 +28,13 @@ struct ParsedEntry {
     file: Arc<ParsedFile>,
 }
 
-/// Outline cache keyed by canonical path. Eviction is O(1): on every access
-/// the stored `mtime` is compared to the caller-supplied value; a mismatch
-/// replaces the entry without scanning the whole map.
+/// Outline cache keyed by canonical path and cap mode. Entries are refreshed
+/// in O(1) when the caller-supplied modification time changes.
 ///
-/// Stores two derived analyses: rendered outline strings (used by search
-/// formatting) and parsed tree-sitter trees (used by AST scope queries).
-/// Both share the same key + invalidation; nothing else is shared.
+/// Stores rendered outline strings by path and cap mode, and parsed
+/// tree-sitter trees by path. Both are invalidated by file modification time.
 pub struct OutlineCache {
-    entries: DashMap<PathBuf, CacheEntry>,
+    entries: DashMap<(PathBuf, bool), CacheEntry>,
     parsed: DashMap<PathBuf, ParsedEntry>,
 }
 
@@ -68,12 +66,25 @@ impl OutlineCache {
         mtime: SystemTime,
         compute: impl FnOnce() -> String,
     ) -> Arc<str> {
+        self.get_or_compute_with_cap(path, mtime, false, compute)
+    }
+
+    /// Get a cached outline for the requested cap mode, or compute it.
+    ///
+    /// The cap mode is part of the key because it can change the rendered outline.
+    pub(crate) fn get_or_compute_with_cap(
+        &self,
+        path: &Path,
+        mtime: SystemTime,
+        capped: bool,
+        compute: impl FnOnce() -> String,
+    ) -> Arc<str> {
         use dashmap::mapref::entry::Entry;
 
-        match self.entries.entry(path.to_path_buf()) {
-            // Fresh entry — hand back the cached outline.
+        match self.entries.entry((path.to_path_buf(), capped)) {
+            // Fresh entry — hand back cached outline.
             Entry::Occupied(slot) if slot.get().mtime == mtime => Arc::clone(&slot.get().outline),
-            // Stale entry — recompute in place, evicting the old outline.
+            // Stale entry — recompute in place, evicting old outline.
             Entry::Occupied(mut slot) => {
                 let outline: Arc<str> = compute().into();
                 slot.insert(CacheEntry {

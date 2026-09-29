@@ -205,6 +205,7 @@ mod tests {
             start_line: line,
             end_line: line,
             signature: sig.map(str::to_string),
+            signature_end: None,
             children: Vec::new(),
             doc: None,
         }
@@ -217,6 +218,7 @@ mod tests {
             start_line: 1,
             end_line: 100,
             signature: None,
+            signature_end: None,
             children,
             doc: None,
         }

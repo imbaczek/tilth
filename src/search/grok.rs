@@ -984,6 +984,7 @@ mod tests {
             start_line: start,
             end_line: end,
             signature: None,
+            signature_end: None,
             children: Vec::new(),
             doc: None,
         }

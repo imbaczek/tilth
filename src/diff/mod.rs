@@ -290,6 +290,18 @@ pub fn diff(
 
     // 3. Cross-file move detection.
     overlay::cross_file_matching(&mut overlays);
+    let directory_scope = scope.and_then(|scope| directory_scope_path(scope, repo));
+    if let Some(directory) = &directory_scope {
+        overlays.retain(|overlay| overlay.path.starts_with(directory));
+        if overlays.is_empty() {
+            return Ok("No changes.".to_string());
+        }
+    }
+    let scope = if directory_scope.is_some() {
+        None
+    } else {
+        scope
+    };
 
     // 4. Signature warnings.
     let mut warnings = overlay::signature_warnings(&overlays);
@@ -372,6 +384,46 @@ pub fn diff(
 // ---------------------------------------------------------------------------
 // Helper functions
 // ---------------------------------------------------------------------------
+
+/// Resolve a directory scope to a path relative to its repository root.
+fn directory_scope_path(scope: &str, repo: Option<&Path>) -> Option<PathBuf> {
+    let scope_path = Path::new(scope);
+    if scope.contains(':') && !scope_path.is_absolute() {
+        return None;
+    }
+
+    let root = if let Some(repo) = repo {
+        std::fs::canonicalize(repo).ok()?
+    } else {
+        let cwd = std::env::current_dir().ok()?;
+        let git_root = Command::new("git")
+            .current_dir(&cwd)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| {
+                let root = String::from_utf8_lossy(&output.stdout);
+                std::fs::canonicalize(root.trim()).ok()
+            });
+        git_root.unwrap_or(cwd)
+    };
+
+    let absolute_scope = if scope_path.is_absolute() {
+        scope_path.to_path_buf()
+    } else {
+        root.join(scope_path)
+    };
+    let absolute_scope = std::fs::canonicalize(absolute_scope).ok()?;
+    if !absolute_scope.is_dir() {
+        return None;
+    }
+
+    absolute_scope
+        .strip_prefix(&root)
+        .ok()
+        .map(Path::to_path_buf)
+}
 
 /// Human-readable label for a diff source.
 fn source_label(source: &DiffSource) -> String {
@@ -543,11 +595,16 @@ fn diff_log(
     }
 
     // Filter by scope if set.
+    let directory_scope = scope.and_then(|scope| directory_scope_path(scope, repo));
     if let Some(file_scope) = scope {
         for summary in &mut summaries {
             summary.overlays.retain(|o| {
-                let p = o.path.to_string_lossy();
-                p == file_scope || p.ends_with(file_scope)
+                if let Some(directory) = &directory_scope {
+                    o.path.starts_with(directory)
+                } else {
+                    let p = o.path.to_string_lossy();
+                    p == file_scope || p.ends_with(file_scope)
+                }
             });
         }
         summaries.retain(|s| !s.overlays.is_empty());
@@ -1260,3 +1317,21 @@ diff --git a/src/main.rs b/src/main.rs
     }
 }
 // test
+
+#[cfg(test)]
+mod directory_scope_path_tests {
+    use super::directory_scope_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn absolute_directory_scope_resolves_to_repo_relative_path() {
+        let repo = tempfile::tempdir().unwrap();
+        let absolute_scope = repo.path().join("src/nested");
+        std::fs::create_dir_all(&absolute_scope).unwrap();
+
+        assert_eq!(
+            directory_scope_path(absolute_scope.to_str().unwrap(), Some(repo.path())),
+            Some(PathBuf::from("src/nested"))
+        );
+    }
+}

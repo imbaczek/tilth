@@ -140,7 +140,7 @@ pub fn read_file(
         #[allow(clippy::cast_precision_loss)]
         let file_mb = byte_len as f64 / 1_000_000.0;
 
-        let outline = cache.get_or_compute(path, mtime, || {
+        let outline = cache.get_or_compute_with_cap(path, mtime, true, || {
             outline::generate(path, file_type, &content, buf, true)
         });
 
@@ -173,7 +173,7 @@ pub fn read_file(
 
     let capped = byte_len > FILE_SIZE_CAP;
 
-    let outline = cache.get_or_compute(path, mtime, || {
+    let outline = cache.get_or_compute_with_cap(path, mtime, capped, || {
         outline::generate(path, file_type, &content, buf, capped)
     });
 

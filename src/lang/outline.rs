@@ -1,5 +1,5 @@
 use crate::lang::treesitter::{node_text_simple, NodeTextMode};
-use crate::types::{Lang, OutlineEntry, OutlineKind};
+use crate::types::{Lang, OutlineEntry, OutlineKind, SignatureEnd};
 
 /// Get the tree-sitter Language for a given Lang variant.
 pub fn outline_language(lang: Lang) -> Option<tree_sitter::Language> {
@@ -117,6 +117,7 @@ fn node_to_entry(
     let start_line = node.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
 
+    let mut signature_end = None;
     let (kind, name, signature) = match kind_str {
         // Functions
         "function_declaration"
@@ -138,7 +139,8 @@ fn node_to_entry(
                         "<anonymous>".into()
                     }
                 });
-            let sig = extract_signature(node, lines);
+            let (sig, end) = extract_signature(node, lines, lang);
+            signature_end = Some(end);
             (OutlineKind::Function, name, Some(sig))
         }
 
@@ -210,7 +212,8 @@ fn node_to_entry(
             let name = find_child_text(node, "name", lines)
                 .or_else(|| first_identifier_text(node, lines))
                 .unwrap_or_else(|| "<property>".into());
-            let sig = extract_signature(node, lines);
+            let (sig, end) = extract_signature(node, lines, lang);
+            signature_end = Some(end);
             (OutlineKind::Property, name, Some(sig))
         }
 
@@ -328,6 +331,7 @@ fn node_to_entry(
         start_line,
         end_line,
         signature,
+        signature_end,
         children,
         doc,
     })
@@ -362,40 +366,213 @@ fn collect_children(
 }
 
 /// Extract the first line as a function signature (name + params + return type).
-fn extract_signature(node: tree_sitter::Node, lines: &[&str]) -> String {
-    let start_row = node.start_position().row;
-    if start_row < lines.len() {
-        let line = lines[start_row].trim();
-        // Truncate at opening brace
-        if let Some(pos) = line.find('{') {
-            return line[..pos].trim().to_string();
-        }
-        if line.ends_with(':') {
-            // Python — truncate at trailing colon (for `def foo(x: int):` etc.)
-            if let Some(pos) = line.rfind(':') {
-                return line[..pos].trim().to_string();
-            }
-        }
-        // Elixir — truncate at ` do` (block form) or `, do:` (keyword form).
-        // Safe for other languages: C/Java/Go/Rust hit the `{` branch above,
-        // Python hits the `:` branch. Only Elixir uses ` do` as a block delimiter.
-        if let Some(pos) = line.rfind(" do") {
-            let after = &line[pos + 3..];
-            if after.is_empty() || after.starts_with('\n') {
-                return line[..pos].trim().to_string();
-            }
-        }
-        if let Some(pos) = line.find(", do:") {
-            return line[..pos].trim().to_string();
-        }
-        // Full first line, truncated
-        if line.len() > 120 {
-            format!("{}...", crate::types::truncate_str(line, 117))
+fn extract_signature(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> (String, SignatureEnd) {
+    let start = node.start_position();
+    let start = (start.row, start.column);
+    let (display_end, source_end) = signature_positions(node, lines, lang);
+    let source = source_text_between(lines, start, display_end);
+
+    (
+        compact_signature(&source, lang),
+        SignatureEnd {
+            line: source_end.0 as u32 + 1,
+            column: source_end.1,
+        },
+    )
+}
+
+fn signature_positions(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+) -> ((usize, usize), (usize, usize)) {
+    let start = node.start_position();
+    let start = (start.row, start.column);
+
+    if let Some(body) = declaration_body(node, lang) {
+        let body_start = body.start_position();
+        let body_start = (body_start.row, body_start.column);
+        let intro_len = body_introducer_len(body, lines);
+
+        let source_end = if intro_len > 0 {
+            (body_start.0, body_start.1 + intro_len)
+        } else if body_start.0 > start.0 {
+            let row = body_start.0 - 1;
+            (row, lines.get(row).map_or(0, |line| line.len()))
         } else {
-            line.to_string()
+            body_start
+        };
+
+        let display_end = if intro_len > 0 || body_start.0 == start.0 {
+            body_start
+        } else {
+            source_end
+        };
+        return (display_end, source_end);
+    }
+
+    if lang == Lang::Elixir {
+        if let Some(bounds) = elixir_keyword_body_positions(node, lines) {
+            return bounds;
         }
+    }
+
+    let end = node.end_position();
+    let end = (end.row, end.column);
+    (end, end)
+}
+
+fn declaration_body(node: tree_sitter::Node, lang: Lang) -> Option<tree_sitter::Node> {
+    if let Some(body) = node.child_by_field_name("body") {
+        return Some(body);
+    }
+
+    let mut cursor = node.walk();
+    if lang == Lang::Elixir {
+        if let Some(body) = node
+            .children(&mut cursor)
+            .find(|child| child.kind() == "do_block")
+        {
+            return Some(body);
+        }
+    }
+
+    let mut cursor = node.walk();
+    let body = node.children(&mut cursor).find(|child| {
+        matches!(
+            child.kind(),
+            "block"
+                | "statement_block"
+                | "compound_statement"
+                | "function_body"
+                | "function_block"
+                | "body_statement"
+                | "declaration_list"
+                | "arrow_expression_clause"
+                | "accessor_list"
+                | "property_body"
+        )
+    });
+    body
+}
+
+fn body_introducer_len(body: tree_sitter::Node, lines: &[&str]) -> usize {
+    let start = body.start_position();
+    let Some(line) = lines.get(start.row) else {
+        return 0;
+    };
+    let Some(tail) = line.get(start.column..) else {
+        return 0;
+    };
+
+    // This is checked only on a structurally selected body node. A brace in a
+    // TypeScript return type is never considered a declaration body.
+    if tail.starts_with('{') {
+        1
+    } else if body.kind() == "do_block" && tail.starts_with("do") {
+        2
+    } else if body.kind() == "arrow_expression_clause" && tail.starts_with("=>") {
+        2
     } else {
-        String::new()
+        0
+    }
+}
+
+fn elixir_keyword_body_positions(
+    node: tree_sitter::Node,
+    lines: &[&str],
+) -> Option<((usize, usize), (usize, usize))> {
+    let start = node.start_position();
+    let start = (start.row, start.column);
+    let end = node.end_position();
+    let source = source_text_between(lines, start, (end.row, end.column));
+    let marker = ", do:";
+    let marker_start = source.find(marker)?;
+    Some((
+        advance_source_position(start, &source[..marker_start]),
+        advance_source_position(start, &source[..marker_start + marker.len()]),
+    ))
+}
+
+fn advance_source_position(start: (usize, usize), text: &str) -> (usize, usize) {
+    let mut position = start;
+    for byte in text.bytes() {
+        if byte == b'\n' {
+            position.0 += 1;
+            position.1 = 0;
+        } else {
+            position.1 += 1;
+        }
+    }
+    position
+}
+
+fn source_text_between(lines: &[&str], start: (usize, usize), end: (usize, usize)) -> String {
+    if start.0 > end.0 || end.0 >= lines.len() {
+        return String::new();
+    }
+
+    let mut text = String::new();
+    for row in start.0..=end.0 {
+        let Some(line) = lines.get(row) else {
+            break;
+        };
+        let from = if row == start.0 {
+            start.1.min(line.len())
+        } else {
+            0
+        };
+        let to = if row == end.0 {
+            end.1.min(line.len())
+        } else {
+            line.len()
+        };
+        if let Some(fragment) = line.get(from..to) {
+            text.push_str(fragment);
+        }
+        if row < end.0 {
+            text.push('\n');
+        }
+    }
+    text
+}
+
+fn compact_signature(source: &str, lang: Lang) -> String {
+    let mut signature = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    for (from, to) in [
+        ("( ", "("),
+        ("[ ", "["),
+        ("< ", "<"),
+        ("{ ", "{"),
+        (" )", ")"),
+        (" ]", "]"),
+        (" >", ">"),
+        (" }", "}"),
+        (" ,", ","),
+        (" ;", ";"),
+        (" .", "."),
+        (" ::", "::"),
+        (" :", ":"),
+    ] {
+        signature = signature.replace(from, to);
+    }
+
+    if lang == Lang::Python {
+        signature = signature
+            .trim_end()
+            .trim_end_matches(':')
+            .trim_end()
+            .to_string();
+    }
+
+    if signature.len() > 120 {
+        format!("{}...", crate::types::truncate_str(&signature, 117))
+    } else {
+        signature
     }
 }
 
@@ -512,6 +689,7 @@ fn elixir_call_to_entry(
     let start_line = node.start_position().row as u32 + 1;
     let end_line = node.end_position().row as u32 + 1;
 
+    let mut signature_end = None;
     let (kind, name, signature) = match keyword.as_str() {
         "defmodule" => {
             let name = elixir_first_arg_text(node, lines)?;
@@ -519,7 +697,8 @@ fn elixir_call_to_entry(
         }
         kw if ELIXIR_DEF_KEYWORDS.contains(&kw) => {
             let name = elixir_func_name(node, lines)?;
-            let sig = extract_signature(node, lines);
+            let (sig, end) = extract_signature(node, lines, lang);
+            signature_end = Some(end);
             (OutlineKind::Function, name, Some(sig))
         }
         "defstruct" | "defexception" => (OutlineKind::Struct, keyword.clone(), None),
@@ -554,6 +733,7 @@ fn elixir_call_to_entry(
         start_line,
         end_line,
         signature,
+        signature_end,
         children,
         doc,
     })
@@ -579,6 +759,7 @@ fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<Outli
                 start_line,
                 end_line,
                 signature: Some(sig),
+                signature_end: None,
                 children: Vec::new(),
                 doc: None,
             })
@@ -592,6 +773,7 @@ fn elixir_attr_to_entry(node: tree_sitter::Node, lines: &[&str]) -> Option<Outli
                 start_line,
                 end_line,
                 signature: Some(sig),
+                signature_end: None,
                 children: Vec::new(),
                 doc: None,
             })

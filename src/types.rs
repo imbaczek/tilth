@@ -187,6 +187,14 @@ pub struct FacetTotals {
 }
 
 /// A single entry in a code outline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignatureEnd {
+    /// 1-based source line where the declaration ends.
+    pub line: u32,
+    /// Exclusive byte column on that line.
+    pub column: usize,
+}
+
 #[derive(Debug)]
 pub struct OutlineEntry {
     pub kind: OutlineKind,
@@ -194,6 +202,7 @@ pub struct OutlineEntry {
     pub start_line: u32,
     pub end_line: u32,
     pub signature: Option<String>,
+    pub signature_end: Option<SignatureEnd>,
     pub children: Vec<OutlineEntry>,
     pub doc: Option<String>,
 }

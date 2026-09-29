@@ -49,7 +49,7 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-                let outline_str = cache.get_or_compute(path, mtime, || {
+                let outline_str = cache.get_or_compute_with_cap(path, mtime, true, || {
                     // Best-effort: an unreadable file contributes no outline symbols rather than
                     // aborting the map. Errors are intentionally swallowed here.
                     let content = std::fs::read_to_string(path).unwrap_or_default();

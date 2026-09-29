@@ -411,6 +411,7 @@ fn clone_entry_shallow(entry: &OutlineEntry) -> OutlineEntry {
         start_line: entry.start_line,
         end_line: entry.end_line,
         signature: entry.signature.clone(),
+        signature_end: entry.signature_end,
         children: Vec::new(),
         doc: entry.doc.clone(),
     }
@@ -560,6 +561,7 @@ mod tests {
                 start_line: 1,
                 end_line: 1,
                 signature: sig.map(std::string::ToString::to_string),
+                signature_end: None,
                 children: Vec::new(),
                 doc: None,
             },
