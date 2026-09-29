@@ -400,6 +400,10 @@ fn write_caller_bucket(
         if total == 1 { "" } else { "s" }
     );
 
+    if total > sorted_callers.len() {
+        let _ = writeln!(output, "> Showing {} of {} found call sites; {} call sites omitted. Use --full or narrow the scope to see more.", sorted_callers.len(), total, total - sorted_callers.len());
+    }
+
     for (i, caller) in sorted_callers.iter().enumerate() {
         // Header: file:line [caller: calling_function]
         let _ = write!(

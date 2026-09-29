@@ -355,7 +355,7 @@ fn run_inner_scopes(
                 let QueryType::FilePath(path) = scoped_query_type else {
                     continue;
                 };
-                match read_file_query(&path, scope, section, full, cache) {
+                match read_file_query(&path, scope, section, full, cache, budget_tokens) {
                     Ok(output) => {
                         if multi_scope {
                             let output = apply_budget(output, budget_tokens);
@@ -419,8 +419,9 @@ fn read_file_query(
     section: Option<&str>,
     full: bool,
     cache: &OutlineCache,
+    budget: Option<u64>,
 ) -> Result<String, TilthError> {
-    let mut output = read::read_file(path, section, full, cache, false)?;
+    let mut output = read::read_file_with_budget(path, section, full, cache, false, budget)?;
     if section.is_none() && !full && read::would_outline(path) {
         let related = read::imports::resolve_related_files(path);
         if !related.is_empty() {
@@ -1258,7 +1259,7 @@ mod tests {
             .iter()
             .map(|scope| {
                 let path = scope.join("large.txt");
-                let output = read_file_query(&path, scope, None, true, &cache).unwrap();
+                let output = read_file_query(&path, scope, None, true, &cache, None).unwrap();
                 format!(
                     "# Scope: {}\n\n{}",
                     scope.display(),

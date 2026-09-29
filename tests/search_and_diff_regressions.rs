@@ -3,6 +3,56 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use tilth::cache::OutlineCache;
+
+#[test]
+fn callers_disclose_the_display_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let source: String = (0..12)
+        .map(|i| format!("fn caller_{i}() {{ target_fn(); }}\n"))
+        .collect();
+    fs::write(
+        dir.path().join("calls.rs"),
+        format!("fn target_fn() {{}}\n{source}"),
+    )
+    .unwrap();
+    let full = tilth::run_callers("target_fn", dir.path(), 0, None, None, true).unwrap();
+    assert_eq!(full.matches("[caller:").count(), 12);
+    let limited = tilth::run_callers("target_fn", dir.path(), 0, None, None, false).unwrap();
+    assert_eq!(limited.matches("[caller:").count(), 10);
+    assert!(
+        limited.contains("10 of 12")
+            || limited.contains("2 more call sites")
+            || limited.contains("2 call sites omitted"),
+        "caller search must disclose the two undisplayed sites: {limited}"
+    );
+}
+
+#[test]
+fn repo_search_finds_a_method_inside_an_inline_module() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("service.rs"),
+        "mod service {\n    pub struct Worker;\n    impl Worker {\n        pub fn nested_needle() {}\n    }\n}\n\nfn flat_needle() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("usage.rs"),
+        "fn consumer() { Worker::nested_needle(); }\n",
+    )
+    .unwrap();
+    let cache = OutlineCache::new();
+    let flat = tilth::run("flat_needle", dir.path(), None, None, None, &cache).unwrap();
+    assert!(
+        flat.contains("[definition]"),
+        "fixture must be parsed as Rust"
+    );
+    let nested = tilth::run("nested_needle", dir.path(), None, None, None, &cache).unwrap();
+    assert!(
+        nested.contains("[definition]"),
+        "repo-wide search missed the nested method definition: {nested}"
+    );
+}
 
 fn git(root: &Path, args: &[&str]) {
     let result = Command::new("git")

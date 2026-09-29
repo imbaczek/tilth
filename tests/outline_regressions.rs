@@ -1,6 +1,7 @@
-//! Regression coverage for decorated and multiline outlines.
+//! Regressions for reported outline failures. These assert the intended behavior
+//! and remain failing until their respective implementation fixes land.
 
-
+use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
 use tilth::cache::OutlineCache;
@@ -46,6 +47,37 @@ class Service:\n    @property\n    def decorated_property(self):\n        return
     .filter(|name| !output.contains(name))
     .collect();
     assert!(missing.is_empty(), "outline silently omitted {missing:?}");
+}
+
+#[test]
+fn tight_auto_read_budget_keeps_a_fitting_outline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("medium.rs");
+    let mut source = String::new();
+    for i in 0..8 {
+        writeln!(source, "pub fn entry_{i}() {{").unwrap();
+        source.push_str(&"    let body_only_marker = 123456789;\n".repeat(30));
+        source.push_str("}\n\n");
+    }
+    // Below the automatic 6,000-token gate, above the requested 500-token budget.
+    assert!(source.len() > 2_000 && source.len() < 24_000);
+    fs::write(&path, &source).unwrap();
+    let baseline = read(&path, &OutlineCache::new(), None);
+    assert!(baseline.contains("[full]"));
+    // Prove the entire outline can fit this budget using the same declarations.
+    let outline_path = dir.path().join("outlined.rs");
+    fs::write(&outline_path, format!("{source}{}", padding())).unwrap();
+    let outline = read(&outline_path, &OutlineCache::new(), Some(500));
+    assert!(outline.contains("[outline]") && outline.contains("entry_7"));
+    assert!(!outline.contains("truncated"));
+
+    let output = read(&path, &OutlineCache::new(), Some(500));
+    assert!(
+        output.contains("entry_7"),
+        "tight auto read hid the final function"
+    );
+    assert!(output.contains("[outline]"));
+    assert!(!output.contains("body_only_marker"));
 }
 
 #[test]

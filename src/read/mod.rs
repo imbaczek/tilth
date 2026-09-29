@@ -42,6 +42,18 @@ pub fn read_file(
     cache: &OutlineCache,
     edit_mode: bool,
 ) -> Result<String, TilthError> {
+    read_file_with_budget(path, section, full, cache, edit_mode, None)
+}
+
+/// Select the automatic view before applying the caller's output budget.
+pub(crate) fn read_file_with_budget(
+    path: &Path,
+    section: Option<&str>,
+    full: bool,
+    cache: &OutlineCache,
+    edit_mode: bool,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -163,7 +175,10 @@ pub fn read_file(
     };
 
     // Full mode or small file → return full content (skip smart view)
-    if full || tokens <= TOKEN_THRESHOLD {
+    if full
+        || (tokens <= TOKEN_THRESHOLD
+            && budget.is_none_or(|limit| estimate_tokens(full_view().len() as u64) <= limit))
+    {
         return Ok(full_view());
     }
 
