@@ -174,7 +174,11 @@ pub fn resolve_source(
 ///
 /// Git runs inside `repo` when one is provided (the caller's checkout);
 /// otherwise in the process cwd, exactly as before `repo` existed.
-fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, String> {
+fn run_git_diff(
+    source: &DiffSource,
+    repo: Option<&Path>,
+    scope: Option<&str>,
+) -> Result<String, String> {
     use std::process::Command;
 
     match source {
@@ -227,6 +231,22 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
         DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
     }
 
+    if let Some(scope) = scope.filter(|_| {
+        matches!(
+            source,
+            DiffSource::GitUncommitted | DiffSource::GitStaged | DiffSource::GitRef(_)
+        )
+    }) {
+        let paths = scoped_git_paths(source, repo, scope)?;
+        if paths.is_empty() {
+            return Ok(String::new());
+        }
+        cmd.arg("--");
+        for path in paths {
+            cmd.arg(format!(":(literal){}", path.display()));
+        }
+    }
+
     let output = cmd
         .output()
         .map_err(|e| format!("failed to run git diff: {e}"))?;
@@ -249,6 +269,111 @@ fn run_git_diff(source: &DiffSource, repo: Option<&Path>) -> Result<String, Stri
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Select changed paths with a cheap name/status query before requesting patches.
+/// Include both sides of renames so old-path scopes keep the rename.
+fn scoped_git_paths(
+    source: &DiffSource,
+    repo: Option<&Path>,
+    scope: &str,
+) -> Result<Vec<PathBuf>, String> {
+    let mut cmd = Command::new("git");
+    if let Some(dir) = repo {
+        cmd.current_dir(dir);
+    }
+    cmd.args([
+        "-c",
+        "core.quotePath=false",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--no-color",
+        "--no-relative",
+        "--name-status",
+        "-z",
+    ]);
+    match source {
+        DiffSource::GitUncommitted => {
+            cmd.arg("HEAD");
+        }
+        DiffSource::GitStaged => {
+            cmd.arg("--staged");
+        }
+        DiffSource::GitRef(reference) => {
+            cmd.arg(reference);
+        }
+        _ => unreachable!(),
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| format!("failed to run git diff: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git diff failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+
+    let fields: Vec<&[u8]> = output.stdout.split(|byte| *byte == 0).collect();
+    let mut changes = Vec::new();
+    let mut i = 0;
+    while i + 1 < fields.len() {
+        let status = fields[i];
+        i += 1;
+        let old = PathBuf::from(String::from_utf8_lossy(fields[i]).into_owned());
+        i += 1;
+        let new = if status
+            .first()
+            .is_some_and(|kind| matches!(kind, b'R' | b'C'))
+            && i < fields.len()
+        {
+            let path = PathBuf::from(String::from_utf8_lossy(fields[i]).into_owned());
+            i += 1;
+            Some(path)
+        } else {
+            None
+        };
+        changes.push((old, new));
+    }
+
+    let has_changes = !changes.is_empty();
+    let directory = directory_scope_path(scope, repo).and_then(|(path, exists)| {
+        (exists
+            || scope.ends_with('/')
+            || changes.iter().any(|(old, new)| {
+                is_path_descendant(old, &path)
+                    || new
+                        .as_deref()
+                        .is_some_and(|new| is_path_descendant(new, &path))
+            }))
+        .then_some(path)
+    });
+    let file = scope.split_once(':').map_or(scope, |(file, _)| file);
+    let mut paths = Vec::new();
+    for (old, new) in changes {
+        let matches = |path: &Path| {
+            if let Some(directory) = &directory {
+                path.starts_with(directory)
+            } else {
+                let path = path.to_string_lossy();
+                path == file || path.ends_with(file)
+            }
+        };
+        if matches(&old) || new.as_deref().is_some_and(matches) {
+            paths.push(old);
+            if let Some(new) = new {
+                paths.push(new);
+            }
+        }
+    }
+    if paths.is_empty() && has_changes && directory.is_none() {
+        return Err(format!("file '{file}' not found in diff"));
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
+
 /// Full diff orchestrator — parse → overlay → format pipeline.
 ///
 /// `repo` anchors every git command and working-tree read to the caller's
@@ -268,7 +393,7 @@ pub fn diff(
         return diff_log(range, repo, scope, budget);
     }
 
-    let raw = run_git_diff(source, repo)?;
+    let raw = run_git_diff(source, repo, scope)?;
     if raw.is_empty() {
         return Ok("No changes.".to_string());
     }
@@ -666,7 +791,7 @@ fn diff_log(
         // Run diff for this commit.
         let ref_str = format!("{hash}^..{hash}");
         let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source, repo)?;
+        let raw = run_git_diff(&commit_source, repo, None)?;
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
@@ -1122,6 +1247,22 @@ mod tests {
 
     // 14. test_file_scope_not_found
     #[test]
+    fn scoped_git_paths_only_selects_the_requested_file() {
+        let dir = setup_test_repo();
+        fs::write(
+            dir.path().join("src/main.rs"),
+            "fn main() { println!(\"changed\"); }\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("src/other.rs"), "fn other() {}\n").unwrap();
+        git(dir.path(), &["add", "src/main.rs", "src/other.rs"]);
+
+        let paths =
+            scoped_git_paths(&DiffSource::GitStaged, Some(dir.path()), "src/main.rs").unwrap();
+        assert_eq!(paths, vec![PathBuf::from("src/main.rs")]);
+    }
+
+    #[test]
     fn test_file_scope_not_found() {
         let dir = setup_test_repo();
         let main_rs = dir.path().join("src/main.rs");
@@ -1370,7 +1511,7 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = setup_test_repo();
         git(dir.path(), &["config", "diff.suppressBlankEmpty", "true"]);
         stage_goodbye_change(dir.path());
-        let raw = run_git_diff(&DiffSource::GitStaged, Some(dir.path())).unwrap();
+        let raw = run_git_diff(&DiffSource::GitStaged, Some(dir.path()), None).unwrap();
         assert!(
             raw.lines().any(|l| l == " "),
             "blank context line must survive as a single space:\n{raw}"
@@ -1384,7 +1525,8 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = setup_test_repo();
         git(dir.path(), &["config", "diff.relative", "true"]);
         stage_goodbye_change(dir.path());
-        let raw = run_git_diff(&DiffSource::GitStaged, Some(&dir.path().join("src"))).unwrap();
+        let raw =
+            run_git_diff(&DiffSource::GitStaged, Some(&dir.path().join("src")), None).unwrap();
         assert!(
             raw.contains("diff --git a/src/main.rs b/src/main.rs"),
             "paths must stay repo-relative when git runs in a subdirectory:\n{raw}"
