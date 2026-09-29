@@ -1,6 +1,5 @@
 //! Regression coverage for decorated and multiline outlines.
 
-
 use std::fs;
 use std::path::Path;
 use tilth::cache::OutlineCache;
