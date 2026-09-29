@@ -83,7 +83,9 @@ pub(in crate::mcp) fn tool_read(
             } else if force_stripped {
                 read_stripped_file(&path, cache).map(|(body, _, _)| body)
             } else {
-                crate::read::read_file(&path, None, force_full, cache, edit_mode)
+                crate::read::read_file_with_budget(
+                    &path, None, force_full, cache, edit_mode, budget,
+                )
             };
             match read {
                 Ok(output) => results.push(output),
@@ -169,7 +171,7 @@ pub(in crate::mcp) fn tool_read(
             .map(|(body, _, _)| body)
             .map_err(|e| e.to_string())?
     } else {
-        crate::read::read_file(&path, section, force_full, cache, edit_mode)
+        crate::read::read_file_with_budget(&path, section, force_full, cache, edit_mode, budget)
             .map_err(|e| e.to_string())?
     };
 

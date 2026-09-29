@@ -441,7 +441,7 @@ fn find_defs_treesitter(
     let mut defs = Vec::new();
 
     walk_for_definitions(
-        root, query, path, &lines, file_lines, mtime, &mut defs, lang, 0,
+        root, query, path, &lines, file_lines, mtime, &mut defs, lang,
     );
 
     defs
@@ -457,61 +457,30 @@ fn walk_for_definitions(
     mtime: SystemTime,
     defs: &mut Vec<Match>,
     lang: Option<crate::types::Lang>,
-    depth: usize,
 ) {
-    if depth > 3 {
-        return;
-    }
+    // Walk every nesting level without growing the Rust call stack.
+    let mut cursor = node.walk();
+    loop {
+        let node = cursor.node();
 
-    let kind = node.kind();
+        let kind = node.kind();
 
-    // Definition kinds and name/weight ops come from the per-language spec. For
-    // a known language these are `spec(lang).definition_kinds` / `.definitions`
-    // (the shared defaults for every language except Elixir, which carries its
-    // own); when `lang` is unknown we fall back to the shared defaults.
-    let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
-        Some(l) => {
-            let s = spec(l);
-            (s.definition_kinds, &s.definitions)
-        }
-        None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
-    };
-
-    if def_kinds.contains(&kind) {
-        // Check if this node defines the queried symbol
-        if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_name: Some(query.to_string()),
-                    def_weight: (def_ops.weight)(node, lines),
-                    impl_target: None,
-                });
+        // Definition kinds and name/weight ops come from the per-language spec. For
+        // a known language these are `spec(lang).definition_kinds` / `.definitions`
+        // (the shared defaults for every language except Elixir, which carries its
+        // own); when `lang` is unknown we fall back to the shared defaults.
+        let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
+            Some(l) => {
+                let s = spec(l);
+                (s.definition_kinds, &s.definitions)
             }
-        }
+            None => (DEFAULT_DEF_KINDS, &DEFAULT_DEFS),
+        };
 
-        // Impl/interface detection: surface `impl Trait for Type` and
-        // `class X implements Interface` blocks when searching for the trait/interface.
-        if kind == "impl_item" {
-            if let Some(trait_name) = extract_impl_trait(node, lines) {
-                if trait_name == query {
-                    let impl_type =
-                        extract_impl_type(node, lines).unwrap_or_else(|| "<unknown>".to_string());
+        if def_kinds.contains(&kind) {
+            // Check if this node defines the queried symbol
+            if let Some(name) = (def_ops.extract_name)(node, lines) {
+                if name == query {
                     let line_num = node.start_position().row as u32 + 1;
                     let line_text = lines
                         .get(node.start_position().row)
@@ -529,84 +498,112 @@ fn walk_for_definitions(
                             node.start_position().row as u32 + 1,
                             node.end_position().row as u32 + 1,
                         )),
-                        def_name: Some(format!("impl {query} for {impl_type}")),
+                        def_name: Some(query.to_string()),
+                        def_weight: (def_ops.weight)(node, lines),
+                        impl_target: None,
+                    });
+                }
+            }
+
+            // Impl/interface detection: surface `impl Trait for Type` and
+            // `class X implements Interface` blocks when searching for the trait/interface.
+            if kind == "impl_item" {
+                if let Some(trait_name) = extract_impl_trait(node, lines) {
+                    if trait_name == query {
+                        let impl_type = extract_impl_type(node, lines)
+                            .unwrap_or_else(|| "<unknown>".to_string());
+                        let line_num = node.start_position().row as u32 + 1;
+                        let line_text = lines
+                            .get(node.start_position().row)
+                            .unwrap_or(&"")
+                            .trim_end();
+                        defs.push(Match {
+                            path: path.to_path_buf(),
+                            line: line_num,
+                            text: line_text.to_string(),
+                            is_definition: true,
+                            exact: true,
+                            file_lines,
+                            mtime,
+                            def_range: Some((
+                                node.start_position().row as u32 + 1,
+                                node.end_position().row as u32 + 1,
+                            )),
+                            def_name: Some(format!("impl {query} for {impl_type}")),
+                            def_weight: 80,
+                            impl_target: Some(query.to_string()),
+                        });
+                    }
+                }
+            } else if kind == "class_declaration" || kind == "class_definition" {
+                let interfaces = extract_implemented_interfaces(node, lines);
+                if interfaces.iter().any(|i| i == query) {
+                    let class_name = extract_definition_name(node, lines)
+                        .unwrap_or_else(|| "<anonymous>".to_string());
+                    let line_num = node.start_position().row as u32 + 1;
+                    let line_text = lines
+                        .get(node.start_position().row)
+                        .unwrap_or(&"")
+                        .trim_end();
+                    defs.push(Match {
+                        path: path.to_path_buf(),
+                        line: line_num,
+                        text: line_text.to_string(),
+                        is_definition: true,
+                        exact: true,
+                        file_lines,
+                        mtime,
+                        def_range: Some((
+                            node.start_position().row as u32 + 1,
+                            node.end_position().row as u32 + 1,
+                        )),
+                        def_name: Some(format!("{class_name} implements {query}")),
                         def_weight: 80,
                         impl_target: Some(query.to_string()),
                     });
                 }
             }
-        } else if kind == "class_declaration" || kind == "class_definition" {
-            let interfaces = extract_implemented_interfaces(node, lines);
-            if interfaces.iter().any(|i| i == query) {
-                let class_name = extract_definition_name(node, lines)
-                    .unwrap_or_else(|| "<anonymous>".to_string());
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_name: Some(format!("{class_name} implements {query}")),
-                    def_weight: 80,
-                    impl_target: Some(query.to_string()),
-                });
+        } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
+            // Elixir: definitions are `call` nodes — check separately. Name and
+            // weight come from `spec(Elixir).definitions` via `def_ops`.
+            if let Some(name) = (def_ops.extract_name)(node, lines) {
+                if name == query {
+                    let line_num = node.start_position().row as u32 + 1;
+                    let line_text = lines
+                        .get(node.start_position().row)
+                        .unwrap_or(&"")
+                        .trim_end();
+                    defs.push(Match {
+                        path: path.to_path_buf(),
+                        line: line_num,
+                        text: line_text.to_string(),
+                        is_definition: true,
+                        exact: true,
+                        file_lines,
+                        mtime,
+                        def_range: Some((
+                            node.start_position().row as u32 + 1,
+                            node.end_position().row as u32 + 1,
+                        )),
+                        def_name: Some(query.to_string()),
+                        def_weight: (def_ops.weight)(node, lines),
+                        impl_target: None,
+                    });
+                }
             }
         }
-    } else if lang == Some(crate::types::Lang::Elixir) && is_elixir_definition(node, lines) {
-        // Elixir: definitions are `call` nodes — check separately. Name and
-        // weight come from `spec(Elixir).definitions` via `def_ops`.
-        if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_name: Some(query.to_string()),
-                    def_weight: (def_ops.weight)(node, lines),
-                    impl_target: None,
-                });
-            }
-        }
-    }
 
-    // Recurse into children (for nested definitions, class bodies, impl blocks, etc.)
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        walk_for_definitions(
-            child,
-            query,
-            path,
-            lines,
-            file_lines,
-            mtime,
-            defs,
-            lang,
-            depth + 1,
-        );
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return;
+            }
+        }
     }
 }
 
