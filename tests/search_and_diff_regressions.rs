@@ -133,6 +133,55 @@ fn diff_directory_scope_includes_descendants_without_prefix_siblings() {
     }
 }
 
+#[test]
+fn scoped_diff_preserves_cross_file_symbol_moves() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+    fs::write(
+        dir.path().join("a.rs"),
+        "fn moved() { println!(\"hello\"); }\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("b.rs"), "fn stays() {}\n").unwrap();
+    fs::write(dir.path().join("unrelated.rs"), "fn unrelated() {}\n").unwrap();
+    commit_diff_regression_fixture(dir.path(), "initial");
+
+    fs::write(dir.path().join("a.rs"), "").unwrap();
+    fs::write(
+        dir.path().join("b.rs"),
+        "fn stays() {}\nfn moved() { println!(\"hello\"); }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("unrelated.rs"),
+        "fn unrelated() { let _ = 1; }\n",
+    )
+    .unwrap();
+
+    let source = tilth::diff::DiffSource::GitUncommitted;
+    for scope in ["a.rs", "b.rs"] {
+        let output =
+            tilth::diff::diff(&source, Some(dir.path()), Some(scope), None, false, 0, None)
+                .unwrap();
+        assert!(output.contains("[↦] moved"), "scope {scope}: {output}");
+        assert!(!output.contains("unrelated"), "scope {scope}: {output}");
+    }
+
+    commit_diff_regression_fixture(dir.path(), "move symbol");
+    let source = tilth::diff::DiffSource::GitRef("HEAD^..HEAD".to_string());
+    let output = tilth::diff::diff(
+        &source,
+        Some(dir.path()),
+        Some("a.rs"),
+        None,
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    assert!(output.contains("[↦] moved"), "committed range: {output}");
+}
+
 fn commit_diff_regression_fixture(root: &Path, message: &str) {
     git(root, &["add", "-A"]);
     git(

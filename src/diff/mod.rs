@@ -413,8 +413,45 @@ pub fn diff(
         .map(|fd| overlay::compute_overlay(fd, source, repo))
         .collect();
 
+    // A scoped patch omits the other half of a symbol move. Look for changed
+    // files mentioning added/deleted symbol names, then include their overlays
+    // only while resolving cross-file matches.
+    let scoped_len = overlays.len();
+    if scope.is_some()
+        && matches!(
+            source,
+            DiffSource::GitUncommitted | DiffSource::GitStaged | DiffSource::GitRef(_)
+        )
+    {
+        let names: HashSet<&str> = overlays
+            .iter()
+            .flat_map(|overlay| &overlay.symbol_changes)
+            .filter(|change| matches!(change.change, ChangeType::Added | ChangeType::Deleted))
+            .map(|change| change.name.as_str())
+            .collect();
+        if !names.is_empty() {
+            let all_raw = run_git_diff(source, repo, None)?;
+            let other_diffs: Vec<FileDiff> = parse::parse_unified_diff(&all_raw)
+                .into_iter()
+                .filter(|fd| {
+                    !file_diffs.iter().any(|scoped| scoped.path == fd.path)
+                        && fd.hunks.iter().any(|hunk| {
+                            hunk.lines
+                                .iter()
+                                .any(|line| names.iter().any(|name| line.content.contains(name)))
+                        })
+                })
+                .collect();
+            let other_overlays: Vec<FileOverlay> = other_diffs
+                .par_iter()
+                .map(|fd| overlay::compute_overlay(fd, source, repo))
+                .collect();
+            overlays.extend(other_overlays);
+        }
+    }
     // 3. Cross-file move detection.
     overlay::cross_file_matching(&mut overlays);
+    overlays.truncate(scoped_len);
     let directory_scope = scope
         .and_then(|scope| directory_scope_path(scope, repo))
         .and_then(|(directory, exists)| {
