@@ -936,3 +936,56 @@ mod outline_cache_regression_tests {
         assert_eq!(after_read, baseline);
     }
 }
+
+#[cfg(test)]
+mod elixir_signature_view_regression_tests {
+    use super::*;
+
+    #[test]
+    fn multiline_keyword_body_stops_at_do_key_with_source_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keyword.ex");
+        let source = "def g(x),\n  do: (\n    IO.puts(x)\n    x + 123\n  )\n";
+        std::fs::write(&path, source).unwrap();
+        let output = tool_read(
+            &serde_json::json!({"path": path, "mode": "signature"}),
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+        )
+        .unwrap();
+
+        for (index, visible) in ["def g(x),", "  do:"].iter().enumerate() {
+            let original = source.lines().nth(index).unwrap();
+            let hash = crate::format::line_hash(original.as_bytes());
+            assert!(
+                output.contains(&format!("{}:{hash:03x}|{visible}", index + 1)),
+                "{output}"
+            );
+        }
+        assert!(!output.contains("IO.puts"), "{output}");
+        assert!(!output.contains("x + 123"), "{output}");
+    }
+
+    #[test]
+    fn keyword_text_inside_default_string_is_not_body_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quoted.ex");
+        let source = "def f(x \\\\ \", do:\"), do: x\n";
+        std::fs::write(&path, source).unwrap();
+        let output = tool_read(
+            &serde_json::json!({"path": path, "mode": "signature"}),
+            &OutlineCache::new(),
+            &Session::new(),
+            false,
+        )
+        .unwrap();
+
+        let hash = crate::format::line_hash(source.trim_end().as_bytes());
+        assert!(
+            output.contains(&format!("1:{hash:03x}|def f(x \\\\ \", do:\"), do:")),
+            "{output}"
+        );
+        assert!(!output.contains("do: x"), "{output}");
+    }
+}

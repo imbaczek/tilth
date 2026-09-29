@@ -4,7 +4,7 @@ pub mod overlay;
 pub mod parse;
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use rayon::prelude::*;
@@ -290,9 +290,17 @@ pub fn diff(
 
     // 3. Cross-file move detection.
     overlay::cross_file_matching(&mut overlays);
-    let directory_scope = scope.and_then(|scope| directory_scope_path(scope, repo));
+    let directory_scope = scope
+        .and_then(|scope| directory_scope_path(scope, repo))
+        .and_then(|(directory, exists)| {
+            if exists || file_diffs_have_descendant_paths(&file_diffs, &directory) {
+                Some(directory)
+            } else {
+                None
+            }
+        });
     if let Some(directory) = &directory_scope {
-        overlays.retain(|overlay| overlay.path.starts_with(directory));
+        overlays.retain(|overlay| overlay_matches_directory_scope(overlay, &file_diffs, directory));
         if overlays.is_empty() {
             return Ok("No changes.".to_string());
         }
@@ -386,7 +394,7 @@ pub fn diff(
 // ---------------------------------------------------------------------------
 
 /// Resolve a directory scope to a path relative to its repository root.
-fn directory_scope_path(scope: &str, repo: Option<&Path>) -> Option<PathBuf> {
+fn directory_scope_path(scope: &str, repo: Option<&Path>) -> Option<(PathBuf, bool)> {
     let scope_path = Path::new(scope);
     if scope.contains(':') && !scope_path.is_absolute() {
         return None;
@@ -414,15 +422,96 @@ fn directory_scope_path(scope: &str, repo: Option<&Path>) -> Option<PathBuf> {
     } else {
         root.join(scope_path)
     };
-    let absolute_scope = std::fs::canonicalize(absolute_scope).ok()?;
-    if !absolute_scope.is_dir() {
+
+    match std::fs::canonicalize(&absolute_scope) {
+        Ok(absolute_scope) => {
+            if !absolute_scope.is_dir() {
+                return None;
+            }
+            let relative_scope = absolute_scope.strip_prefix(&root).ok()?.to_path_buf();
+            Some((relative_scope, true))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute_scope = normalize_absolute_scope(&absolute_scope)?;
+            let mut ancestor = absolute_scope.as_path();
+            let canonical_ancestor = loop {
+                match std::fs::canonicalize(ancestor) {
+                    Ok(path) => break path,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        ancestor = ancestor.parent()?;
+                    }
+                    Err(_) => return None,
+                }
+            };
+            if !canonical_ancestor.is_dir() {
+                return None;
+            }
+
+            let missing = absolute_scope.strip_prefix(ancestor).ok()?;
+            let mut resolved_scope = canonical_ancestor;
+            resolved_scope.push(missing);
+            let relative_scope = normalize_absolute_scope(&resolved_scope)?
+                .strip_prefix(&root)
+                .ok()?
+                .to_path_buf();
+            Some((relative_scope, false))
+        }
+        Err(_) => None,
+    }
+}
+
+fn normalize_absolute_scope(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
         return None;
     }
 
-    absolute_scope
-        .strip_prefix(&root)
-        .ok()
-        .map(Path::to_path_buf)
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                normalized.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some() {
+                    normalized.pop();
+                } else {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Some(normalized)
+}
+
+fn file_diffs_have_descendant_paths(file_diffs: &[FileDiff], directory: &Path) -> bool {
+    file_diffs.iter().any(|file_diff| {
+        is_path_descendant(&file_diff.path, directory)
+            || file_diff
+                .old_path
+                .as_deref()
+                .map_or(false, |old_path| is_path_descendant(old_path, directory))
+    })
+}
+
+fn is_path_descendant(path: &Path, directory: &Path) -> bool {
+    path != directory && path.starts_with(directory)
+}
+
+fn overlay_matches_directory_scope(
+    overlay: &FileOverlay,
+    file_diffs: &[FileDiff],
+    directory: &Path,
+) -> bool {
+    overlay.path.starts_with(directory)
+        || file_diffs.iter().any(|file_diff| {
+            file_diff.path == overlay.path
+                && file_diff
+                    .old_path
+                    .as_deref()
+                    .map_or(false, |old_path| old_path.starts_with(directory))
+        })
 }
 
 /// Human-readable label for a diff source.
@@ -554,6 +643,7 @@ fn diff_log(
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut summaries: Vec<CommitSummary> = Vec::new();
+    let scope_path = scope.and_then(|scope| directory_scope_path(scope, repo));
 
     for line in stdout.lines() {
         let line = line.trim();
@@ -584,6 +674,22 @@ fn diff_log(
             .map(|fd| overlay::compute_overlay(fd, &commit_source, repo))
             .collect();
         overlay::cross_file_matching(&mut overlays);
+        let directory_scope = scope_path.as_ref().and_then(|(directory, exists)| {
+            if *exists || file_diffs_have_descendant_paths(&file_diffs, directory) {
+                Some(directory.as_path())
+            } else {
+                None
+            }
+        });
+        if let Some(directory) = directory_scope {
+            overlays
+                .retain(|overlay| overlay_matches_directory_scope(overlay, &file_diffs, directory));
+        } else if let Some(file_scope) = scope {
+            overlays.retain(|overlay| {
+                let path = overlay.path.to_string_lossy();
+                path == file_scope || path.ends_with(file_scope)
+            });
+        }
 
         summaries.push(CommitSummary {
             hash: hash.to_string(),
@@ -594,20 +700,8 @@ fn diff_log(
         });
     }
 
-    // Filter by scope if set.
-    let directory_scope = scope.and_then(|scope| directory_scope_path(scope, repo));
-    if let Some(file_scope) = scope {
-        for summary in &mut summaries {
-            summary.overlays.retain(|o| {
-                if let Some(directory) = &directory_scope {
-                    o.path.starts_with(directory)
-                } else {
-                    let p = o.path.to_string_lossy();
-                    p == file_scope || p.ends_with(file_scope)
-                }
-            });
-        }
-        summaries.retain(|s| !s.overlays.is_empty());
+    if scope.is_some() {
+        summaries.retain(|summary| !summary.overlays.is_empty());
     }
 
     if summaries.is_empty() {
@@ -1331,7 +1425,7 @@ mod directory_scope_path_tests {
 
         assert_eq!(
             directory_scope_path(absolute_scope.to_str().unwrap(), Some(repo.path())),
-            Some(PathBuf::from("src/nested"))
+            Some((PathBuf::from("src/nested"), true))
         );
     }
 }

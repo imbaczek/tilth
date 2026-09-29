@@ -132,3 +132,135 @@ fn diff_directory_scope_includes_descendants_without_prefix_siblings() {
         assert!(!output.contains("excluded"));
     }
 }
+
+fn commit_diff_regression_fixture(root: &Path, message: &str) {
+    git(root, &["add", "-A"]);
+    git(
+        root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-qm",
+            message,
+        ],
+    );
+}
+
+#[test]
+fn diff_directory_scope_includes_renames_from_the_source_path_in_diff_and_log() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+
+    for (file, content) in [
+        ("old/a.rs", "fn moved() -> u8 { 1 }\n"),
+        ("old/keeper.rs", "fn keeper() -> u8 { 1 }\n"),
+    ] {
+        let path = dir.path().join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, content).unwrap();
+    }
+    commit_diff_regression_fixture(dir.path(), "initial");
+
+    fs::create_dir_all(dir.path().join("new")).unwrap();
+    git(dir.path(), &["mv", "old/a.rs", "new/a.rs"]);
+
+    let staged = tilth::diff::DiffSource::GitStaged;
+    let output =
+        tilth::diff::diff(&staged, Some(dir.path()), Some("old"), None, false, 0, None).unwrap();
+    assert!(
+        output.contains("new/a.rs"),
+        "source directory scope omitted staged rename: {output}"
+    );
+
+    commit_diff_regression_fixture(dir.path(), "move from old");
+    let log_source = tilth::diff::DiffSource::Log("HEAD^..HEAD".to_string());
+    let log = tilth::diff::diff(
+        &log_source,
+        Some(dir.path()),
+        Some("old"),
+        None,
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    assert!(
+        log.contains("move from old"),
+        "source directory scope omitted rename from log: {log}"
+    );
+}
+
+#[test]
+fn diff_directory_scope_supports_removed_directories_and_component_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "-q"]);
+
+    fs::create_dir_all(dir.path().join("gone")).unwrap();
+    fs::create_dir_all(dir.path().join("gone-other")).unwrap();
+    fs::write(dir.path().join("gone/a.rs"), "fn removed() -> u8 { 1 }\n").unwrap();
+    fs::write(
+        dir.path().join("gone-other/a.rs"),
+        "fn affected() -> u8 { 1 }\nfn unrelated() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    commit_diff_regression_fixture(dir.path(), "initial");
+
+    fs::remove_file(dir.path().join("gone/a.rs")).unwrap();
+    fs::remove_dir(dir.path().join("gone")).unwrap();
+    fs::write(
+        dir.path().join("gone-other/a.rs"),
+        "fn affected() -> u8 { 2 }\nfn unrelated() -> u8 { 2 }\n",
+    )
+    .unwrap();
+
+    let source = tilth::diff::DiffSource::GitUncommitted;
+    let absolute_scope = dir.path().join("gone").to_string_lossy().into_owned();
+    for scope in ["gone/", absolute_scope.as_str()] {
+        let output =
+            tilth::diff::diff(&source, Some(dir.path()), Some(scope), None, false, 0, None)
+                .unwrap();
+        assert!(
+            output.contains("gone/a.rs"),
+            "removed directory scope {scope:?} omitted deletion: {output}"
+        );
+        assert!(
+            !output.contains("gone-other/a.rs"),
+            "removed directory scope {scope:?} included a prefix sibling: {output}"
+        );
+    }
+
+    let file_scope = tilth::diff::diff(
+        &source,
+        Some(dir.path()),
+        Some("gone-other/a.rs"),
+        None,
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    assert!(file_scope.contains("gone-other/a.rs"), "{file_scope}");
+    assert!(!file_scope.contains("gone/a.rs"), "{file_scope}");
+
+    let function_scope = tilth::diff::diff(
+        &source,
+        Some(dir.path()),
+        Some("gone-other/a.rs:affected"),
+        None,
+        false,
+        0,
+        None,
+    )
+    .unwrap();
+    assert!(
+        function_scope.contains("gone-other/a.rs"),
+        "file:function scope was not preserved: {function_scope}"
+    );
+}

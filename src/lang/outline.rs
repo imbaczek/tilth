@@ -486,29 +486,23 @@ fn elixir_keyword_body_positions(
     node: tree_sitter::Node,
     lines: &[&str],
 ) -> Option<((usize, usize), (usize, usize))> {
-    let start = node.start_position();
-    let start = (start.row, start.column);
-    let end = node.end_position();
-    let source = source_text_between(lines, start, (end.row, end.column));
-    let marker = ", do:";
-    let marker_start = source.find(marker)?;
-    Some((
-        advance_source_position(start, &source[..marker_start]),
-        advance_source_position(start, &source[..marker_start + marker.len()]),
-    ))
-}
-
-fn advance_source_position(start: (usize, usize), text: &str) -> (usize, usize) {
-    let mut position = start;
-    for byte in text.bytes() {
-        if byte == b'\n' {
-            position.0 += 1;
-            position.1 = 0;
-        } else {
-            position.1 += 1;
-        }
-    }
-    position
+    let mut cursor = node.walk();
+    let arguments = node
+        .children(&mut cursor)
+        .find(|child| child.kind() == "arguments")?;
+    let mut cursor = arguments.walk();
+    let keywords = arguments
+        .children(&mut cursor)
+        .find(|child| child.kind() == "keywords")?;
+    let mut cursor = keywords.walk();
+    let key = keywords
+        .children(&mut cursor)
+        .filter(|child| child.kind() == "pair")
+        .filter_map(|pair| pair.child_by_field_name("key"))
+        .find(|key| node_text(*key, lines).trim() == "do:")?;
+    let start = key.start_position();
+    let end = key.end_position();
+    Some(((start.row, start.column), (end.row, end.column)))
 }
 
 fn source_text_between(lines: &[&str], start: (usize, usize), end: (usize, usize)) -> String {
@@ -542,23 +536,95 @@ fn source_text_between(lines: &[&str], start: (usize, usize), end: (usize, usize
 }
 
 fn compact_signature(source: &str, lang: Lang) -> String {
-    let mut signature = source.split_whitespace().collect::<Vec<_>>().join(" ");
-    for (from, to) in [
-        ("( ", "("),
-        ("[ ", "["),
-        ("< ", "<"),
-        ("{ ", "{"),
-        (" )", ")"),
-        (" ]", "]"),
-        (" >", ">"),
-        (" }", "}"),
-        (" ,", ","),
-        (" ;", ";"),
-        (" .", "."),
-        (" ::", "::"),
-        (" :", ":"),
-    ] {
-        signature = signature.replace(from, to);
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Ordinary(char),
+        Triple(char),
+        RustRaw(usize),
+    }
+
+    let mut signature = String::new();
+    let mut chars = source.chars().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut pending_space = false;
+
+    while let Some(ch) = chars.next() {
+        if let Some(delimiter) = quote {
+            signature.push(ch);
+            match delimiter {
+                Quote::RustRaw(hashes) => {
+                    if ch == '"' && chars.clone().take(hashes).all(|next| next == '#') {
+                        for _ in 0..hashes {
+                            signature.push(chars.next().unwrap());
+                        }
+                        quote = None;
+                    }
+                }
+                Quote::Ordinary(end) | Quote::Triple(end) => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == end {
+                        if matches!(delimiter, Quote::Triple(_)) {
+                            if chars.clone().take(2).eq([end, end]) {
+                                signature.push(chars.next().unwrap());
+                                signature.push(chars.next().unwrap());
+                                quote = None;
+                            }
+                        } else {
+                            quote = None;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if ch.is_whitespace() {
+            pending_space = !signature.is_empty();
+            continue;
+        }
+
+        if pending_space
+            && !matches!(ch, ')' | ']' | '>' | '}' | ',' | ';' | '.' | ':')
+            && !matches!(signature.chars().last(), Some('(' | '[' | '<' | '{'))
+        {
+            signature.push(' ');
+        }
+        pending_space = false;
+        signature.push(ch);
+
+        let rust_lifetime = ch == '\''
+            && lang.has_lifetimes()
+            && chars
+                .peek()
+                .is_some_and(|next| next.is_alphabetic() || *next == '_')
+            && chars.clone().nth(1) != Some('\'');
+        if rust_lifetime {
+            continue;
+        }
+
+        if lang == Lang::Rust && ch == '"' {
+            let prefix = &signature[..signature.len() - 1];
+            let hashes = prefix
+                .bytes()
+                .rev()
+                .take_while(|byte| *byte == b'#')
+                .count();
+            if prefix[..prefix.len() - hashes].ends_with('r') {
+                quote = Some(Quote::RustRaw(hashes));
+                continue;
+            }
+        }
+        if lang == Lang::Python && matches!(ch, '"' | '\'') && chars.clone().take(2).eq([ch, ch]) {
+            signature.push(chars.next().unwrap());
+            signature.push(chars.next().unwrap());
+            quote = Some(Quote::Triple(ch));
+        } else if matches!(ch, '"' | '\'') || ch == char::from(96u8) {
+            quote = Some(Quote::Ordinary(ch));
+        }
     }
 
     if lang == Lang::Python {
@@ -1427,5 +1493,137 @@ main() {
         // `source\t./lib.sh` (tab separator) must be parsed correctly.
         let result = extract_import_source("source\t./lib/utils.sh", Some(Lang::Bash));
         assert_eq!(result, "./lib/utils.sh");
+    }
+}
+
+#[cfg(test)]
+mod signature_boundary_regression_tests {
+    use super::get_outline_entries;
+    use crate::types::Lang;
+
+    #[test]
+    fn quoted_python_defaults_keep_whitespace_and_punctuation() {
+        for (old_default, new_default) in [
+            ("a  b", "a b"),
+            ("a , b", "a, b"),
+            ("[ a ]", "[a]"),
+            ("a : b", "a: b"),
+        ] {
+            let old = format!("def f(value: str = \"{old_default}\"):\n    return value\n");
+            let new = format!("def f(value: str = \"{new_default}\"):\n    return value\n");
+            let old_sig = get_outline_entries(&old, Lang::Python)[0]
+                .signature
+                .clone()
+                .unwrap();
+            let new_sig = get_outline_entries(&new, Lang::Python)[0]
+                .signature
+                .clone()
+                .unwrap();
+            assert!(old_sig.contains(&format!("\"{old_default}\"")), "{old_sig}");
+            assert_ne!(old_sig, new_sig, "{old_default:?} vs {new_default:?}");
+        }
+    }
+
+    #[test]
+    fn multiline_signatures_stay_compact_without_changing_literals() {
+        let source =
+            "def f(\n    value: str = \"a  b\",\n    count: int = 1,\n):\n    return value\n";
+        let signature = get_outline_entries(source, Lang::Python)[0]
+            .signature
+            .clone()
+            .unwrap();
+        assert_eq!(signature, "def f(value: str = \"a  b\", count: int = 1,)");
+    }
+
+    #[test]
+    fn rust_lifetimes_remain_outside_quoted_literals() {
+        let source = "fn borrow<'a>(value: &'a str) -> &'a str { value }\n";
+        let signature = get_outline_entries(source, Lang::Rust)[0]
+            .signature
+            .clone()
+            .unwrap();
+        assert_eq!(signature, "fn borrow<'a>(value: &'a str) -> &'a str");
+    }
+
+    #[test]
+    fn elixir_keyword_body_uses_structural_key_position() {
+        let multiline = "def g(x),\n  do: (\n    IO.puts(x)\n    x + 123\n  )\n";
+        let entry = &get_outline_entries(multiline, Lang::Elixir)[0];
+        assert_eq!(entry.signature.as_deref(), Some("def g(x),"));
+        let end = entry.signature_end.unwrap();
+        assert_eq!((end.line, end.column), (2, 6));
+
+        let quoted = "def f(x \\\\ \", do:\"), do: x\n";
+        let entry = &get_outline_entries(quoted, Lang::Elixir)[0];
+        assert_eq!(entry.signature.as_deref(), Some("def f(x \\\\ \", do:\"),"));
+        let end = entry.signature_end.unwrap();
+        assert_eq!(
+            (end.line, end.column),
+            (1, quoted.find("do: x").unwrap() + 4)
+        );
+    }
+}
+
+#[cfg(test)]
+mod signature_change_classification_regression_tests {
+    use super::get_outline_entries;
+    use crate::diff::matching::{build_diff_symbols, match_symbols};
+    use crate::diff::ChangeType;
+    use crate::types::Lang;
+
+    #[test]
+    fn quoted_default_whitespace_is_classified_as_signature_change() {
+        let old = "def f(value: str = \"a  b\"):\n    return value\n";
+        let new = "def f(value: str = \"a b\"):\n    return value\n";
+        let old_entries = get_outline_entries(old, Lang::Python);
+        let new_entries = get_outline_entries(new, Lang::Python);
+        let old_symbols = build_diff_symbols(&old_entries, old, Lang::Python);
+        let new_symbols = build_diff_symbols(&new_entries, new, Lang::Python);
+
+        let changes = match_symbols(&old_symbols, &new_symbols);
+        assert_eq!(changes.len(), 1);
+        assert!(
+            matches!(changes[0].change, ChangeType::SignatureChanged),
+            "{changes:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod extended_literal_signature_regression_tests {
+    use super::get_outline_entries;
+    use crate::types::Lang;
+
+    #[test]
+    fn python_triple_quoted_default_keeps_embedded_quote_and_spaces() {
+        let source = "def f(x = \"\"\"a\"  b\"\"\"):\n    return x\n";
+        let signature = get_outline_entries(source, Lang::Python)[0]
+            .signature
+            .clone()
+            .unwrap();
+        assert!(signature.contains("\"\"\"a\"  b\"\"\""), "{signature}");
+    }
+
+    #[test]
+    fn rust_raw_string_default_keeps_embedded_quote_and_spaces() {
+        let signature = super::compact_signature("fn f(x: &str = r#\"a\"  b\"#)", Lang::Rust);
+        assert!(signature.contains("r#\"a\"  b\"#"), "{signature}");
+    }
+    #[test]
+    fn python_raw_default_keeps_escaped_quote_and_spaces() {
+        let source = r#"def f(x = r"a\"  b"):
+    return x
+"#;
+        let signature = get_outline_entries(source, Lang::Python)[0]
+            .signature
+            .clone()
+            .unwrap();
+        assert!(signature.contains(r#"r"a\"  b""#), "{signature}");
+    }
+
+    #[test]
+    fn rust_raw_string_with_multiple_hashes_keeps_quote_and_spaces() {
+        let signature = super::compact_signature("fn f(x = r##\"a\"#  b\"##)", Lang::Rust);
+        assert!(signature.contains("r##\"a\"#  b\"##"), "{signature}");
     }
 }
