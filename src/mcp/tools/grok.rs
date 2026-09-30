@@ -28,9 +28,41 @@ pub(in crate::mcp) fn tool_grok(
         crate::search::grok::GrokCaps::default()
     };
 
-    let result = crate::search::grok::grok(target, &scope, bloom, session, caps)
+    let result = crate::search::grok::grok_with_root(target, &scope, bloom, session, caps, root)
         .map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::grok::format_grok(&result, &scope));
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_relative_target_and_nested_scope_use_the_supplied_checkout() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+        std::fs::write(
+            root.path().join("src/nested/target.rs"),
+            "fn target() {}\nfn inside() { target(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("outside.rs"),
+            "fn outside() { target(); }\n",
+        )
+        .unwrap();
+        let bloom = Arc::new(BloomFilterCache::new());
+        for target in ["src/nested/target.rs:1", "target.rs:1"] {
+            let args =
+                serde_json::json!({"target": target, "root": root.path(), "scope": "src/nested"});
+            let output = tool_grok(&args, &bloom, &Session::default()).unwrap();
+            assert!(output.starts_with("# grok: target ["), "{output}");
+            assert!(
+                output.contains("inside") && !output.contains("outside"),
+                "{output}"
+            );
+        }
+    }
 }

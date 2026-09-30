@@ -52,9 +52,14 @@ pub(super) fn walk_to_enclosing_definition<'a>(
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let mut current = Some(node);
     while let Some(n) = current {
-        let def_name = if matches!(n.kind(), "arrow_function" | "function_expression") {
+        let def_name = if matches!(
+            n.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
             anonymous_function_name(n, lines)
-        } else if DEFINITION_KINDS.contains(&n.kind()) {
+        } else if DEFINITION_KINDS.contains(&n.kind())
+            || n.kind() == "generator_function_declaration"
+        {
             extract_definition_name(n, lines)
         } else if lang == crate::types::Lang::Elixir && is_elixir_definition(n, lines) {
             extract_elixir_definition_name(n, lines)
@@ -63,6 +68,36 @@ pub(super) fn walk_to_enclosing_definition<'a>(
         };
 
         if let Some(name) = def_name {
+            // Calls in local initializers belong to their enclosing callable,
+            // not to the binding. Keep top-level bindings and real callbacks.
+            if matches!(
+                n.kind(),
+                "lexical_declaration"
+                    | "variable_declaration"
+                    | "variable_assignment"
+                    | "const_declaration"
+                    | "const_item"
+                    | "static_item"
+            ) {
+                let mut ancestor = n.parent();
+                while let Some(parent) = ancestor {
+                    if matches!(
+                        parent.kind(),
+                        "function_declaration"
+                            | "function_definition"
+                            | "function_item"
+                            | "method_definition"
+                            | "method_declaration"
+                            | "arrow_function"
+                            | "function_expression"
+                            | "generator_function"
+                            | "generator_function_declaration"
+                    ) {
+                        return walk_to_enclosing_definition(parent, lines, lang);
+                    }
+                    ancestor = parent.parent();
+                }
+            }
             let range = (
                 n.start_position().row as u32 + 1,
                 n.end_position().row as u32 + 1,
@@ -145,37 +180,7 @@ pub fn enclosing_definition_at(
         .root_node()
         .descendant_for_point_range(point, point)?;
 
-    let (mut def_node, mut name, _range) =
-        walk_to_enclosing_definition(target, &lines, parsed.lang)?;
-    // A local binding's initializer is part of its containing function's usage
-    // scope. Starting at its first token must not label the function as that binding.
-    if matches!(
-        def_node.kind(),
-        "lexical_declaration" | "variable_declaration" | "const_item" | "static_item"
-    ) {
-        let mut ancestor = def_node.parent();
-        while let Some(node) = ancestor {
-            if matches!(
-                node.kind(),
-                "function_declaration"
-                    | "function_definition"
-                    | "function_item"
-                    | "method_definition"
-                    | "method_declaration"
-                    | "arrow_function"
-                    | "function_expression"
-                    | "generator_function"
-                    | "generator_function_declaration"
-            ) {
-                let (function, function_name, _) =
-                    walk_to_enclosing_definition(node, &lines, parsed.lang)?;
-                def_node = function;
-                name = function_name;
-                break;
-            }
-            ancestor = node.parent();
-        }
-    }
+    let (def_node, name, _range) = walk_to_enclosing_definition(target, &lines, parsed.lang)?;
     Some(EnclosingScope {
         byte_range: (def_node.start_byte(), def_node.end_byte()),
         kind: kind_label(def_node, &lines, parsed.lang),
@@ -195,7 +200,9 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "method_declaration"
         | "decorated_definition"
         | "arrow_function"
-        | "function_expression" => "function",
+        | "function_expression"
+        | "generator_function"
+        | "generator_function_declaration" => "function",
         "class_declaration" | "class_definition" => "class",
         "struct_item" => "struct",
         "interface_declaration" => "interface",
