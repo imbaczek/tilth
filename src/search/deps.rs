@@ -773,6 +773,32 @@ mod tests {
     }
 
     #[test]
+    fn commonjs_consumers_and_forwarders_are_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("lib.js");
+        fs::write(&target, "function run() {}\nmodule.exports = { run };\n").unwrap();
+        fs::write(
+            root.join("direct.js"),
+            "const { run } = require('./lib');\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            "module.exports = require('./lib');\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("indirect.js"),
+            "const { run } = require('./index');\n",
+        )
+        .unwrap();
+        let result =
+            analyze_deps(&target, root, &crate::index::bloom::BloomFilterCache::new()).unwrap();
+        assert_eq!(result.total_dependents, 3);
+    }
+
+    #[test]
     fn go_stdlib_fmtlib_is_not_stdlib() {
         // "fmtlib" is not a Go stdlib package—previously matched via starts_with("fmt")
         assert!(!is_stdlib("fmtlib", crate::types::Lang::Go));

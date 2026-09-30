@@ -222,11 +222,19 @@ pub(crate) fn js_import_bindings(text: &str) -> Vec<(String, String)> {
             }
         }
     }
-    if let Some(namespace) = clause.strip_prefix("* as ") {
+    let namespace_clause = if clause.starts_with('*') {
+        clause
+    } else {
+        clause
+            .split_once(',')
+            .map_or(clause, |(_, rest)| rest.trim_start())
+    };
+    if let Some(namespace) = namespace_clause.strip_prefix("* as ") {
         if let Some(local) = namespace.split_whitespace().next() {
             bindings.push((local.to_string(), "*".to_string()));
         }
-    } else if !clause.starts_with(['{', '\'', '"']) {
+    }
+    if !clause.starts_with(['{', '*', '\'', '"']) {
         if let Some(local) = clause
             .split(|c: char| c.is_whitespace() || c == ',')
             .next()
@@ -332,7 +340,70 @@ pub(crate) fn js_module_sources(content: &str, lang: Lang) -> Vec<(String, bool)
             result.push((value.to_string(), reexport));
         }
     }
+    if content.contains("require") {
+        collect_commonjs_sources(tree.root_node(), content.as_bytes(), &mut result);
+    }
     result
+}
+
+/// Literal `CommonJS` imports are dependencies even when they occur inside a function.
+/// Traverse syntax nodes so comments, strings, property calls and dynamic arguments
+/// cannot masquerade as a static import.
+fn collect_commonjs_sources(
+    node: tree_sitter::Node,
+    bytes: &[u8],
+    result: &mut Vec<(String, bool)>,
+) {
+    if node.kind() == "call_expression"
+        && node
+            .child_by_field_name("function")
+            .is_some_and(|function| {
+                function.kind() == "identifier" && function.utf8_text(bytes) == Ok("require")
+            })
+    {
+        if let Some(arguments) = node.child_by_field_name("arguments") {
+            if arguments.named_child_count() == 1 {
+                if let Some(source) = arguments
+                    .named_child(0)
+                    .filter(|source| source.kind() == "string")
+                {
+                    if let Ok(raw) = source.utf8_text(bytes) {
+                        let value = raw.trim_matches(['\'', '"']);
+                        if !value.is_empty() {
+                            let mut reexport = false;
+                            let mut parent = node.parent();
+                            while let Some(ancestor) = parent {
+                                if ancestor.kind() == "assignment_expression" {
+                                    let left = ancestor
+                                        .child_by_field_name("left")
+                                        .and_then(|left| left.utf8_text(bytes).ok())
+                                        .unwrap_or("");
+                                    reexport = left == "module.exports"
+                                        || left.starts_with("module.exports.")
+                                        || left.starts_with("exports.");
+                                    break;
+                                }
+                                if matches!(
+                                    ancestor.kind(),
+                                    "statement_block"
+                                        | "variable_declarator"
+                                        | "expression_statement"
+                                ) {
+                                    break;
+                                }
+                                parent = ancestor.parent();
+                            }
+                            result.push((value.to_string(), reexport));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_commonjs_sources(child, bytes, result);
+    }
 }
 
 type CachedImports = (SystemTime, u64, Arc<Vec<(String, bool)>>);
@@ -355,7 +426,10 @@ pub(crate) fn js_module_sources_from_file(path: &Path, lang: Lang) -> Vec<(Strin
     let Ok(content) = fs::read_to_string(path) else {
         return Vec::new();
     };
-    let sources = if content.contains("import") || content.contains("export") {
+    let sources = if content.contains("import")
+        || content.contains("export")
+        || content.contains("require")
+    {
         js_module_sources(&content, lang)
     } else {
         Vec::new()
@@ -707,6 +781,33 @@ fn resolve_bash(dir: &Path, source: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn combined_default_and_namespace_import_bindings() {
+        assert_eq!(
+            js_import_bindings("import Default, * as ns from './lib';"),
+            vec![
+                ("ns".to_string(), "*".to_string()),
+                ("Default".to_string(), "default".to_string())
+            ]
+        );
+        assert_eq!(
+            js_import_bindings("import * as ns from './lib';"),
+            vec![("ns".to_string(), "*".to_string())]
+        );
+    }
+
+    #[test]
+    fn commonjs_module_sources_are_structural_and_static() {
+        let sources = js_module_sources("const { run } = require('./lib');\nfunction load() { return require('./lazy'); }\nmodule.exports = require('./barrel');\nconst ignored = 'require(\"./string\")';\n// require('./comment')\nconst dynamic = require(name);\nconst method = mock.require('./method');\n", Lang::JavaScript);
+        assert_eq!(
+            sources,
+            vec![
+                ("./lib".to_string(), false),
+                ("./lazy".to_string(), false),
+                ("./barrel".to_string(), true)
+            ]
+        );
+    }
     use std::fs;
 
     #[test]

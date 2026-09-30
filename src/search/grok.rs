@@ -922,16 +922,22 @@ fn ts_owner_aliases(
             .unwrap_or(statement_text)
             .trim_start();
         let clause = clause.strip_prefix("type ").unwrap_or(clause);
-        if let Some(namespace) = clause.strip_prefix("* as ") {
+        let namespace_clause = if clause.starts_with('*') {
+            clause
+        } else {
+            clause
+                .split_once(',')
+                .map_or(clause, |(_, rest)| rest.trim_start())
+        };
+        if let Some(namespace) = namespace_clause.strip_prefix("* as ") {
             if let Some(namespace) = namespace.split_whitespace().next() {
                 let owner = resolver.owner.clone();
                 if resolver.resolves(&imported_path, &owner) {
                     aliases.insert(format!("{namespace}.{owner}"));
                 }
             }
-        } else if let Some(default_name) =
-            clause.split(|c: char| c.is_whitespace() || c == ',').next()
-        {
+        }
+        if let Some(default_name) = clause.split(|c: char| c.is_whitespace() || c == ',').next() {
             if !default_name.is_empty()
                 && !matches!(default_name, "{" | "*" | "from")
                 && resolver.resolves(&imported_path, "default")
@@ -1870,6 +1876,95 @@ mod tests {
             .callers
             .iter()
             .any(|caller| caller.path.ends_with("client.ts") && caller.line == 4));
+    }
+
+    #[test]
+    fn grok_ts_function_expression_parameters_stay_in_their_scope() {
+        for expression in [
+            "function(service: Other) {}",
+            "function*(service: Other) {}",
+            "(service: Other) => {}",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = write_fixture(
+                tmp.path(),
+                "service.ts",
+                "export class Service {\n create() {}\n}\n",
+            );
+            write_fixture(tmp.path(), "client.ts", &format!("import {{ Service }} from './service';\nclass Other {{ create() {{}} }}\nconst service = new Service();\nconst callback = {expression};\nexport function execute() {{ service.create(); }}\n"));
+            let result = grok(
+                &format!("{}:2", target.display()),
+                tmp.path(),
+                &BloomFilterCache::default(),
+                &crate::session::Session::default(),
+                GrokCaps::default(),
+            )
+            .unwrap();
+            assert_eq!(result.total_callers, 1, "{expression}");
+            assert_eq!(result.callers[0].calling_function, "execute");
+        }
+    }
+
+    #[test]
+    fn grok_ts_combined_default_namespace_import_resolves_both_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export default class Service {\n create() {}\n}\nexport { Service };\n",
+        );
+        write_fixture(tmp.path(), "client.ts", "import Default, * as ns from './service';\nexport function execute() { new ns.Service().create(); new Default().create(); }\n");
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 2);
+        assert!(result
+            .callers
+            .iter()
+            .all(|caller| caller.calling_function == "execute"));
+    }
+
+    #[test]
+    fn grok_js_commonjs_consumers_are_not_filtered_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "lib.js",
+            "function run() {}\nmodule.exports = { run };\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "direct.js",
+            "const { run } = require('./lib');\nfunction execute() { run(); }\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "index.js",
+            "module.exports = require('./lib');\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "indirect.js",
+            "const { run } = require('./index');\nfunction execute() { run(); }\n",
+        );
+        let result = grok(
+            &format!("{}:1", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 2);
+        assert!(result
+            .callers
+            .iter()
+            .all(|caller| caller.calling_function == "execute"));
     }
 
     #[test]
