@@ -3,6 +3,65 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn caller_search_counts_all_files_before_default_and_full_previews() {
+    let root = tempfile::tempdir().unwrap();
+    for file in 0..25 {
+        let mut source = String::new();
+        for i in 0..25 {
+            writeln!(source, "fn caller_{file}_{i}() {{ hot(); }}").unwrap();
+        }
+        fs::write(root.path().join(format!("part{file:02}.rs")), source).unwrap();
+    }
+    fs::write(
+        root.path().join("wide.rs"),
+        format!("fn late() {{ hot(); }}\n//{}", "x".repeat(500_001)),
+    )
+    .unwrap();
+    let run = |full: bool, glob: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tilth"));
+        command
+            .args(["hot", "--callers", "--scope"])
+            .arg(root.path());
+        if full {
+            command.arg("--full");
+        }
+        if let Some(glob) = glob {
+            command.args(["--glob", glob]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    for full in [false, true] {
+        let output = run(full, None);
+        assert!(output.contains("— 626 call sites"), "{output}");
+        assert_eq!(
+            output.matches("[caller:").count(),
+            if full { 100 } else { 10 },
+            "{output}"
+        );
+        assert!(
+            output
+                .lines()
+                .find(|line| line.starts_with("## "))
+                .unwrap()
+                .contains("part00.rs:1"),
+            "{output}"
+        );
+        assert_eq!(run(full, None), output);
+        let filtered = run(full, Some("wide.rs"));
+        assert!(
+            filtered.contains("— 1 call site") && filtered.contains("[caller: late]"),
+            "{filtered}"
+        );
+    }
+}
+
+#[test]
 fn multiline_docs_are_readable_in_outline_and_grok() {
     let root = tempfile::tempdir().unwrap();
     for (filename, declaration_line, source) in [

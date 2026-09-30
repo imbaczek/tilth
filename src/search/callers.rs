@@ -16,36 +16,12 @@ const MAX_MATCHES: usize = 10;
 const IMPACT_FANOUT_THRESHOLD: usize = 10;
 /// Max 2nd-hop results to display.
 const IMPACT_MAX_RESULTS: usize = 15;
-/// Stop the batch caller walk once we have this many raw matches. Generous headroom for dedup + ranking.
+/// Raw-match limit for bounded internal analyses. Caller queries collect fully
+/// and apply their preview limits only after ranking.
 pub(crate) const BATCH_EARLY_QUIT: usize = 50;
 
-/// Match-count cap when `--full` is set. Mirrors the symbol/content search caps.
+/// Display cap when `--full` is set. Mirrors symbol/content search previews.
 const FULL_MAX_MATCHES: usize = 100;
-/// Walker early-quit threshold when `--full` is set.
-const FULL_BATCH_EARLY_QUIT: usize = FULL_MAX_MATCHES * 3;
-
-/// Scale a single-target batch-walk budget for a multi-target search.
-///
-/// `find_callers_batch`'s `early_quit_threshold` is a walk-wide raw-match
-/// count shared by every target in the `HashSet` passed to it — the walker
-/// has no concept of "budget per target," it just stops once the total
-/// match count crosses the threshold (see `found_count` in
-/// `find_callers_batch`). A single target's budget (`BATCH_EARLY_QUIT` /
-/// `FULL_BATCH_EARLY_QUIT`) sized for one symbol therefore starves later
-/// targets in a multi-target search once an earlier, hit-rich target
-/// consumes it. Scaling linearly by target count gives each target
-/// approximately its own full budget's worth of headroom; `n_targets` is
-/// already bounded to 5 by the dispatch layer (`tool_search`'s
-/// `2..=5 => ...` arm), so the scaled result stays bounded too.
-///
-/// Note: the early-quit mechanism itself is a coarse walk-wide heuristic
-/// that is a candidate for removal/replacement in a future change — this
-/// scaling is a minimal parity fix so multi-target does not regress vs. N
-/// separate single-target calls, not a long-term investment in the
-/// mechanism's design.
-fn scaled_batch_quit(base_quit: usize, n_targets: usize) -> usize {
-    base_quit.saturating_mul(n_targets.max(1))
-}
 
 /// A single caller match — a call site of a target symbol.
 #[derive(Debug)]
@@ -135,6 +111,18 @@ pub(crate) fn find_callers_batch(
         super::bloom_walk::MAX_FILE_SIZE,
     )
     .map(|(matches, _)| matches)
+}
+
+/// Caller queries need the complete analyzed set for totals and ranking, even
+/// when a common name or a large source file would exhaust an internal cap.
+fn find_all_callers_batch(
+    targets: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+) -> Result<Vec<(String, CallerMatch)>, TilthError> {
+    find_callers_batch_with_size_limit(targets, scope, bloom, glob, usize::MAX, u64::MAX)
+        .map(|(matches, _)| matches)
 }
 
 pub(crate) fn find_callers_batch_with_size_limit(
@@ -635,13 +623,9 @@ pub fn search_callers_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let (max_matches, batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
-    let raw = find_callers_batch(&single, scope, bloom, glob, batch_quit)?;
+    let raw = find_all_callers_batch(&single, scope, bloom, glob)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
 
     if callers.is_empty() {
@@ -662,6 +646,10 @@ pub fn search_callers_expanded(
         .map(|c| c.calling_function.clone())
         .collect();
 
+    let all_direct_locations = sorted_callers
+        .iter()
+        .map(|c| (c.path.clone(), c.line))
+        .collect();
     sorted_callers.truncate(max_matches);
 
     let mut output = String::new();
@@ -669,11 +657,10 @@ pub fn search_callers_expanded(
     write_second_hop_impact(
         &mut output,
         &all_caller_names,
-        &sorted_callers,
+        &all_direct_locations,
         scope,
         bloom,
         glob,
-        batch_quit,
     );
 
     let tokens = crate::types::estimate_tokens(output.len() as u64);
@@ -763,34 +750,39 @@ fn write_caller_bucket(
 /// finding: the multi-target path originally omitted this entirely).
 ///
 /// `all_caller_names` must be the target's unique direct-caller names
-/// collected BEFORE `sorted_callers` truncation, so the fan-out threshold
+/// collected BEFORE preview truncation, so the fan-out threshold
 /// check reflects the true hop-1 breadth rather than the display-capped one.
 fn write_second_hop_impact(
     output: &mut String,
     all_caller_names: &HashSet<String>,
-    sorted_callers: &[CallerMatch],
+    all_direct_locations: &HashSet<(PathBuf, u32)>,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
     glob: Option<&str>,
-    batch_quit: usize,
 ) {
     if all_caller_names.is_empty() || all_caller_names.len() > IMPACT_FANOUT_THRESHOLD {
         return;
     }
-    let Ok(hop2) = find_callers_batch(all_caller_names, scope, bloom, glob, batch_quit) else {
+    let Ok(hop2) = find_all_callers_batch(all_caller_names, scope, bloom, glob) else {
         return;
     };
 
     // Filter out hop-1 matches (same file+line = same call site)
-    let hop1_locations: HashSet<(PathBuf, u32)> = sorted_callers
-        .iter()
-        .map(|c| (c.path.clone(), c.line))
-        .collect();
-
-    let hop2_filtered: Vec<_> = hop2
+    let mut hop2_filtered: Vec<_> = hop2
         .into_iter()
-        .filter(|(_, m)| !hop1_locations.contains(&(m.path.clone(), m.line)))
+        .filter(|(_, m)| !all_direct_locations.contains(&(m.path.clone(), m.line)))
         .collect();
+    hop2_filtered.sort_by(|(a_via, a), (b_via, b)| {
+        let a_rel = a.path.strip_prefix(scope).unwrap_or(&a.path);
+        let b_rel = b.path.strip_prefix(scope).unwrap_or(&b.path);
+        a_rel
+            .components()
+            .count()
+            .cmp(&b_rel.components().count())
+            .then_with(|| a.path.cmp(&b.path))
+            .then_with(|| a.line.cmp(&b.line))
+            .then_with(|| a_via.cmp(b_via))
+    });
 
     if hop2_filtered.is_empty() {
         return;
@@ -851,9 +843,8 @@ fn write_second_hop_impact(
 /// `write_second_hop_impact` helpers the single-target path uses, so a
 /// bucket here is byte-identical to what a lone `search_callers_expanded`
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
-/// MED — header shape parity). The batch walk's early-quit budget is scaled
-/// by target count so a hit-rich earlier target cannot starve a later,
-/// rarer one (PR #138 review: MED — budget scaling).
+/// MED — header shape parity). Collection is complete before partitioning,
+/// so a hit-rich target cannot starve a rarer one.
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -863,11 +854,7 @@ pub fn search_callers_multi_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let (max_matches, base_batch_quit) = if full {
-        (FULL_MAX_MATCHES, FULL_BATCH_EARLY_QUIT)
-    } else {
-        (MAX_MATCHES, BATCH_EARLY_QUIT)
-    };
+    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
 
     // Dedupe targets, preserving first-seen order: a repeated target (e.g.
     // query "foo,foo") must not render an empty no-callers section on its
@@ -880,14 +867,8 @@ pub fn search_callers_multi_expanded(
         .filter(|t| seen.insert(*t))
         .collect();
 
-    // Scale the walk-wide early-quit budget by (deduped) target count so
-    // each target gets roughly its own single-target budget's headroom —
-    // see `scaled_batch_quit` for why an unscaled shared budget starves
-    // later targets.
-    let batch_quit = scaled_batch_quit(base_batch_quit, ordered.len());
-
     let target_set: HashSet<String> = ordered.iter().map(ToString::to_string).collect();
-    let raw = find_callers_batch(&target_set, scope, bloom, glob, batch_quit)?;
+    let raw = find_all_callers_batch(&target_set, scope, bloom, glob)?;
 
     // Bucket matches by which target they call. Preserve the caller-supplied
     // target order so output is deterministic.
@@ -920,17 +901,17 @@ pub fn search_callers_multi_expanded(
             .map(|c| c.calling_function.clone())
             .collect();
 
+        let all_direct_locations = callers.iter().map(|c| (c.path.clone(), c.line)).collect();
         callers.truncate(max_matches);
 
         write_caller_bucket(&mut output, target, scope, total, &callers, expand);
         write_second_hop_impact(
             &mut output,
             &all_caller_names,
-            &callers,
+            &all_direct_locations,
             scope,
             bloom,
             glob,
-            batch_quit,
         );
         output.push('\n');
     }
@@ -1013,36 +994,109 @@ fn rank_callers(callers: &mut [CallerMatch], scope: &Path, context: Option<&Path
 mod tests {
     use super::*;
 
-    /// MED finding from PR review: the batch walk's early-quit budget is a
-    /// walk-wide raw-match count shared by every target passed to
-    /// `find_callers_batch` — a single target's budget therefore starves
-    /// later targets in a multi-target search. `scaled_batch_quit` is the
-    /// pure scaling function `search_callers_multi_expanded` uses to size
-    /// the walk's budget by target count instead of reusing the unscaled
-    /// single-target constant. This asserts the scaling directly (rather
-    /// than only via an integration test against the parallel walker, whose
-    /// starvation is real but not reliably reproducible in a small,
-    /// deterministic unit test — see
-    /// `callers_multi_target_later_target_not_starved_by_hit_rich_earlier_target`
-    /// in `src/mcp/tools/search.rs` for that scenario-level guard).
     #[test]
-    fn scaled_batch_quit_multiplies_by_target_count() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 1), BATCH_EARLY_QUIT);
-        assert_eq!(
-            scaled_batch_quit(BATCH_EARLY_QUIT, 2),
-            BATCH_EARLY_QUIT * 2,
-            "2 targets must not share a single target's budget"
-        );
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 5), BATCH_EARLY_QUIT * 5);
+    fn caller_queries_collect_all_matches_before_ranking_and_target_partitioning() {
+        let dir = tempfile::tempdir().unwrap();
+        for file in 0..40 {
+            let mut source = String::new();
+            for i in 0..50 {
+                writeln!(source, "fn caller_{file}_{i}() {{ hot(); }}").unwrap();
+            }
+            std::fs::write(dir.path().join(format!("file{file:02}.rs")), source).unwrap();
+        }
+        let preferred = dir.path().join("zz_preferred.rs");
+        std::fs::write(
+            &preferred,
+            format!("fn best() {{ hot(); cold(); }}\n//{}", "x".repeat(500_001)),
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        for full in [false, true] {
+            let cap = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+            let single =
+                search_callers_expanded("hot", dir.path(), &bloom, 0, Some(&preferred), None, full)
+                    .unwrap();
+            assert!(single.contains("— 2001 call sites"), "{single}");
+            assert_eq!(single.matches("[caller:").count(), cap, "{single}");
+            assert!(
+                single
+                    .lines()
+                    .find(|line| line.starts_with("## "))
+                    .unwrap()
+                    .contains("zz_preferred.rs:1 [caller: best]"),
+                "{single}"
+            );
+            let multi = search_callers_multi_expanded(
+                &["hot", "cold", "hot"],
+                dir.path(),
+                &bloom,
+                0,
+                Some(&preferred),
+                None,
+                full,
+            )
+            .unwrap();
+            assert!(
+                multi.contains("— 2001 call sites") && multi.contains("— 1 call site"),
+                "{multi}"
+            );
+            assert_eq!(multi.matches("# Callers of \"hot\"").count(), 1);
+            assert_eq!(multi.matches("[caller:").count(), cap + 1, "{multi}");
+            let cold =
+                search_callers_expanded("cold", dir.path(), &bloom, 0, None, None, full).unwrap();
+            assert!(
+                cold.contains("— 1 call site") && cold.contains("[caller: best]"),
+                "{cold}"
+            );
+        }
     }
 
-    /// `n_targets = 0` cannot happen through the dispatch layer (`tool_search`
-    /// rejects an empty query before reaching `search_callers_multi_expanded`),
-    /// but the scaling function must stay total rather than dividing by zero
-    /// or returning a zero budget that would make every walk quit instantly.
     #[test]
-    fn scaled_batch_quit_treats_zero_targets_as_one() {
-        assert_eq!(scaled_batch_quit(BATCH_EARLY_QUIT, 0), BATCH_EARLY_QUIT);
+    fn caller_query_second_hop_counts_complete_set_and_excludes_hidden_direct_sites() {
+        let dir = tempfile::tempdir().unwrap();
+        let bridge = format!(
+            "fn bridge() {{\n{}}}\n",
+            " target(); bridge();\n".repeat(40)
+        );
+        std::fs::write(dir.path().join("bridge.rs"), bridge).unwrap();
+        for i in 0..160 {
+            std::fs::write(
+                dir.path().join(format!("hop{i:03}.rs")),
+                format!("fn outer{i:03}() {{ bridge(); bridge(); bridge(); }}\n"),
+            )
+            .unwrap();
+        }
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let mut previous = None;
+        for full in [false, true] {
+            for _ in 0..2 {
+                let result =
+                    search_callers_expanded("target", dir.path(), &bloom, 0, None, None, full)
+                        .unwrap();
+                assert!(result.contains("— 40 call sites"), "{result}");
+                let impact = result.split("-- impact (2nd hop) --\n").nth(1).unwrap();
+                let impact = impact
+                    .split("functions affected across 2 hops.")
+                    .next()
+                    .unwrap();
+                assert!(
+                    impact.ends_with("161 ") && impact.contains("... and 145 more"),
+                    "{result}"
+                );
+                assert!(
+                    !impact.contains("bridge.rs"),
+                    "hidden direct sites must not become hop2: {result}"
+                );
+                for i in 0..15 {
+                    assert!(impact.contains(&format!("outer{i:03}")), "{result}");
+                }
+                assert!(!impact.contains("outer015"), "{result}");
+                if let Some(previous) = &previous {
+                    assert_eq!(impact, previous);
+                }
+                previous = Some(impact.to_string());
+            }
+        }
     }
 
     #[test]
