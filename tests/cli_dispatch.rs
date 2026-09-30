@@ -3,6 +3,57 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn grok_non_ts_caller_totals_survive_default_and_full_display_caps() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("target.rs");
+    fs::write(&target, "pub fn target() {}\n").unwrap();
+    let mut callers = String::new();
+    for i in 0..75 {
+        writeln!(callers, "fn caller{i:02}() {{ target(); }}").unwrap();
+    }
+    fs::write(root.path().join("callers.rs"), callers).unwrap();
+    let mut tests = String::new();
+    for i in 0..65 {
+        writeln!(tests, "#[test]\nfn case{i:02}() {{ target(); }}").unwrap();
+    }
+    fs::write(root.path().join("cases_test.rs"), tests).unwrap();
+    for full in [false, true] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tilth"));
+        command
+            .arg("grok")
+            .arg(format!("{}:1", target.display()))
+            .arg("--scope")
+            .arg(root.path());
+        if full {
+            command.arg("--full");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            output.contains(if full {
+                "## callers (50 of 75)"
+            } else {
+                "## callers (5 of 75)"
+            }),
+            "{output}"
+        );
+        assert!(
+            output.contains(if full {
+                "## tests (30 of 65)"
+            } else {
+                "## tests (8 of 65)"
+            }),
+            "{output}"
+        );
+    }
+}
+
+#[test]
 fn deps_full_expands_preview_and_obeys_budget() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("target.ts");

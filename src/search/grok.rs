@@ -12,7 +12,7 @@ use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
 use crate::lang::outline::get_outline_entries;
 use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
-use crate::search::callers::{find_callers_batch, CallerMatch, BATCH_EARLY_QUIT};
+use crate::search::callers::{find_callers_batch_with_size_limit, CallerMatch};
 use crate::search::search_symbol_raw;
 use crate::types::{is_test_file, FileType, Lang, OutlineEntry, OutlineKind};
 
@@ -495,7 +495,9 @@ pub fn grok(
         candidates.insert(canonical_target.clone());
         super::callers::find_callers_in_files(&candidates, scope, &symbols)
     } else {
-        find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?
+        // Collect before filtering, partitioning and sorting. A raw-match or
+        // file-size cap can hide real callers and make the totals misleading.
+        find_callers_batch_with_size_limit(&symbols, scope, bloom, None, usize::MAX, u64::MAX)?.0
     };
     let mut ts_aliases: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     if let Some(owner) = ts_owner {
@@ -1789,6 +1791,79 @@ fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<Si
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn non_ts_grok_includes_oversized_caller_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(tmp.path(), "target.rs", "pub fn target() {}\n");
+        write_fixture(
+            tmp.path(),
+            "large.rs",
+            &format!(
+                "/* {} */\nfn caller() {{ target(); }}\n",
+                "x".repeat(510_000)
+            ),
+        );
+        for caps in [GrokCaps::default(), GrokCaps::full()] {
+            let result = grok(
+                &format!("{}:1", target.display()),
+                tmp.path(),
+                &BloomFilterCache::default(),
+                &crate::session::Session::default(),
+                caps,
+            )
+            .unwrap();
+            assert_eq!(result.total_callers, 1);
+            assert_eq!(result.callers.len(), 1);
+            assert!(result.callers[0].path.ends_with("large.rs"));
+        }
+    }
+
+    #[test]
+    fn non_ts_callers_are_collected_before_filtering_and_display_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut source = String::from("pub fn target() {\n");
+        for _ in 0..80 {
+            source.push_str("target();\n");
+        }
+        source.push_str("}\n");
+        let target = write_fixture(tmp.path(), "target.rs", &source);
+        for i in 0..75 {
+            write_fixture(
+                tmp.path(),
+                &format!("caller{i:02}.rs"),
+                "fn caller() { target(); }\n",
+            );
+        }
+        for i in 0..65 {
+            write_fixture(
+                tmp.path(),
+                &format!("case{i:02}_test.rs"),
+                "#[test]\nfn test_target() { target(); }\n",
+            );
+        }
+        let spec = format!("{}:1", target.display());
+        for caps in [GrokCaps::default(), GrokCaps::full()] {
+            let result = grok(
+                &spec,
+                tmp.path(),
+                &BloomFilterCache::default(),
+                &crate::session::Session::default(),
+                caps,
+            )
+            .unwrap();
+            assert_eq!(result.total_callers, 75);
+            assert_eq!(result.total_tests, 65);
+            assert_eq!(result.callers.len(), caps.max_callers);
+            assert_eq!(result.tests.len(), caps.max_tests);
+            for (i, caller) in result.callers.iter().enumerate() {
+                assert!(caller.path.ends_with(format!("caller{i:02}.rs")));
+            }
+            for (i, test) in result.tests.iter().enumerate() {
+                assert!(test.path.ends_with(format!("case{i:02}_test.rs")));
+            }
+        }
+    }
 
     fn make_entry(kind: OutlineKind, name: &str, start: u32, end: u32) -> OutlineEntry {
         OutlineEntry {
