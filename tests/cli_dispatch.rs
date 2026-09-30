@@ -1,5 +1,45 @@
+use std::fmt::Write as _;
 use std::fs;
 use std::process::Command;
+
+#[test]
+fn deps_full_expands_preview_and_obeys_budget() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("target.ts");
+    let mut imports = String::new();
+    for i in 0..12 {
+        fs::write(
+            root.path().join(format!("dep{i:02}.ts")),
+            "export const value = 1;\n",
+        )
+        .unwrap();
+        writeln!(imports, "import {{ value as v{i} }} from './dep{i:02}';").unwrap();
+    }
+    fs::write(&path, imports).unwrap();
+    let run = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .arg(&path)
+            .arg("--deps")
+            .arg("--scope")
+            .arg(root.path())
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let preview = run(&[]);
+    assert!(preview.contains("12 local"), "{preview}");
+    assert!(!preview.contains("dep11.ts"), "{preview}");
+    let full = run(&["--full"]);
+    assert!(full.contains("dep11.ts"), "{full}");
+    let limited = run(&["--full", "--budget", "30"]);
+    assert!(limited.len() < full.len());
+}
 
 #[test]
 fn repeated_scopes_full_expand_zero_still_obey_final_budget() {

@@ -8,13 +8,12 @@ use std::path::{Path, PathBuf};
 
 use crate::error::TilthError;
 use crate::lang::detect_file_type;
-use crate::lang::outline::{extract_import_source, get_outline_entries};
+use crate::lang::outline::get_outline_entries;
 use crate::read::imports::{
-    is_external, is_import_line, js_module_sources_from_file, resolve_import_source,
-    resolve_related_files_with_content,
+    dependency_import_sources, is_external, js_module_sources_from_file, resolve_import_source,
 };
 use crate::search::callees::{extract_callee_names, resolve_callees};
-use crate::search::callers::{find_callers_batch, find_callers_in_files};
+use crate::search::callers::find_callers_in_files;
 use crate::types::{FileType, OutlineKind};
 
 /// Maximum number of exported symbols to search for in the reverse direction.
@@ -22,6 +21,7 @@ const MAX_EXPORTED_SYMBOLS: usize = 25;
 
 /// Maximum number of dependents to show before truncation.
 const MAX_DEPENDENTS: usize = 15;
+const MAX_LOCAL_DEPENDENCIES: usize = 8;
 
 /// Result of a full dependency analysis for a single file.
 pub struct DepsResult {
@@ -29,8 +29,10 @@ pub struct DepsResult {
     pub uses_local: Vec<LocalDep>,
     pub uses_external: Vec<String>,
     pub used_by: Vec<Dependent>,
-    /// Total dependents found before truncation.
+    /// Total observed dependents, independent of display limits.
     pub total_dependents: usize,
+    /// False when reverse symbol or call-site collection stopped at a limit.
+    pub dependents_complete: bool,
     pub exported_count: usize,
     /// Actual number of symbols searched (may be < `exported_count` if capped).
     pub searched_count: usize,
@@ -55,10 +57,21 @@ pub struct Dependent {
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
 /// Phase 3: Reverse dependencies — what uses this file.
+#[cfg(test)]
 pub fn analyze_deps(
     path: &Path,
     scope: &Path,
     bloom: &crate::index::bloom::BloomFilterCache,
+) -> Result<DepsResult, TilthError> {
+    analyze_deps_with_options(path, scope, bloom, false)
+}
+
+/// Full mode removes analysis limits as well as the formatter's preview limits.
+pub fn analyze_deps_with_options(
+    path: &Path,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    full: bool,
 ) -> Result<DepsResult, TilthError> {
     // Canonicalize for reliable path comparison (callers return absolute paths).
     let path = &path.canonicalize().map_err(|e| TilthError::IoError {
@@ -79,6 +92,7 @@ pub fn analyze_deps(
             uses_external: Vec::new(),
             used_by: Vec::new(),
             total_dependents: 0,
+            dependents_complete: true,
             exported_count: 0,
             searched_count: 0,
         });
@@ -107,7 +121,7 @@ pub fn analyze_deps(
     let exported_count = all_names.len();
 
     // Cap at MAX_EXPORTED_SYMBOLS, preferring longer (more specific) names
-    let searched_count = if all_names.len() > MAX_EXPORTED_SYMBOLS {
+    let searched_count = if !full && all_names.len() > MAX_EXPORTED_SYMBOLS {
         all_names.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         all_names.truncate(MAX_EXPORTED_SYMBOLS);
         MAX_EXPORTED_SYMBOLS
@@ -134,9 +148,11 @@ pub fn analyze_deps(
 
     // Merge in import-resolved files (may not have resolved callees if symbols
     // weren't matched, but the import relationship itself is meaningful)
-    let import_files = resolve_related_files_with_content(path, &content);
-    for import_path in import_files {
-        local_by_file.entry(import_path).or_default();
+    let import_sources = dependency_import_sources(&content, lang);
+    for source in &import_sources {
+        if let Some(import_path) = resolve_import_source(path, source, lang) {
+            local_by_file.entry(import_path).or_default();
+        }
     }
 
     // Sort symbols within each dep, then build the list sorted by path
@@ -153,20 +169,13 @@ pub fn analyze_deps(
         .collect();
     uses_local.sort_by(|a, b| a.path.cmp(&b.path));
 
-    // External deps via line-level import parsing
+    // External and local counts come from the same complete source list.
     let mut external_set: HashSet<String> = HashSet::new();
-    for line in content.lines() {
-        if !is_import_line(line, lang) {
-            continue;
-        }
-        let source = extract_import_source(line, Some(lang));
-        if source.is_empty() {
-            continue;
-        }
-        if is_external(&source, lang)
-            && resolve_import_source(path, &source, lang).is_none()
-            && !is_stdlib(&source, lang)
-            && is_valid_module_path(&source)
+    for source in &import_sources {
+        if is_external(source, lang)
+            && resolve_import_source(path, source, lang).is_none()
+            && !is_stdlib(source, lang)
+            && is_valid_module_path(source)
         {
             external_set.insert(source.clone());
         }
@@ -176,7 +185,8 @@ pub fn analyze_deps(
 
     // ── Phase 3: Reverse dependencies ────────────────────────────────────────
 
-    let mut used_by = if searched_count > 0
+    let mut dependents_complete = true;
+    let used_by = if searched_count > 0
         || matches!(
             lang,
             crate::types::Lang::TypeScript
@@ -197,17 +207,33 @@ pub fn analyze_deps(
         } else {
             HashSet::new()
         };
-        let raw_matches = if is_ts {
-            find_callers_in_files(&importing_files, scope, &symbols_set)
+        let (raw_matches, scan_complete) = if is_ts {
+            (
+                find_callers_in_files(&importing_files, scope, &symbols_set),
+                true,
+            )
         } else {
-            find_callers_batch(
+            crate::search::callers::find_callers_batch_with_size_limit(
                 &symbols_set,
                 scope,
                 bloom,
                 None,
-                crate::search::callers::BATCH_EARLY_QUIT,
+                if full {
+                    usize::MAX
+                } else {
+                    crate::search::callers::BATCH_EARLY_QUIT
+                },
+                if full {
+                    u64::MAX
+                } else {
+                    super::bloom_walk::MAX_FILE_SIZE
+                },
             )?
         };
+
+        if !is_ts && !full {
+            dependents_complete = searched_count == exported_count && scan_complete;
+        }
 
         // Group by file path
         let mut by_file: HashMap<PathBuf, Vec<(String, String, u32)>> = HashMap::new();
@@ -260,7 +286,6 @@ pub fn analyze_deps(
     };
 
     let total_dependents = used_by.len();
-    used_by.truncate(MAX_DEPENDENTS);
 
     Ok(DepsResult {
         target: path.clone(),
@@ -268,6 +293,7 @@ pub fn analyze_deps(
         uses_external,
         used_by,
         total_dependents,
+        dependents_complete,
         exported_count,
         searched_count,
     })
@@ -355,9 +381,36 @@ fn find_importers_impl(
 /// 2. Truncate "Uses (external)" to count only
 /// 3. Truncate "Uses (local)" symbol lists to file paths only
 /// 4. Never truncate the header line
+#[cfg(test)]
 pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> String {
+    format_deps_with_options(result, scope, budget, false)
+}
+
+pub fn format_deps_with_options(
+    result: &DepsResult,
+    scope: &Path,
+    budget: Option<usize>,
+    full: bool,
+) -> String {
     let dep_count = result.total_dependents;
-    let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by.iter().partition(|d| !d.is_test);
+    let local_limit = if full {
+        result.uses_local.len()
+    } else {
+        MAX_LOCAL_DEPENDENCIES.min(result.uses_local.len())
+    };
+    let dependent_limit = if full {
+        result.used_by.len()
+    } else {
+        MAX_DEPENDENTS.min(result.used_by.len())
+    };
+    let (prod_deps, test_deps): (Vec<_>, Vec<_>) = result.used_by[..dependent_limit]
+        .iter()
+        .partition(|d| !d.is_test);
+    let dep_count_label = if result.dependents_complete {
+        dep_count.to_string()
+    } else {
+        format!("at least {dep_count}")
+    };
 
     // ── Build sections (full fidelity first) ─────────────────────────────────
 
@@ -373,16 +426,16 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
         rel_target,
         result.uses_local.len(),
         result.uses_external.len(),
-        dep_count,
+        dep_count_label,
         if dep_count == 1 { "" } else { "s" },
     );
 
-    let uses_local_section = format_uses_local(&result.uses_local, scope, true);
+    let uses_local_section = format_uses_local(&result.uses_local[..local_limit], scope, true);
     let uses_external_section = format_uses_external(&result.uses_external);
     let used_by_section = format_used_by(&prod_deps, scope, "## Used by");
     let used_by_tests_section = format_used_by(&test_deps, scope, "## Used by (tests)");
 
-    let barrel_note = if result.exported_count > MAX_EXPORTED_SYMBOLS {
+    let mut barrel_note = if result.searched_count < result.exported_count {
         format!(
             "\n\n> ({} of {} exported symbols searched)",
             result.searched_count, result.exported_count
@@ -390,6 +443,23 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
     } else {
         String::new()
     };
+    if !result.dependents_complete {
+        barrel_note.push_str("\n\n> Reverse search was capped; dependent counts are lower bounds. Use full output to search all symbols and call sites.");
+    }
+    let hidden_local = result.uses_local.len() - local_limit;
+    if hidden_local > 0 {
+        let _ = write!(
+            barrel_note,
+            "\n\n... and {hidden_local} more local dependencies"
+        );
+    }
+    let hidden_dependents = result.total_dependents.saturating_sub(dependent_limit);
+    if hidden_dependents > 0 {
+        let _ = write!(
+            barrel_note,
+            "\n\n... and {hidden_dependents} more dependents"
+        );
+    }
 
     // Full output
     let mut parts: Vec<String> = Vec::new();
@@ -405,10 +475,6 @@ pub fn format_deps(result: &DepsResult, scope: &Path, budget: Option<usize>) -> 
     }
     if !used_by_tests_section.is_empty() {
         parts.push(used_by_tests_section.clone());
-    }
-    let truncated = result.total_dependents.saturating_sub(result.used_by.len());
-    if truncated > 0 {
-        parts.push(format!("... and {truncated} more dependents"));
     }
     if !barrel_note.is_empty() {
         parts.push(barrel_note.clone());
@@ -595,12 +661,24 @@ fn apply_budget_truncation(
         &Path,
     ) -> String] = &[
         // Level 0: no tests
-        |hdr, ul, ue, pd, _td, bn, sc| {
-            assemble(&[hdr, ul, ue, &format_used_by(pd, sc, "## Used by"), bn])
+        |hdr, ul, ue, pd, td, bn, sc| {
+            let note = if td.is_empty() {
+                String::new()
+            } else {
+                format!("... {} test dependents omitted to fit budget", td.len())
+            };
+            assemble(&[
+                hdr,
+                ul,
+                ue,
+                &format_used_by(pd, sc, "## Used by"),
+                &note,
+                bn,
+            ])
         },
         // Level 1: no used-by entries at all
-        |hdr, ul, ue, pd, _td, bn, _sc| {
-            let count = pd.len();
+        |hdr, ul, ue, pd, td, bn, _sc| {
+            let count = pd.len() + td.len();
             let note = if count > 0 {
                 format!("\n\n(... {count} more dependents)")
             } else {
@@ -662,6 +740,100 @@ fn assemble(parts: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn size_limited_reverse_count_is_a_lower_bound() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.rs");
+        fs::write(&target, "pub fn target() {}\n").unwrap();
+        fs::write(
+            root.path().join("large.rs"),
+            format!(
+                "/* {} */\nfn caller() {{ target(); }}\n",
+                "x".repeat(510_000)
+            ),
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let preview = analyze_deps(&target, root.path(), &bloom).unwrap();
+        assert_eq!(preview.total_dependents, 0);
+        assert!(!preview.dependents_complete);
+        assert!(format_deps(&preview, root.path(), None).contains("at least 0 dependents"));
+        let full = analyze_deps_with_options(&target, root.path(), &bloom, true).unwrap();
+        assert_eq!(full.total_dependents, 1);
+        assert!(full.dependents_complete);
+    }
+
+    #[test]
+    fn full_searches_late_symbols_in_large_caller_files() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.rs");
+        let mut source = String::new();
+        for i in 0..30 {
+            writeln!(source, "pub fn func{i:02}() {{}}").unwrap();
+        }
+        fs::write(&target, source).unwrap();
+        fs::write(root.path().join("small.rs"), "fn caller() { func00(); }\n").unwrap();
+        fs::write(
+            root.path().join("large.rs"),
+            format!(
+                "/* {} */\nfn caller() {{ func29(); }}\n",
+                "x".repeat(510_000)
+            ),
+        )
+        .unwrap();
+        let bloom = crate::index::bloom::BloomFilterCache::new();
+        let preview = analyze_deps(&target, root.path(), &bloom).unwrap();
+        assert!(!preview.dependents_complete);
+        assert_eq!(preview.total_dependents, 1);
+        let full = analyze_deps_with_options(&target, root.path(), &bloom, true).unwrap();
+        assert!(full.dependents_complete);
+        assert_eq!(full.total_dependents, 2);
+        assert!(full.used_by.iter().any(|d| d.path.ends_with("large.rs")));
+    }
+
+    #[test]
+    fn full_dependencies_preserve_counts_and_expand_display() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let mut source = String::new();
+        for i in 0..37 {
+            fs::write(root.join(format!("dep{i}.ts")), "export const value = 1;\n").unwrap();
+            write!(
+                source,
+                "import {{\n value as value{i}\n}} from './dep{i}';\n"
+            )
+            .unwrap();
+        }
+        source.push_str("export function target() {}\n");
+        let path = root.join("target.ts");
+        fs::write(&path, source).unwrap();
+        for i in 0..20 {
+            fs::write(
+                root.join(format!("user{i}.ts")),
+                "import { target } from './target';\ntarget();\n",
+            )
+            .unwrap();
+        }
+        let result =
+            analyze_deps(&path, root, &crate::index::bloom::BloomFilterCache::new()).unwrap();
+        assert_eq!(result.uses_local.len(), 37);
+        assert_eq!(result.total_dependents, 20);
+        assert_eq!(result.used_by.len(), 20);
+        let limited = format_deps(&result, root, Some(20_000));
+        assert!(limited.contains("37 local"));
+        assert!(limited.contains("20 dependents"));
+        assert!(limited.contains("29"));
+        let full = format_deps_with_options(&result, root, Some(20_000), true);
+        for i in 0..37 {
+            assert!(full.contains(&format!("dep{i}.ts")));
+        }
+        for i in 0..20 {
+            assert!(full.contains(&format!("user{i}.ts")));
+        }
+        let small = format_deps_with_options(&result, root, Some(80), true);
+        assert!(small.len() < full.len());
+    }
 
     #[test]
     fn import_then_export_barrel_reports_transitive_dependents() {

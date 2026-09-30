@@ -126,14 +126,35 @@ pub(crate) fn find_callers_batch(
     glob: Option<&str>,
     early_quit_threshold: usize,
 ) -> Result<Vec<(String, CallerMatch)>, TilthError> {
+    find_callers_batch_with_size_limit(
+        targets,
+        scope,
+        bloom,
+        glob,
+        early_quit_threshold,
+        super::bloom_walk::MAX_FILE_SIZE,
+    )
+    .map(|(matches, _)| matches)
+}
+
+pub(crate) fn find_callers_batch_with_size_limit(
+    targets: &HashSet<String>,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    glob: Option<&str>,
+    early_quit_threshold: usize,
+    max_file_size: u64,
+) -> Result<(Vec<(String, CallerMatch)>, bool), TilthError> {
     let matches: Mutex<Vec<(String, CallerMatch)>> = Mutex::new(Vec::new());
     let found_count = AtomicUsize::new(0);
+    let skipped_large = std::sync::atomic::AtomicBool::new(false);
 
     let walker = super::walker(scope, glob)?;
 
     walker.run(|| {
         let matches = &matches;
         let found_count = &found_count;
+        let skipped_large = &skipped_large;
 
         Box::new(move |entry| {
             // Early termination: enough callers found
@@ -151,13 +172,17 @@ pub(crate) fn find_callers_batch(
 
             let path = entry.path();
 
+            if matches!(detect_file_type(path), FileType::Code(_))
+                && std::fs::metadata(path).is_ok_and(|meta| meta.len() > max_file_size)
+            {
+                skipped_large.store(true, Ordering::Relaxed);
+                return ignore::WalkState::Continue;
+            }
+
             // Read + size-gate + bloom prefilter in one shared step.
-            let Some((content, _mtime)) = super::bloom_walk::read_with_bloom_check(
-                path,
-                targets,
-                bloom,
-                super::bloom_walk::MAX_FILE_SIZE,
-            ) else {
+            let Some((content, _mtime)) =
+                super::bloom_walk::read_with_bloom_check(path, targets, bloom, max_file_size)
+            else {
                 return ignore::WalkState::Continue;
             };
 
@@ -195,9 +220,14 @@ pub(crate) fn find_callers_batch(
         })
     });
 
-    Ok(matches
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner))
+    let complete = !skipped_large.load(Ordering::Relaxed)
+        && found_count.load(Ordering::Relaxed) < early_quit_threshold;
+    Ok((
+        matches
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        complete,
+    ))
 }
 
 /// Tree-sitter call site detection for a set of target symbols.

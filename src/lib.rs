@@ -214,10 +214,25 @@ pub fn run_deps(
     scope: &Path,
     budget_tokens: Option<u64>,
 ) -> Result<String, TilthError> {
+    run_deps_with_options(path, scope, budget_tokens, false)
+}
+
+/// Analyze dependencies with optional full collection and display.
+pub fn run_deps_with_options(
+    path: &Path,
+    scope: &Path,
+    budget_tokens: Option<u64>,
+    full: bool,
+) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
-    let result = search::deps::analyze_deps(path, scope, &bloom)?;
+    let result = search::deps::analyze_deps_with_options(path, scope, &bloom, full)?;
     let budget_usize = budget_tokens.map(|b| b as usize);
-    Ok(search::deps::format_deps(&result, scope, budget_usize))
+    Ok(search::deps::format_deps_with_options(
+        &result,
+        scope,
+        budget_usize,
+        full,
+    ))
 }
 
 /// Grok a symbol: return def + doc + callees + callers + siblings + tests in one call.

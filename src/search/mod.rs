@@ -1086,7 +1086,9 @@ fn format_single_match(
         if !fence_will_follow {
             let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
         }
-    } else if let Some(context) = outline_context_for_match(&m.path, m.line, cache) {
+    } else if let Some(context) =
+        outline_context_for_definition(&m.path, m.line, m.def_name.as_deref(), cache)
+    {
         out.push_str(&context);
     } else if !fence_will_follow {
         let _ = write!(out, "\n-> [{}]   {}", m.line, m.text);
@@ -1903,15 +1905,41 @@ fn outline_context_for_match(
     match_line: u32,
     cache: &OutlineCache,
 ) -> Option<String> {
+    outline_context_for_definition(path, match_line, None, cache)
+}
+
+fn outline_context_for_definition(
+    path: &std::path::Path,
+    match_line: u32,
+    preferred_name: Option<&str>,
+    cache: &OutlineCache,
+) -> Option<String> {
     let outline_str = get_outline_str(path, cache)?;
     let outline_lines: Vec<&str> = outline_str.lines().collect();
     if outline_lines.is_empty() {
         return None;
     }
 
-    let match_idx = outline_lines.iter().position(|line| {
-        extract_line_range(line).is_some_and(|(s, e)| match_line >= s && match_line <= e)
-    })?;
+    let match_idx = outline_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let (start, end) = extract_line_range(line)?;
+            (start <= match_line && match_line <= end).then_some((
+                preferred_name.is_some_and(|name| line.split_whitespace().nth(2) != Some(name)),
+                end - start,
+                // Definitions retain declaration order for same-named entries
+                // (e.g. a class and its constructor). Usages prefer children.
+                if preferred_name.is_some() {
+                    index
+                } else {
+                    usize::MAX - index
+                },
+                index,
+            ))
+        })
+        .min_by_key(|&(mismatch, span, order, _)| (mismatch, span, order))
+        .map(|(_, _, _, index)| index)?;
 
     let start = match_idx.saturating_sub(2);
     let end = (match_idx + 3).min(outline_lines.len());
@@ -2226,6 +2254,86 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn definition_context_keeps_class_when_constructor_has_same_name_and_range() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Example.cs");
+        fs::write(
+            &path,
+            "class Example { public Example() {\n target();\n} }\n",
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let context = outline_context_for_definition(&path, 1, Some("Example"), &cache).unwrap();
+        assert!(
+            context
+                .lines()
+                .find(|line| line.starts_with("->"))
+                .unwrap()
+                .contains("class Example"),
+            "{context}"
+        );
+        let usage = outline_context_for_match(&path, 2, &cache).unwrap();
+        assert!(
+            usage
+                .lines()
+                .find(|line| line.starts_with("->"))
+                .unwrap()
+                .contains("fn Example"),
+            "{usage}"
+        );
+    }
+
+    #[test]
+    fn outline_context_equal_ranges_prefer_deeper_scope_and_named_definition() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("service.ts");
+        fs::write(&path, "class Example { method() {\n target();\n} }\n").unwrap();
+        let cache = OutlineCache::new();
+        let usage = outline_context_for_match(&path, 2, &cache).unwrap();
+        assert!(
+            usage
+                .lines()
+                .find(|line| line.starts_with("->"))
+                .unwrap()
+                .contains("method"),
+            "{usage}"
+        );
+        let class = outline_context_for_definition(&path, 1, Some("Example"), &cache).unwrap();
+        assert!(
+            class
+                .lines()
+                .find(|line| line.starts_with("->"))
+                .unwrap()
+                .contains("class Example"),
+            "{class}"
+        );
+        let method = outline_context_for_definition(&path, 1, Some("method"), &cache).unwrap();
+        assert!(
+            method
+                .lines()
+                .find(|line| line.starts_with("->"))
+                .unwrap()
+                .contains("method"),
+            "{method}"
+        );
+    }
+
+    #[test]
+    fn outline_context_marks_method_inside_large_class() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("service.ts");
+        let source = format!(
+            "class Service {{\n first() {{}}\n{} target() {{\n return 42;\n }}\n}}\n",
+            "\n".repeat(60)
+        );
+        fs::write(&path, source).unwrap();
+        let context = outline_context_for_match(&path, 63, &OutlineCache::new()).unwrap();
+        let marked = context.lines().find(|line| line.starts_with("->")).unwrap();
+        assert!(marked.contains("target"), "{context}");
+        assert!(!marked.contains("class Service"), "{context}");
+    }
 
     #[test]
     fn missing_requested_scope_is_error_and_successful_scope_is_lower_bound() {

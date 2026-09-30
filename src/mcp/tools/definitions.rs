@@ -156,7 +156,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             }
         }),
         serde_json::json!({
-            "name": "tilth_deps",
+              "name": "tilth_deps",
             "annotations": { "readOnlyHint": true },
             "description": "Blast-radius check before breaking changes. Shows what a file imports (local + external) and what other files call its exports, with symbol-level detail. Use ONLY when your planned edit changes a function signature, removes/renames an export, or modifies behavior that callers rely on. Do NOT use for reading files, adding new code, or internal-only changes — use tilth_read instead.",
             "inputSchema": {
@@ -171,10 +171,14 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Directory to search for dependents. Default: project root."
                     },
-                    "budget": {
+                      "budget": {
                         "type": "number",
                         "description": "Max tokens. Truncates 'Used by' first."
-                    },
+                      },
+                      "full": {
+                          "type": "boolean",
+                          "description": "Search all symbols and call sites and show all dependencies. Explicit budget still applies. Default: false."
+                      },
                     "root": {
                         "type": "string",
                         "description": "Absolute project root; anchors relative paths and scopes. Required with any relative path/scope."

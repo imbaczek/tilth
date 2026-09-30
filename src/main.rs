@@ -42,6 +42,8 @@ struct Cli {
     /// by `--budget`.
     ///
     /// Glob: no effect (glob queries already return a flat file list).
+    ///
+    /// Deps: search all symbols/call sites and show all dependencies, within --budget.
     #[arg(long)]
     full: bool,
 
@@ -334,7 +336,7 @@ fn main() {
     if cli.deps {
         let result = run_query_for_scopes(&scopes, &query, cli.budget, |scope| {
             let path = resolve_query_path(&query, scope);
-            tilth::run_deps(&path, scope, cli.budget)
+            tilth::run_deps_with_options(&path, scope, cli.budget, cli.full)
         });
         emit_result(result, &query, cli.json, is_tty);
         return;

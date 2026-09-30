@@ -11,6 +11,24 @@ use crate::types::{FileType, Lang};
 
 const MAX_SUGGESTIONS: usize = 8;
 
+/// Collect all static import sources for dependency analysis, rather than a
+/// preview of related files. JS syntax traversal includes multiline imports,
+/// re-exports and literal `CommonJS` requires.
+pub(crate) fn dependency_import_sources(content: &str, lang: Lang) -> Vec<String> {
+    if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+        return js_module_sources(content, lang)
+            .into_iter()
+            .map(|(source, _)| source)
+            .collect();
+    }
+    content
+        .lines()
+        .filter(|line| is_import_line(line, lang))
+        .map(|line| crate::lang::outline::extract_import_source(line, Some(lang)))
+        .filter(|source| !source.is_empty())
+        .collect()
+}
+
 /// Extract import sources from a code file and resolve them to existing local file paths.
 /// Returns empty Vec for non-code files, files with no imports, or when all imports are external.
 pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
