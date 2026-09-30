@@ -198,14 +198,62 @@ pub fn run_callers(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let bloom = index::bloom::BloomFilterCache::new();
     let expand = if expand > 0 { expand } else { 2 };
-    let output =
-        search::callers::search_callers_expanded(target, scope, &bloom, expand, None, glob, full)?;
+    run_callers_paginated(target, scope, expand, budget_tokens, glob, full, (0, None))
+}
+
+/// Find a page of ranked direct callers. Pagination is independent of the
+/// output budget; the offset is zero-based and the limit defaults to 10/100.
+pub fn run_callers_paginated(
+    target: &str,
+    scope: &Path,
+    expand: usize,
+    budget_tokens: Option<u64>,
+    glob: Option<&str>,
+    full: bool,
+    page: (usize, Option<usize>),
+) -> Result<String, TilthError> {
+    let bloom = index::bloom::BloomFilterCache::new();
+    let output = search::callers::search_callers_page(
+        target,
+        scope,
+        &bloom,
+        expand,
+        None,
+        glob,
+        (page.0, page.1.unwrap_or(if full { 100 } else { 10 }).max(1)),
+    )?;
     match budget_tokens {
-        Some(b) => Ok(budget::apply(&output, b)),
+        Some(b) => Ok(apply_callers_output_budget(&output, b)),
         None => Ok(output),
     }
+}
+
+/// Cap caller output without advertising a next page past budget-hidden sites.
+/// When the requested page cannot fit, retry the same offset with a smaller
+/// limit rather than advancing to the originally requested page end.
+#[must_use]
+pub fn apply_callers_output_budget(output: &str, budget_tokens: u64) -> String {
+    use std::fmt::Write as _;
+    if types::estimate_tokens(output.len() as u64) <= budget_tokens {
+        return output.to_owned();
+    }
+    let mut safe = String::new();
+    for line in output.lines() {
+        if line.starts_with("> Showing call sites ") {
+            if let Some(offset) = line
+                .split_once("(offset ")
+                .and_then(|(_, rest)| rest.split_once(','))
+                .map(|(offset, _)| offset)
+            {
+                let _ = writeln!(safe, "> Budget may truncate this page. Retry --offset {offset} with a smaller --limit before advancing.");
+                continue;
+            }
+        }
+        safe.push_str(line);
+        safe.push('\n');
+    }
+    budget::apply(&safe, budget_tokens)
 }
 
 /// Analyze blast-radius dependencies of a file.

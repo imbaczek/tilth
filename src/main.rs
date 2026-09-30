@@ -37,8 +37,8 @@ struct Cli {
     ///
     /// File path: return the whole file instead of an outline (bypass smart view).
     ///
-    /// Symbol / text / regex: inline source for every match (equivalent to
-    /// `--expand=<all>`). Explicit `--expand=N` wins. Output stays bounded
+    /// Symbol / text / regex / callers: show up to 100 matches and inline
+    /// source for up to 50. Explicit `--expand=N` wins. Output stays bounded
     /// by `--budget`.
     ///
     /// Glob: no effect (glob queries already return a flat file list).
@@ -67,7 +67,7 @@ struct Cli {
     ///
     /// Applies to symbol / text / regex queries. Without the flag the
     /// result is just the outline summary. `--full` upgrades this to
-    /// expand every match (subject to `--budget`); explicit `--expand=N`
+    /// expand up to 50 matches (subject to `--budget`); explicit `--expand=N`
     /// wins over `--full`. No effect on file-path or glob queries.
     #[arg(long, num_args = 0..=1, default_missing_value = "2", require_equals = true)]
     expand: Option<usize>,
@@ -76,7 +76,16 @@ struct Cli {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Find all callers of a symbol.
+    /// Skip N ranked call sites per scope (0-based; requires --callers).
+    #[arg(long, requires = "callers")]
+    offset: Option<usize>,
+
+    /// Call sites per page per scope (default 10, or 100 with --full).
+    /// Output remains subject to --budget. Requires --callers.
+    #[arg(long, requires = "callers")]
+    limit: Option<std::num::NonZeroUsize>,
+
+    /// Find callers of a symbol; use --offset and --limit to paginate.
     #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
     callers: bool,
 
@@ -161,6 +170,10 @@ enum Command {
         #[arg(long, default_value = ".")]
         scope: PathBuf,
 
+        /// Max tokens in response (also accepted before grok).
+        #[arg(long)]
+        budget: Option<u64>,
+
         /// Widen output caps (more callers, callees, siblings, tests).
         #[arg(long)]
         full: bool,
@@ -203,10 +216,14 @@ fn main() {
                 target,
                 scope,
                 full,
+                budget,
             } => {
                 let scope = scope.canonicalize().unwrap_or(scope);
                 match tilth::run_grok(&target, &scope, full) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Ok(output) => emit_output(
+                        &apply_optional_budget(output, budget.or(cli.budget)),
+                        io::stdout().is_terminal(),
+                    ),
                     Err(e) => {
                         eprintln!("grok error: {e}");
                         process::exit(e.exit_code());
@@ -318,15 +335,20 @@ fn main() {
 
     // Callers mode
     if cli.callers {
-        let result = run_query_for_scopes(&scopes, &query, cli.budget, |scope| {
-            tilth::run_callers(
+        let result = run_query_for_scopes(&scopes, &query, None, |scope| {
+            tilth::run_callers_paginated(
                 &query,
                 scope,
                 expand,
-                cli.budget,
+                None,
                 cli.glob.as_deref(),
                 cli.full,
+                (cli.offset.unwrap_or(0), cli.limit.map(|limit| limit.get())),
             )
+        });
+        let result = result.map(|output| match cli.budget {
+            Some(budget) => tilth::apply_callers_output_budget(&output, budget),
+            None => output,
         });
         emit_result(result, &query, cli.json, is_tty);
         return;

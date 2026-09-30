@@ -623,7 +623,28 @@ pub fn search_callers_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    search_callers_page(
+        target,
+        scope,
+        bloom,
+        expand,
+        context,
+        glob,
+        (0, if full { FULL_MAX_MATCHES } else { MAX_MATCHES }),
+    )
+}
+
+/// Render a zero-based page of ranked callers, with complete impact summaries.
+pub fn search_callers_page(
+    target: &str,
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    page: (usize, usize),
+) -> Result<String, TilthError> {
+    let (offset, limit) = (page.0, page.1.max(1));
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
     let raw = find_all_callers_batch(&single, scope, bloom, glob)?;
     let callers: Vec<CallerMatch> = raw.into_iter().map(|(_, m)| m).collect();
@@ -650,10 +671,20 @@ pub fn search_callers_expanded(
         .iter()
         .map(|c| (c.path.clone(), c.line))
         .collect();
-    sorted_callers.truncate(max_matches);
+    let start = offset.min(total);
+    let end = start.saturating_add(limit).min(total);
+    let page_callers = &sorted_callers[start..end];
 
     let mut output = String::new();
-    write_caller_bucket(&mut output, target, scope, total, &sorted_callers, expand);
+    write_caller_bucket(
+        &mut output,
+        target,
+        scope,
+        total,
+        page_callers,
+        expand,
+        (offset, limit),
+    );
     write_second_hop_impact(
         &mut output,
         &all_caller_names,
@@ -686,6 +717,7 @@ fn write_caller_bucket(
     total: usize,
     sorted_callers: &[CallerMatch],
     expand: usize,
+    page: (usize, usize),
 ) {
     let _ = writeln!(
         output,
@@ -696,8 +728,17 @@ fn write_caller_bucket(
         if total == 1 { "" } else { "s" }
     );
 
-    if total > sorted_callers.len() {
-        let _ = writeln!(output, "> Showing {} of {} found call sites; {} call sites omitted. Use --full or narrow the scope to see more.", sorted_callers.len(), total, total - sorted_callers.len());
+    let (offset, limit) = page;
+    let start = offset.min(total);
+    let end = start.saturating_add(sorted_callers.len()).min(total);
+    if sorted_callers.is_empty() {
+        let _ = writeln!(output, "> No call sites at offset {offset}; {total} found.");
+    } else {
+        let _ = write!(output, "> Showing call sites {}-{end} of {total} (offset {offset}, limit {limit}); {} call sites omitted.", start + 1, total - sorted_callers.len());
+        if end < total {
+            let _ = write!(output, " Next page: --offset {end} --limit {limit} (keep the same query, scope and filters).");
+        }
+        output.push('\n');
     }
 
     for (i, caller) in sorted_callers.iter().enumerate() {
@@ -904,7 +945,15 @@ pub fn search_callers_multi_expanded(
         let all_direct_locations = callers.iter().map(|c| (c.path.clone(), c.line)).collect();
         callers.truncate(max_matches);
 
-        write_caller_bucket(&mut output, target, scope, total, &callers, expand);
+        write_caller_bucket(
+            &mut output,
+            target,
+            scope,
+            total,
+            &callers,
+            expand,
+            (0, max_matches),
+        );
         write_second_hop_impact(
             &mut output,
             &all_caller_names,
