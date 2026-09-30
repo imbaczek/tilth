@@ -125,16 +125,19 @@ pub(crate) fn parse_unified_diff(raw: &str) -> Vec<FileDiff> {
         if let Some(hunk) = current_hunk.as_mut() {
             if let Some(content) = line.strip_prefix('+') {
                 hunk.lines.push(DiffLine {
+                    line: None,
                     kind: DiffLineKind::Added,
                     content: content.to_owned(),
                 });
             } else if let Some(content) = line.strip_prefix('-') {
                 hunk.lines.push(DiffLine {
+                    line: None,
                     kind: DiffLineKind::Removed,
                     content: content.to_owned(),
                 });
             } else if let Some(content) = line.strip_prefix(' ') {
                 hunk.lines.push(DiffLine {
+                    line: None,
                     kind: DiffLineKind::Context,
                     content: content.to_owned(),
                 });

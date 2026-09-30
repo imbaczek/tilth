@@ -50,6 +50,8 @@ pub struct Hunk {
 
 #[derive(Debug)]
 pub struct DiffLine {
+    /// Actual source line for rendered attribution (old side for removals).
+    pub line: Option<u32>,
     pub kind: DiffLineKind,
     pub content: String,
 }
@@ -67,6 +69,7 @@ pub struct DiffSymbol {
     pub identity: SymbolIdentity,
     pub content_hash: u64,
     pub structural_hash: u64,
+    pub signature_hash: u64,
     pub source_text: String,
 }
 
@@ -84,9 +87,16 @@ pub struct SymbolChange {
     pub change: ChangeType,
     pub match_confidence: MatchConfidence,
     pub line: u32,
+    pub old_line: Option<u32>,
+    pub structural_hash: u64,
     pub old_sig: Option<String>,
     pub new_sig: Option<String>,
     pub size_delta: Option<(u32, u32)>,
+}
+
+/// Internal attribution key: overloads and same-named methods stay distinct.
+pub(crate) fn symbol_key(change: &SymbolChange) -> String {
+    format!("{}@{}", change.name, change.line)
 }
 
 #[derive(Debug, Clone)]
@@ -174,10 +184,20 @@ pub fn resolve_source(
 ///
 /// Git runs inside `repo` when one is provided (the caller's checkout);
 /// otherwise in the process cwd, exactly as before `repo` existed.
-fn run_git_diff(
+fn run_git_diff_scoped(
     source: &DiffSource,
     repo: Option<&Path>,
     scope: Option<&str>,
+) -> Result<String, String> {
+    run_git_diff_query(source, repo, scope, &[], &[])
+}
+
+fn run_git_diff_query(
+    source: &DiffSource,
+    repo: Option<&Path>,
+    scope: Option<&str>,
+    extra: &[String],
+    paths: &[PathBuf],
 ) -> Result<String, String> {
     use std::process::Command;
 
@@ -212,6 +232,7 @@ fn run_git_diff(
         "--src-prefix=a/",
         "--dst-prefix=b/",
     ]);
+    cmd.args(extra);
 
     match source {
         DiffSource::GitUncommitted => {
@@ -231,19 +252,21 @@ fn run_git_diff(
         DiffSource::Patch(_) | DiffSource::Log(_) => unreachable!(),
     }
 
-    if let Some(scope) = scope.filter(|_| {
-        matches!(
-            source,
-            DiffSource::GitUncommitted | DiffSource::GitStaged | DiffSource::GitRef(_)
-        )
-    }) {
-        let paths = scoped_git_paths(source, repo, scope)?;
-        if paths.is_empty() {
-            return Ok(String::new());
-        }
-        cmd.arg("--");
-        for path in paths {
-            cmd.arg(format!(":(literal){}", path.display()));
+    if !matches!(source, DiffSource::Files(..)) {
+        if !paths.is_empty() {
+            cmd.arg("--");
+            for path in paths {
+                cmd.arg(format!(":(literal){}", path.display()));
+            }
+        } else if let Some(scope) = scope {
+            let paths = scoped_git_paths(source, repo, scope)?;
+            if paths.is_empty() {
+                return Ok(String::new());
+            }
+            cmd.arg("--");
+            for path in paths {
+                cmd.arg(format!(":(literal){}", path.display()));
+            }
         }
     }
 
@@ -388,18 +411,93 @@ pub fn diff(
     _expand: usize,
     budget: Option<u64>,
 ) -> Result<String, String> {
+    // Git emits repository-relative paths even when invoked in a subdirectory.
+    // Anchor both blob and working-tree reads to the same repository root.
+    let git_root = if matches!(
+        source,
+        DiffSource::GitUncommitted
+            | DiffSource::GitStaged
+            | DiffSource::GitRef(_)
+            | DiffSource::Log(_)
+    ) {
+        let mut cmd = Command::new("git");
+        if let Some(repo) = repo {
+            cmd.current_dir(repo);
+        }
+        let output = cmd
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .map_err(|e| format!("failed to locate repository: {e}"))?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+        }
+        Some(PathBuf::from(
+            String::from_utf8_lossy(&output.stdout).trim(),
+        ))
+    } else {
+        None
+    };
+    let repo = git_root.as_deref().or(repo);
+    let normalized_scope = scope.map(|scope| {
+        let (path, symbol) = scope
+            .split_once(':')
+            .map_or((scope, None), |(path, symbol)| (path, Some(symbol)));
+        let path = Path::new(path);
+        let path = repo
+            .and_then(|root| path.strip_prefix(root).ok())
+            .unwrap_or(path);
+        let path: PathBuf = path
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect();
+        let path = if path.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            path
+        };
+        let path = path.to_string_lossy();
+        symbol.map_or_else(|| path.to_string(), |symbol| format!("{path}:{symbol}"))
+    });
+    let scope = normalized_scope.as_deref();
     // Log mode has its own pipeline.
     if let DiffSource::Log(range) = source {
         return diff_log(range, repo, scope, budget);
     }
 
-    let raw = run_git_diff(source, repo, scope)?;
+    let raw = run_git_diff_scoped(source, repo, scope)?;
     if raw.is_empty() {
+        if let Some(scope) = scope {
+            let path = scope.split_once(':').map_or(scope, |(path, _)| path);
+            let disk = repo.map_or_else(|| PathBuf::from(path), |repo| repo.join(path));
+            if !disk.exists() && !scope.ends_with('/') {
+                return Err(format!("file '{path}' not found in diff"));
+            }
+        }
         return Ok("No changes.".to_string());
     }
 
     // 1. Parse raw unified diff.
-    let file_diffs = parse::parse_unified_diff(&raw);
+    let mut file_diffs = parse::parse_unified_diff(&raw);
+    let directory_scope = scope
+        .and_then(|scope| directory_scope_path(scope, repo))
+        .and_then(|(directory, exists)| {
+            (exists
+                || scope.is_some_and(|scope| scope.ends_with('/'))
+                || file_diffs_have_descendant_paths(&file_diffs, &directory))
+            .then_some(directory)
+        });
+    if let Some(scope) = scope {
+        let path = scope.split_once(':').map_or(scope, |(path, _)| path);
+        file_diffs.retain(|fd| {
+            let matches = |file: &Path| {
+                directory_scope.as_ref().map_or_else(
+                    || file.to_string_lossy().ends_with(path),
+                    |directory| file.starts_with(directory),
+                )
+            };
+            matches(&fd.path) || fd.old_path.as_deref().is_some_and(matches)
+        });
+    }
     if file_diffs.is_empty() {
         return Ok("No changes.".to_string());
     }
@@ -413,68 +511,25 @@ pub fn diff(
         .map(|fd| overlay::compute_overlay(fd, source, repo))
         .collect();
 
-    // A scoped patch omits the other half of a symbol move. Look for changed
-    // files mentioning added/deleted symbol names, then include their overlays
-    // only while resolving cross-file matches.
-    let scoped_len = overlays.len();
-    if scope.is_some()
-        && matches!(
-            source,
-            DiffSource::GitUncommitted | DiffSource::GitStaged | DiffSource::GitRef(_)
-        )
-    {
-        let names: HashSet<&str> = overlays
-            .iter()
-            .flat_map(|overlay| &overlay.symbol_changes)
-            .filter(|change| matches!(change.change, ChangeType::Added | ChangeType::Deleted))
-            .map(|change| change.name.as_str())
-            .collect();
-        if !names.is_empty() {
-            let all_raw = run_git_diff(source, repo, None)?;
-            let other_diffs: Vec<FileDiff> = parse::parse_unified_diff(&all_raw)
-                .into_iter()
-                .filter(|fd| {
-                    !file_diffs.iter().any(|scoped| scoped.path == fd.path)
-                        && fd.hunks.iter().any(|hunk| {
-                            hunk.lines
-                                .iter()
-                                .any(|line| names.iter().any(|name| line.content.contains(name)))
-                        })
-                })
-                .collect();
-            let other_overlays: Vec<FileOverlay> = other_diffs
-                .par_iter()
-                .map(|fd| overlay::compute_overlay(fd, source, repo))
-                .collect();
-            overlays.extend(other_overlays);
-        }
-    }
-    // 3. Cross-file move detection.
+    // 3. Discover a bounded set of move candidates by changed-line names.
+    // Git returns only paths here; never fetch an unscoped patch as fallback.
+    let move_warning = if scope.is_some() {
+        extend_move_candidates(&mut overlays, source, repo)?
+    } else {
+        None
+    };
     overlay::cross_file_matching(&mut overlays);
-    overlays.truncate(scoped_len);
-    let directory_scope = scope
-        .and_then(|scope| directory_scope_path(scope, repo))
-        .and_then(|(directory, exists)| {
-            if exists || file_diffs_have_descendant_paths(&file_diffs, &directory) {
-                Some(directory)
-            } else {
-                None
-            }
-        });
+    let selected_paths: HashSet<_> = file_diffs.iter().map(|fd| fd.path.clone()).collect();
+    overlays.retain(|overlay| selected_paths.contains(&overlay.path));
     if let Some(directory) = &directory_scope {
         overlays.retain(|overlay| overlay_matches_directory_scope(overlay, &file_diffs, directory));
-        if overlays.is_empty() {
-            return Ok("No changes.".to_string());
-        }
     }
-    let scope = if directory_scope.is_some() {
-        None
-    } else {
-        scope
-    };
 
     // 4. Signature warnings.
     let mut warnings = overlay::signature_warnings(&overlays);
+    if let Some(warning) = move_warning {
+        warnings.push(warning);
+    }
 
     // 5. Search filter.
     if let Some(term) = search {
@@ -506,12 +561,23 @@ pub fn diff(
     let label = source_label(source);
     let mut output = match scope {
         None => format::format_overview(&overlays, &file_meta, &warnings, &label, budget),
+        Some(_) if directory_scope.is_some() => {
+            format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+        }
         Some(s) if s.contains(':') => {
             // file:function scope
             let (file_part, fn_name) = s.split_once(':').unwrap();
             match overlays.iter().find(|o| {
                 let p = o.path.to_string_lossy();
-                p == file_part || p.ends_with(file_part)
+                p == file_part
+                    || p.ends_with(file_part)
+                    || file_diffs.iter().any(|fd| {
+                        fd.path == o.path
+                            && fd
+                                .old_path
+                                .as_ref()
+                                .is_some_and(|old| old.to_string_lossy().ends_with(file_part))
+                    })
             }) {
                 Some(o) => format::format_function_detail(o, fn_name),
                 None => return Err(format!("file '{file_part}' not found in diff")),
@@ -520,13 +586,36 @@ pub fn diff(
         Some(file) => {
             match overlays.iter().find(|o| {
                 let p = o.path.to_string_lossy();
-                p == file || p.ends_with(file)
+                p == file
+                    || p.ends_with(file)
+                    || file_diffs.iter().any(|fd| {
+                        fd.path == o.path
+                            && fd
+                                .old_path
+                                .as_ref()
+                                .is_some_and(|old| old.to_string_lossy().ends_with(file))
+                    })
             }) {
                 Some(o) => format::format_file_detail(o, budget),
+                None if file == "." || overlays.iter().any(|o| o.path.starts_with(file)) => {
+                    format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+                }
                 None => return Err(format!("file '{file}' not found in diff")),
             }
         }
     };
+
+    if scope.is_some_and(|scope| {
+        overlays
+            .iter()
+            .any(|o| o.path == Path::new(scope.split_once(':').map_or(scope, |(path, _)| path)))
+    }) {
+        for warning in &warnings {
+            output.push('\n');
+            output.push_str(warning);
+            output.push('\n');
+        }
+    }
 
     // 9. Conflict detection for uncommitted diffs.
     if matches!(source, DiffSource::GitUncommitted) {
@@ -676,6 +765,83 @@ fn overlay_matches_directory_scope(
         })
 }
 
+/// Extend scoped overlays with a bounded set of possible move counterparts.
+fn extend_move_candidates(
+    overlays: &mut Vec<FileOverlay>,
+    source: &DiffSource,
+    repo: Option<&Path>,
+) -> Result<Option<String>, String> {
+    const CANDIDATE_LIMIT: usize = 64;
+    if !matches!(
+        source,
+        DiffSource::GitUncommitted | DiffSource::GitStaged | DiffSource::GitRef(_)
+    ) {
+        return Ok(None);
+    }
+    let mut names: Vec<_> = overlays
+        .iter()
+        .flat_map(|o| &o.symbol_changes)
+        .filter(|c| matches!(c.change, ChangeType::Added | ChangeType::Deleted))
+        .filter(|c| !matches!(c.kind, OutlineKind::Import | OutlineKind::Export))
+        .map(|c| c.name.rsplit("::").next().unwrap_or(&c.name).to_string())
+        .collect();
+    names.sort();
+    names.dedup();
+    if names.is_empty() {
+        return Ok(None);
+    }
+    let limited = || {
+        Some(format!("warning: cross-scope move detection skipped (more than {CANDIDATE_LIMIT} candidate names or files)"))
+    };
+    if names.len() > CANDIDATE_LIMIT {
+        return Ok(limited());
+    }
+    let escaped: Vec<String> = names
+        .iter()
+        .map(|name| {
+            name.chars().fold(String::new(), |mut out, ch| {
+                if ".[](){}?*+^$|\\".contains(ch) {
+                    out.push('\\');
+                }
+                out.push(ch);
+                out
+            })
+        })
+        .collect();
+    let pattern = format!(
+        "(^|[^[:alnum:]_$])({})($|[^[:alnum:]_$])",
+        escaped.join("|")
+    );
+    let raw = run_git_diff_query(
+        source,
+        repo,
+        None,
+        &["--name-only".into(), "-z".into(), format!("-G{pattern}")],
+        &[],
+    )?;
+    let paths: Vec<_> = raw
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| !overlays.iter().any(|overlay| &overlay.path == path))
+        .collect();
+    if paths.len() > CANDIDATE_LIMIT {
+        return Ok(limited());
+    }
+    if !paths.is_empty() {
+        let raw = run_git_diff_query(source, repo, None, &[], &paths)?;
+        let mut files = parse::parse_unified_diff(&raw);
+        files.retain(|file| !overlays.iter().any(|overlay| overlay.path == file.path));
+        overlays.extend(
+            files
+                .par_iter()
+                .map(|file| overlay::compute_overlay(file, source, repo))
+                .collect::<Vec<_>>(),
+        );
+    }
+    Ok(None)
+}
+
 /// Human-readable label for a diff source.
 fn source_label(source: &DiffSource) -> String {
     match source {
@@ -711,7 +877,7 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
             .symbol_changes
             .iter()
             .filter(|c| c.name.to_lowercase().contains(&lower_term))
-            .map(|c| c.name.clone())
+            .map(symbol_key)
             .collect();
 
         let all_matching: HashSet<String> =
@@ -723,7 +889,7 @@ fn filter_by_search(overlays: &mut Vec<FileOverlay>, term: &str) {
 
         overlay
             .symbol_changes
-            .retain(|c| all_matching.contains(&c.name));
+            .retain(|c| all_matching.contains(&symbol_key(c)));
         overlay
             .attributed_hunks
             .retain(|(name, _)| all_matching.contains(name));
@@ -741,7 +907,7 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
         .iter()
         .flat_map(|o| o.symbol_changes.iter())
         .filter(|c| matches!(c.change, ChangeType::SignatureChanged))
-        .map(|c| c.name.clone())
+        .map(|c| c.name.rsplit("::").next().unwrap_or(&c.name).to_string())
         .collect();
 
     if sig_changed.is_empty() {
@@ -754,20 +920,15 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
     };
     let bloom = crate::index::bloom::BloomFilterCache::new();
 
-    match crate::search::callers::find_callers_batch(
-        &sig_changed,
-        &scope,
-        &bloom,
-        None,
-        crate::search::callers::BATCH_EARLY_QUIT,
-    ) {
+    match crate::search::callers::find_callers_batch(&sig_changed, &scope, &bloom, None, usize::MAX)
+    {
         Ok(matches) => {
             let mut counts: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();
             for (target, _) in &matches {
                 *counts.entry(target.clone()).or_default() += 1;
             }
-            counts
+            let mut warnings: Vec<_> = counts
                 .into_iter()
                 .map(|(name, count)| {
                     format!(
@@ -775,7 +936,9 @@ fn compute_blast(overlays: &[FileOverlay], repo: Option<&Path>) -> Vec<String> {
                         if count == 1 { "" } else { "s" }
                     )
                 })
-                .collect()
+                .collect();
+            warnings.sort();
+            warnings
         }
         Err(_) => Vec::new(),
     }
@@ -828,7 +991,11 @@ fn diff_log(
         // Run diff for this commit.
         let ref_str = format!("{hash}^..{hash}");
         let commit_source = DiffSource::GitRef(ref_str);
-        let raw = run_git_diff(&commit_source, repo, None)?;
+        let raw = match run_git_diff_scoped(&commit_source, repo, scope) {
+            Ok(raw) => raw,
+            Err(error) if scope.is_some() && error.ends_with("not found in diff") => continue,
+            Err(error) => return Err(error),
+        };
         let file_diffs = parse::parse_unified_diff(&raw);
 
         let mut overlays: Vec<FileOverlay> = file_diffs
@@ -849,7 +1016,15 @@ fn diff_log(
         } else if let Some(file_scope) = scope {
             overlays.retain(|overlay| {
                 let path = overlay.path.to_string_lossy();
-                path == file_scope || path.ends_with(file_scope)
+                path == file_scope
+                    || path.ends_with(file_scope)
+                    || file_diffs.iter().any(|fd| {
+                        fd.path == overlay.path
+                            && fd
+                                .old_path
+                                .as_ref()
+                                .is_some_and(|old| old.to_string_lossy().ends_with(file_scope))
+                    })
             });
         }
 
@@ -863,7 +1038,7 @@ fn diff_log(
     }
 
     if scope.is_some() {
-        summaries.retain(|summary| !summary.overlays.is_empty());
+        summaries.retain(|s| !s.overlays.is_empty());
     }
 
     if summaries.is_empty() {
@@ -960,6 +1135,285 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, "No changes.");
+    }
+
+    #[test]
+    fn scoped_typescript_detail_uses_both_sides_once() {
+        let dir = setup_test_repo();
+        let path = dir.path().join("src/service.ts");
+        let before = "export class A {\n  run() {\n    return 1;\n  }\n}\nexport class B {\n  run() {\n    return 10;\n  }\n}\n";
+        fs::write(&path, before).unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "baseline typescript"]);
+        fs::write(
+            &path,
+            before
+                .replace("return 1;", "const value = 2;\n    return value;")
+                .replace("return 10;", "return 20;"),
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "change both methods"]);
+        // Range overlays must come from the committed blobs, not this file.
+        fs::write(&path, "export class WrongWorktree {}\n").unwrap();
+        let source = DiffSource::GitRef("HEAD~1..HEAD".to_string());
+        let output = diff(
+            &source,
+            Some(dir.path()),
+            Some("src/service.ts"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(output.contains("+3/−2 lines"), "{output}");
+        assert_eq!(output.matches("const value = 2;").count(), 1, "{output}");
+        assert_eq!(output.matches("return 1;").count(), 1, "{output}");
+        assert_eq!(output.matches("return 20;").count(), 1, "{output}");
+        assert!(
+            output.contains("A::run") && output.contains("B::run"),
+            "{output}"
+        );
+        assert!(!output.contains("WrongWorktree"), "{output}");
+        for _ in 0..5 {
+            assert_eq!(
+                output,
+                diff(
+                    &source,
+                    Some(dir.path()),
+                    Some("./src/service.ts"),
+                    None,
+                    false,
+                    0,
+                    None
+                )
+                .unwrap()
+            );
+        }
+        assert_eq!(
+            output,
+            diff(
+                &source,
+                Some(&dir.path().join("src")),
+                Some(path.to_str().unwrap()),
+                None,
+                false,
+                0,
+                None
+            )
+            .unwrap()
+        );
+        let directory = diff(&source, Some(dir.path()), Some("src"), None, false, 0, None).unwrap();
+        assert!(
+            directory.contains("A::run") && directory.contains("B::run"),
+            "{directory}"
+        );
+        let method = diff(
+            &source,
+            Some(dir.path()),
+            Some("src/service.ts:A::run"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            method.contains("return 1;") && method.contains("const value = 2;"),
+            "{method}"
+        );
+    }
+
+    #[test]
+    fn file_detail_preserves_non_code_added_and_deleted_totals() {
+        let dir = setup_test_repo();
+        fs::write(dir.path().join("notes.txt"), "one\ntwo\n").unwrap();
+        git(dir.path(), &["add", "notes.txt"]);
+        let added = diff(
+            &DiffSource::GitStaged,
+            Some(dir.path()),
+            Some("notes.txt"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            added.contains("+2/−0 lines") && added.contains("one"),
+            "{added}"
+        );
+        git(dir.path(), &["commit", "-m", "notes"]);
+        fs::write(dir.path().join("notes.txt"), "one\nthree\n").unwrap();
+        let modified = diff(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            Some("notes.txt"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            modified.contains("+1/−1 lines") && modified.contains("two"),
+            "{modified}"
+        );
+        fs::remove_file(dir.path().join("notes.txt")).unwrap();
+        let deleted = diff(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            Some("notes.txt"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            deleted.contains("+0/−2 lines") && deleted.contains("two"),
+            "{deleted}"
+        );
+    }
+
+    #[test]
+    fn git_scope_is_literal_and_limits_the_patch() {
+        let dir = setup_test_repo();
+        fs::write(dir.path().join("src/[literal].rs"), "fn target() { 1 }\n").unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "literal path"]);
+        fs::write(dir.path().join("src/[literal].rs"), "fn target() { 2 }\n").unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn unrelated() {}\n").unwrap();
+        let raw = run_git_diff_scoped(
+            &DiffSource::GitUncommitted,
+            Some(dir.path()),
+            Some("src/[literal].rs:target"),
+        )
+        .unwrap();
+        assert!(raw.contains("[literal].rs"));
+        assert!(!raw.contains("main.rs") && !raw.contains("unrelated"));
+    }
+
+    #[test]
+    fn scoped_move_detection_finds_external_file_without_leaking_its_output() {
+        let dir = setup_test_repo();
+        fs::write(
+            dir.path().join("src/old.rs"),
+            "pub fn moved() { println!(\"moved\"); }\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "source"]);
+        fs::write(dir.path().join("src/old.rs"), "// moved elsewhere\n").unwrap();
+        fs::create_dir(dir.path().join("destination")).unwrap();
+        fs::write(
+            dir.path().join("destination/new.rs"),
+            "pub fn moved() { println!(\"moved\"); }\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        let output = diff(
+            &DiffSource::GitStaged,
+            Some(dir.path()),
+            Some("destination"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            output.contains("moved") && output.contains("from src/old.rs"),
+            "{output}"
+        );
+        assert!(!output.contains("## src/old.rs"), "{output}");
+    }
+
+    #[test]
+    fn scoped_move_candidate_limit_is_explicit() {
+        let dir = setup_test_repo();
+        fs::create_dir(dir.path().join("destination")).unwrap();
+        fs::write(
+            dir.path().join("destination/new.rs"),
+            "pub fn common() { 1 }\n",
+        )
+        .unwrap();
+        for i in 0..65 {
+            fs::write(dir.path().join(format!("candidate{i}.txt")), "common\n").unwrap();
+        }
+        git(dir.path(), &["add", "-A"]);
+        let output = diff(
+            &DiffSource::GitStaged,
+            Some(dir.path()),
+            Some("destination/new.rs"),
+            None,
+            false,
+            0,
+            None,
+        )
+        .unwrap();
+        assert!(
+            output.contains("cross-scope move detection skipped"),
+            "{output}"
+        );
+        assert!(!output.contains("candidate0.txt"), "{output}");
+    }
+
+    #[test]
+    fn cross_scope_move_can_change_parent_but_requires_the_same_structure() {
+        let dir = setup_test_repo();
+        let old = dir.path().join("src/old.ts");
+        fs::write(
+            &old,
+            "class Old {\n  run() { return 1; }\n}\nfunction unrelated() { return 10; }\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        git(dir.path(), &["commit", "-m", "old parent"]);
+        fs::write(&old, "// definitions removed\n").unwrap();
+        fs::create_dir(dir.path().join("destination")).unwrap();
+        fs::write(
+            dir.path().join("destination/new.ts"),
+            "class New {\n  run() { return 1; }\n}\nfunction unrelated() { return 99; }\n",
+        )
+        .unwrap();
+        git(dir.path(), &["add", "-A"]);
+        let source = DiffSource::GitStaged;
+        let mut overlays = parse::parse_unified_diff(
+            &run_git_diff_scoped(&source, Some(dir.path()), Some("destination")).unwrap(),
+        )
+        .iter()
+        .map(|file| overlay::compute_overlay(file, &source, Some(dir.path())))
+        .collect::<Vec<_>>();
+        assert!(
+            extend_move_candidates(&mut overlays, &source, Some(dir.path()))
+                .unwrap()
+                .is_none()
+        );
+        overlay::cross_file_matching(&mut overlays);
+        let new = overlays
+            .iter()
+            .find(|o| o.path == Path::new("destination/new.ts"))
+            .unwrap();
+        let method = new
+            .symbol_changes
+            .iter()
+            .find(|change| change.name == "New::run")
+            .unwrap();
+        assert!(
+            matches!(method.change, ChangeType::Moved { .. }),
+            "{method:?}"
+        );
+        let unrelated = new
+            .symbol_changes
+            .iter()
+            .find(|change| change.name == "unrelated")
+            .unwrap();
+        assert!(
+            matches!(unrelated.change, ChangeType::Added),
+            "{unrelated:?}"
+        );
     }
 
     // 2. test_overview_modified
@@ -1548,7 +2002,7 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = setup_test_repo();
         git(dir.path(), &["config", "diff.suppressBlankEmpty", "true"]);
         stage_goodbye_change(dir.path());
-        let raw = run_git_diff(&DiffSource::GitStaged, Some(dir.path()), None).unwrap();
+        let raw = run_git_diff_scoped(&DiffSource::GitStaged, Some(dir.path()), None).unwrap();
         assert!(
             raw.lines().any(|l| l == " "),
             "blank context line must survive as a single space:\n{raw}"
@@ -1562,8 +2016,8 @@ diff --git a/src/main.rs b/src/main.rs
         let dir = setup_test_repo();
         git(dir.path(), &["config", "diff.relative", "true"]);
         stage_goodbye_change(dir.path());
-        let raw =
-            run_git_diff(&DiffSource::GitStaged, Some(&dir.path().join("src")), None).unwrap();
+        let raw = run_git_diff_scoped(&DiffSource::GitStaged, Some(&dir.path().join("src")), None)
+            .unwrap();
         assert!(
             raw.contains("diff --git a/src/main.rs b/src/main.rs"),
             "paths must stay repo-relative when git runs in a subdirectory:\n{raw}"

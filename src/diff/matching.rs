@@ -20,7 +20,107 @@ pub(crate) fn build_diff_symbols(
     let lines: Vec<&str> = content.lines().collect();
     let mut out = Vec::new();
     build_symbols_recursive(entries, &lines, lang, "", &mut out);
+    // Outline signatures are abbreviated display text. Diffing needs the
+    // complete declaration header and its tokens, independent of formatting.
+    if let Some(language) = outline_language(lang) {
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&language).is_ok() {
+            if let Some(tree) = parser.parse(content, None) {
+                let mut nodes = HashMap::new();
+                index_nodes_by_row(tree.root_node(), &mut nodes);
+                for symbol in &mut out {
+                    if symbol.entry.signature.is_some() {
+                        if let Some(node) = declaration_node(&nodes, symbol, content) {
+                            let mut cursor = node.walk();
+                            let body = node.child_by_field_name("body").or_else(|| {
+                                node.children(&mut cursor).find(|child| {
+                                    matches!(
+                                        child.kind(),
+                                        "block"
+                                            | "statement_block"
+                                            | "compound_statement"
+                                            | "function_body"
+                                            | "do_block"
+                                    )
+                                })
+                            });
+                            let end = body.map_or(node.end_byte(), |body| body.start_byte());
+                            symbol.entry.signature =
+                                Some(content[node.start_byte()..end].trim().to_string());
+                            let mut hash = DefaultHasher::new();
+                            hash_header_tokens(node, content.as_bytes(), end, &mut hash);
+                            symbol.signature_hash = hash.finish();
+                        }
+                    }
+                }
+            }
+        }
+    }
     out
+}
+
+fn index_nodes_by_row<'a>(
+    node: tree_sitter::Node<'a>,
+    out: &mut HashMap<usize, Vec<tree_sitter::Node<'a>>>,
+) {
+    out.entry(node.start_position().row).or_default().push(node);
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        index_nodes_by_row(child, out);
+    }
+}
+
+fn declaration_node<'a>(
+    nodes: &HashMap<usize, Vec<tree_sitter::Node<'a>>>,
+    symbol: &DiffSymbol,
+    content: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let row = symbol.entry.start_line.saturating_sub(1) as usize;
+    nodes.get(&row)?.iter().copied().find(|node| {
+        let name = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("identifier"));
+        node.end_position().row + 1 == symbol.entry.end_line as usize
+            && (name.is_some_and(|name| content[name.byte_range()] == symbol.identity.name)
+                || (name.is_none()
+                    && (node.child_by_field_name("body").is_some()
+                        || matches!(
+                            node.kind(),
+                            "function_declaration"
+                                | "function_definition"
+                                | "method_definition"
+                                | "method_declaration"
+                                | "constructor_declaration"
+                                | "deinit_declaration"
+                                | "call"
+                        ))))
+    })
+}
+
+fn hash_header_tokens(
+    node: tree_sitter::Node,
+    source: &[u8],
+    end: usize,
+    hash: &mut DefaultHasher,
+) {
+    if node.start_byte() >= end || node.kind().contains("comment") {
+        return;
+    }
+    if node.child_count() == 0 {
+        source[node.byte_range()].hash(hash);
+        return;
+    }
+    let mut cursor = node.walk();
+    for (index, child) in node.children(&mut cursor).enumerate() {
+        // TypeScript permits an optional leading union/intersection operator.
+        if index == 0
+            && matches!(node.kind(), "union_type" | "intersection_type")
+            && matches!(child.kind(), "|" | "&")
+        {
+            continue;
+        }
+        hash_header_tokens(child, source, end, hash);
+    }
 }
 
 /// Pair entries within one identity bucket (same name+kind — i.e. overloads).
@@ -97,11 +197,13 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
 
                 if o.content_hash == n.content_hash {
                     changes.push(SymbolChange {
-                        name: n.identity.name.clone(),
+                        name: symbol_name(n),
                         kind: n.identity.kind,
                         change: ChangeType::Unchanged,
                         match_confidence: MatchConfidence::Exact,
                         line: n.entry.start_line,
+                        old_line: Some(o.entry.start_line),
+                        structural_hash: n.structural_hash,
                         old_sig: None,
                         new_sig: None,
                         size_delta: Some((
@@ -109,13 +211,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                             n.entry.end_line.saturating_sub(n.entry.start_line) + 1,
                         )),
                     });
-                } else if o.entry.signature != n.entry.signature {
+                } else if o.signature_hash != n.signature_hash {
                     changes.push(SymbolChange {
-                        name: n.identity.name.clone(),
+                        name: symbol_name(n),
                         kind: n.identity.kind,
                         change: ChangeType::SignatureChanged,
                         match_confidence: MatchConfidence::Exact,
                         line: n.entry.start_line,
+                        old_line: Some(o.entry.start_line),
+                        structural_hash: n.structural_hash,
                         old_sig: o.entry.signature.clone(),
                         new_sig: n.entry.signature.clone(),
                         size_delta: Some((
@@ -125,11 +229,13 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     });
                 } else {
                     changes.push(SymbolChange {
-                        name: n.identity.name.clone(),
+                        name: symbol_name(n),
                         kind: n.identity.kind,
                         change: ChangeType::BodyChanged,
                         match_confidence: MatchConfidence::Exact,
                         line: n.entry.start_line,
+                        old_line: Some(o.entry.start_line),
+                        structural_hash: n.structural_hash,
                         old_sig: None,
                         new_sig: None,
                         size_delta: Some((
@@ -174,13 +280,15 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                 old_matched[oi] = true;
                 new_matched[ni] = true;
                 changes.push(SymbolChange {
-                    name: new[ni].identity.name.clone(),
+                    name: symbol_name(&new[ni]),
                     kind: new[ni].identity.kind,
                     change: ChangeType::Renamed {
-                        old_name: old[oi].identity.name.clone(),
+                        old_name: symbol_name(&old[oi]),
                     },
                     match_confidence: MatchConfidence::Structural,
                     line: new[ni].entry.start_line,
+                    old_line: Some(old[oi].entry.start_line),
+                    structural_hash: new[ni].structural_hash,
                     old_sig: old[oi].entry.signature.clone(),
                     new_sig: new[ni].entry.signature.clone(),
                     size_delta: Some((
@@ -203,11 +311,13 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     if !new_matched[ni] {
                         new_matched[ni] = true;
                         changes.push(SymbolChange {
-                            name: new[ni].identity.name.clone(),
+                            name: symbol_name(&new[ni]),
                             kind: new[ni].identity.kind,
                             change: ChangeType::Added,
                             match_confidence: MatchConfidence::Ambiguous(count),
                             line: new[ni].entry.start_line,
+                            old_line: None,
+                            structural_hash: new[ni].structural_hash,
                             old_sig: None,
                             new_sig: new[ni].entry.signature.clone(),
                             size_delta: None,
@@ -218,11 +328,13 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
                     if !old_matched[oi] {
                         old_matched[oi] = true;
                         changes.push(SymbolChange {
-                            name: old[oi].identity.name.clone(),
+                            name: symbol_name(&old[oi]),
                             kind: old[oi].identity.kind,
                             change: ChangeType::Deleted,
                             match_confidence: MatchConfidence::Ambiguous(count),
                             line: old[oi].entry.start_line,
+                            old_line: Some(old[oi].entry.start_line),
+                            structural_hash: old[oi].structural_hash,
                             old_sig: old[oi].entry.signature.clone(),
                             new_sig: None,
                             size_delta: None,
@@ -297,11 +409,13 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
         };
 
         changes.push(SymbolChange {
-            name: new[ni].identity.name.clone(),
+            name: symbol_name(&new[ni]),
             kind: new[ni].identity.kind,
             change,
             match_confidence: MatchConfidence::Fuzzy(score),
             line: new[ni].entry.start_line,
+            old_line: Some(old[oi].entry.start_line),
+            structural_hash: new[ni].structural_hash,
             old_sig: old[oi].entry.signature.clone(),
             new_sig: new[ni].entry.signature.clone(),
             size_delta: Some((
@@ -325,32 +439,59 @@ pub(crate) fn match_symbols(old: &[DiffSymbol], new: &[DiffSymbol]) -> Vec<Symbo
     for (i, matched) in old_matched.iter().enumerate() {
         if !matched {
             changes.push(SymbolChange {
-                name: old[i].identity.name.clone(),
+                name: symbol_name(&old[i]),
                 kind: old[i].identity.kind,
                 change: ChangeType::Deleted,
                 match_confidence: MatchConfidence::Exact,
                 line: old[i].entry.start_line,
+                old_line: Some(old[i].entry.start_line),
+                structural_hash: old[i].structural_hash,
                 old_sig: old[i].entry.signature.clone(),
                 new_sig: None,
-                size_delta: None,
+                size_delta: Some((
+                    old[i]
+                        .entry
+                        .end_line
+                        .saturating_sub(old[i].entry.start_line)
+                        + 1,
+                    0,
+                )),
             });
         }
     }
     for (i, matched) in new_matched.iter().enumerate() {
         if !matched {
             changes.push(SymbolChange {
-                name: new[i].identity.name.clone(),
+                name: symbol_name(&new[i]),
                 kind: new[i].identity.kind,
                 change: ChangeType::Added,
                 match_confidence: MatchConfidence::Exact,
                 line: new[i].entry.start_line,
+                old_line: None,
+                structural_hash: new[i].structural_hash,
                 old_sig: None,
                 new_sig: new[i].entry.signature.clone(),
-                size_delta: None,
+                size_delta: Some((
+                    0,
+                    new[i]
+                        .entry
+                        .end_line
+                        .saturating_sub(new[i].entry.start_line)
+                        + 1,
+                )),
             });
         }
     }
 
+    // Hash-map iteration must not determine which entries survive a budget.
+    changes.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then_with(|| a.name.cmp(&b.name))
+            .then_with(|| a.old_line.cmp(&b.old_line))
+            .then_with(|| a.old_sig.cmp(&b.old_sig))
+            .then_with(|| a.new_sig.cmp(&b.new_sig))
+    });
     changes
 }
 
@@ -366,6 +507,14 @@ fn index_by_identity(symbols: &[DiffSymbol]) -> HashMap<SymbolIdentity, Vec<usiz
     map
 }
 
+pub(crate) fn symbol_name(symbol: &DiffSymbol) -> String {
+    if symbol.identity.parent_path.is_empty() {
+        symbol.identity.name.clone()
+    } else {
+        format!("{}::{}", symbol.identity.parent_path, symbol.identity.name)
+    }
+}
+
 fn build_symbols_recursive(
     entries: &[OutlineEntry],
     lines: &[&str],
@@ -374,6 +523,9 @@ fn build_symbols_recursive(
     out: &mut Vec<DiffSymbol>,
 ) {
     for entry in entries {
+        if matches!(entry.kind, OutlineKind::Import | OutlineKind::Export) {
+            continue;
+        }
         let source = extract_source(lines, entry.start_line, entry.end_line);
         let content_hash = hash_string(&source);
         let structural_hash = compute_structural_hash(&source, &entry.name, lang);
@@ -389,6 +541,7 @@ fn build_symbols_recursive(
             identity,
             content_hash,
             structural_hash,
+            signature_hash: hash_string(entry.signature.as_deref().unwrap_or("")),
             source_text: source,
         });
 
@@ -545,6 +698,72 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 mod tests {
     use super::*;
 
+    fn typescript_changes(old: &str, new: &str) -> Vec<SymbolChange> {
+        let old = build_diff_symbols(
+            &crate::lang::outline::get_outline_entries(old, Lang::TypeScript),
+            old,
+            Lang::TypeScript,
+        );
+        let new = build_diff_symbols(
+            &crate::lang::outline::get_outline_entries(new, Lang::TypeScript),
+            new,
+            Lang::TypeScript,
+        );
+        match_symbols(&old, &new)
+    }
+
+    #[test]
+    fn signature_formatting_ignores_whitespace_comments_and_leading_union() {
+        let old = "class Service {\n  run(value: string): string | number { return value; }\n}";
+        let new = "class Service {\n  run(\n    value: /* comment */ string\n  ):\n    | string\n    | number { return value; }\n}";
+        let changes = typescript_changes(old, new);
+        assert!(changes.iter().any(|c| c.name == "Service::run"));
+        assert!(
+            !changes
+                .iter()
+                .any(|c| matches!(c.change, ChangeType::SignatureChanged)),
+            "{changes:?}"
+        );
+    }
+
+    #[test]
+    fn multiline_and_long_signature_changes_remain_visible() {
+        let old = "class Service {\n  run(\n    value: string\n  ): { result: string } { return { result: value }; }\n}";
+        let new = old.replace("value: string", "value: number");
+        let changes = typescript_changes(old, &new);
+        let method = changes.iter().find(|c| c.name == "Service::run").unwrap();
+        assert!(
+            matches!(method.change, ChangeType::SignatureChanged),
+            "{method:?}"
+        );
+        assert!(method.old_sig.as_ref().unwrap().contains("value: string"));
+        assert!(method.new_sig.as_ref().unwrap().contains("value: number"));
+        // A type-literal brace is part of the return type, not the body.
+        assert!(method
+            .new_sig
+            .as_ref()
+            .unwrap()
+            .contains("{ result: string }"));
+        let params = (0..25)
+            .map(|i| format!("parameter{i}: string"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let old = format!("function run({params}): void {{}}\n");
+        let new = old.replace("parameter24: string", "parameter24: number");
+        let changes = typescript_changes(&old, &new);
+        let method = changes.iter().find(|c| c.name == "run").unwrap();
+        assert!(
+            matches!(method.change, ChangeType::SignatureChanged),
+            "{method:?}"
+        );
+        assert!(method
+            .new_sig
+            .as_ref()
+            .unwrap()
+            .contains("parameter24: number"));
+        assert!(!method.new_sig.as_ref().unwrap().contains("..."));
+    }
+
     fn make_sym(
         kind: OutlineKind,
         name: &str,
@@ -572,6 +791,7 @@ mod tests {
             },
             content_hash,
             structural_hash,
+            signature_hash: hash_string(sig.unwrap_or("")),
             source_text: source.to_string(),
         }
     }
