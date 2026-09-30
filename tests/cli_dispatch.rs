@@ -3,6 +3,50 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn spec_maps_show_test_titles_and_keep_real_code_symbols() {
+    let root = tempfile::tempdir().unwrap();
+    for filename in ["service.spec.ts", "service.test.tsx", "service.test.js"] {
+        fs::write(
+            root.path().join(filename),
+            "describe('fn and class member', () => {\n it('method check', () => {});\n});\n",
+        )
+        .unwrap();
+    }
+    fs::write(
+        root.path().join("code.ts"),
+        "export function parse() {}\nexport class Reader {}\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("reader.rs"),
+        "struct Reader;\nimpl Reader {\n fn parse() {}\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg("--map")
+        .arg("--scope")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let map = String::from_utf8(output.stdout).unwrap();
+    for filename in ["service.spec.ts", "service.test.tsx", "service.test.js"] {
+        assert!(
+            map.contains(&format!(
+                "{filename}: describe(\"fn and class member\"), it(\"method check\")"
+            )),
+            "{map}"
+        );
+    }
+    assert!(map.contains("code.ts: parse, Reader"), "{map}");
+    assert!(map.contains("reader.rs: Reader, Reader, parse"), "{map}");
+}
+
+#[test]
 fn decorator_grok_and_symbol_search_keep_one_correct_definition() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("service.ts");

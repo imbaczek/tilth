@@ -145,11 +145,25 @@ fn extract_symbol_names(outline: &str) -> Vec<String> {
     let mut names = Vec::new();
     for line in outline.lines() {
         let trimmed = line.trim();
+        let Some(payload) = outline_payload(trimmed) else {
+            continue;
+        };
+        // Test outlines contain suite/test titles, not declaration signatures.
+        // Preserve those labels rather than interpreting words inside them.
+        if let Some(title) = payload
+            .strip_prefix("suite: ")
+            .or_else(|| payload.strip_prefix("test: "))
+        {
+            if !title.is_empty() {
+                names.push(title.to_string());
+            }
+            continue;
+        }
         // Skip import lines and empty lines
         if trimmed.starts_with('[') {
             // Find the symbol name after kind keywords
-            if let Some(sig_start) = find_symbol_start(trimmed) {
-                let sig = &trimmed[sig_start..];
+            if let Some(sig_start) = find_symbol_start(payload) {
+                let sig = &payload[sig_start..];
                 // Take just the name (up to first paren or space after name)
                 let name = extract_name_from_sig(sig);
                 if !name.is_empty() && name != "imports" {
@@ -161,7 +175,30 @@ fn extract_symbol_names(outline: &str) -> Vec<String> {
     names
 }
 
+fn outline_payload(line: &str) -> Option<&str> {
+    let (range, payload) = line.strip_prefix('[')?.split_once(']')?;
+    let mut bounds = range.split('-');
+    let start = bounds.next()?.parse::<u32>().ok()?;
+    if start == 0 {
+        return None;
+    }
+    if let Some(end) = bounds.next() {
+        if end.parse::<u32>().ok()? < start {
+            return None;
+        }
+    }
+    if bounds.next().is_some() {
+        return None;
+    }
+    Some(payload.trim_start())
+}
+
 fn find_symbol_start(line: &str) -> Option<usize> {
+    // Rust impl entries render as module entries named `impl Type`.
+    // Preserve the implementing type rather than emitting the keyword `impl`.
+    if line.starts_with("mod impl ") {
+        return Some("mod impl ".len());
+    }
     let kinds = [
         "fn ",
         "struct ",
@@ -179,8 +216,8 @@ fn find_symbol_start(line: &str) -> Option<usize> {
         "def ",
     ];
     for kind in &kinds {
-        if let Some(pos) = line.find(kind) {
-            return Some(pos + kind.len());
+        if line.starts_with(kind) {
+            return Some(kind.len());
         }
     }
     None
@@ -243,6 +280,57 @@ fn format_tree(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rust_impl_module_labels_keep_their_type_names() {
+        let outline = "[1] struct Reader\n[2-4] mod impl Reader\n[3] fn parse()\n[5-7] mod impl Load for Reader\n[8-9] mod utilities\n";
+        assert_eq!(
+            extract_symbol_names(outline),
+            ["Reader", "Reader", "parse", "Load", "utilities"]
+        );
+    }
+
+    #[test]
+    fn declaration_labels_are_anchored_and_diagnostics_are_not_symbols() {
+        let outline = "[1-9] fn parse(value: impl Trait)\n continuation fn not_a_symbol\n[10] struct Reader\n[11-] imports: class Imported\n[12] note: fn invented\n[generated] fn fake\n[13-14-15] fn malformed\n[16] fn café()\n";
+        assert_eq!(extract_symbol_names(outline), ["parse", "Reader", "café"]);
+        for invalid in [
+            "[1-] fn fake",
+            "[0] fn fake",
+            "[0-0] fn fake",
+            "[9-1] fn fake",
+            "[1-2-3] fn fake",
+        ] {
+            assert!(extract_symbol_names(invalid).is_empty(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn test_titles_do_not_turn_declaration_words_into_symbols() {
+        let outline =
+            "[1] suite: describe(\"fn and class member\")\n  [2] test: it(\"method check\")\n";
+        assert_eq!(
+            extract_symbol_names(outline),
+            ["describe(\"fn and class member\")", "it(\"method check\")"]
+        );
+    }
+
+    #[test]
+    fn spec_map_preserves_test_titles_instead_of_inventing_identifiers() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("service.spec.ts"),
+            "describe('fn and class member', () => {\n it('method check', () => {});\n});\n",
+        )
+        .unwrap();
+        let output = generate(root.path(), 2, None, &OutlineCache::new());
+        assert!(
+            output.contains("describe(\"fn and class member\")"),
+            "{output}"
+        );
+        assert!(output.contains("it(\"method check\")"), "{output}");
+        assert!(!output.contains("service.spec.ts: and"), "{output}");
+    }
 
     fn entry(name: &str, tokens: u64) -> FileEntry {
         FileEntry {
