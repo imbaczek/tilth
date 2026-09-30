@@ -26,13 +26,15 @@ pub(in crate::mcp) fn tool_deps(
         .and_then(serde_json::Value::as_u64)
         .map(|b| b as usize);
 
-    let deps_result =
-        crate::search::deps::analyze_deps(&path, &scope, bloom).map_err(|e| e.to_string())?;
+    let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+    let deps_result = crate::search::deps::analyze_deps_with_options(&path, &scope, bloom, full)
+        .map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
-    output.push_str(&crate::search::deps::format_deps(
+    output.push_str(&crate::search::deps::format_deps_with_options(
         &deps_result,
         &scope,
         budget,
+        full,
     ));
     Ok(output)
 }
@@ -40,6 +42,36 @@ pub(in crate::mcp) fn tool_deps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+
+    #[test]
+    fn full_argument_expands_local_dependency_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target.ts");
+        let mut source = String::new();
+        for i in 0..12 {
+            std::fs::write(
+                root.path().join(format!("dep{i:02}.ts")),
+                "export const value = 1;\n",
+            )
+            .unwrap();
+            writeln!(source, "import {{value as v{i}}} from './dep{i:02}';").unwrap();
+        }
+        std::fs::write(&target, source).unwrap();
+        let preview = tool_deps(
+            &serde_json::json!({"path": target, "scope": root.path()}),
+            &bloom(),
+        )
+        .unwrap();
+        let full = tool_deps(
+            &serde_json::json!({"path": target, "scope": root.path(), "full": true}),
+            &bloom(),
+        )
+        .unwrap();
+        assert!(preview.contains("12 local"));
+        assert!(!preview.contains("dep11.ts"));
+        assert!(full.contains("dep11.ts"));
+    }
 
     fn bloom() -> Arc<BloomFilterCache> {
         Arc::new(BloomFilterCache::new())
