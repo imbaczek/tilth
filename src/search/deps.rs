@@ -274,6 +274,23 @@ pub fn analyze_deps(
 }
 
 pub(crate) fn find_importers(target: &Path, scope: &Path) -> Result<HashSet<PathBuf>, TilthError> {
+    find_importers_impl(target, scope, false)
+}
+
+/// Include modules exporting instances of imported classes, not only barrels.
+/// Grok subsequently checks which exported binding matches the receiver.
+pub(crate) fn find_transitive_importers(
+    target: &Path,
+    scope: &Path,
+) -> Result<HashSet<PathBuf>, TilthError> {
+    find_importers_impl(target, scope, true)
+}
+
+fn find_importers_impl(
+    target: &Path,
+    scope: &Path,
+    follow_all: bool,
+) -> Result<HashSet<PathBuf>, TilthError> {
     let edges = std::sync::Mutex::new(Vec::new());
     super::walker(scope, None)?.run(|| {
         let edges = &edges;
@@ -316,7 +333,7 @@ pub(crate) fn find_importers(target: &Path, scope: &Path) -> Result<HashSet<Path
     loop {
         let before = exported_through.len();
         for (importer, imported, reexport) in &edges {
-            if *reexport && exported_through.contains(imported) {
+            if (follow_all || *reexport) && exported_through.contains(imported) {
                 exported_through.insert(importer.clone());
             }
         }
@@ -770,6 +787,32 @@ mod tests {
     #[test]
     fn go_stdlib_fmt_is_stdlib() {
         assert!(is_stdlib("fmt", crate::types::Lang::Go));
+    }
+
+    #[test]
+    fn commonjs_consumers_and_forwarders_are_dependents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let target = root.join("lib.js");
+        fs::write(&target, "function run() {}\nmodule.exports = { run };\n").unwrap();
+        fs::write(
+            root.join("direct.js"),
+            "const { run } = require('./lib');\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("index.js"),
+            "module.exports = require('./lib');\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("indirect.js"),
+            "const { run } = require('./index');\n",
+        )
+        .unwrap();
+        let result =
+            analyze_deps(&target, root, &crate::index::bloom::BloomFilterCache::new()).unwrap();
+        assert_eq!(result.total_dependents, 3);
     }
 
     #[test]

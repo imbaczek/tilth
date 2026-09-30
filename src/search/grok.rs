@@ -476,8 +476,17 @@ pub fn grok(
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
     let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
+    let ts_owner = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+        enclosing_class_name(&entries, target.start_line)
+    } else {
+        None
+    };
     let ts_importers = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
-        Some(super::deps::find_importers(&canonical_target, scope)?)
+        Some(if ts_owner.is_some() {
+            super::deps::find_transitive_importers(&canonical_target, scope)?
+        } else {
+            super::deps::find_importers(&canonical_target, scope)?
+        })
     } else {
         None
     };
@@ -488,17 +497,23 @@ pub fn grok(
     } else {
         find_callers_batch(&symbols, scope, bloom, None, BATCH_EARLY_QUIT)?
     };
-    let ts_owner = if ts_importers.is_some() {
-        enclosing_class_name(&entries, target.start_line)
-    } else {
-        None
-    };
     let mut ts_aliases: HashMap<PathBuf, HashSet<String>> = HashMap::new();
     if let Some(owner) = ts_owner {
-        let mut resolver = TsExportResolver::new(&canonical_target, owner, &content, lang);
+        let mut resolver =
+            TsExportResolver::new(&canonical_target, owner, &content, lang, &target.name);
+        let receivers: Vec<String> = raw_callers
+            .iter()
+            .filter_map(|(_, c)| c.receiver.clone())
+            .collect();
         for (_, caller) in &raw_callers {
             ts_aliases.entry(caller.path.clone()).or_insert_with(|| {
-                ts_owner_aliases(&caller.path, &caller.content, &target.name, &mut resolver)
+                ts_owner_aliases(
+                    &caller.path,
+                    &caller.content,
+                    &target.name,
+                    &mut resolver,
+                    &receivers,
+                )
             });
         }
     }
@@ -539,6 +554,14 @@ pub fn grok(
     callees_external.truncate(caps.max_callees);
 
     let mut callers = prod_callers;
+    callers.sort_by(|a, b| {
+        (&a.path, a.line, &a.calling_function, &a.receiver).cmp(&(
+            &b.path,
+            b.line,
+            &b.calling_function,
+            &b.receiver,
+        ))
+    });
     callers.truncate(caps.max_callers);
 
     let mut siblings = siblings_all;
@@ -552,6 +575,7 @@ pub fn grok(
             test_name: m.calling_function,
         })
         .collect();
+    tests.sort_by(|a, b| (&a.path, a.line, &a.test_name).cmp(&(&b.path, b.line, &b.test_name)));
     tests.truncate(caps.max_tests);
 
     // Slice the body only once the fallible work above has succeeded: the
@@ -652,12 +676,13 @@ fn enclosing_class_name(entries: &[OutlineEntry], line: u32) -> Option<&str> {
 struct TsExportResolver {
     target: PathBuf,
     owner: String,
+    method: String,
     target_default: bool,
     cache: HashMap<(PathBuf, String), bool>,
 }
 
 impl TsExportResolver {
-    fn new(target: &Path, owner: &str, content: &str, lang: Lang) -> Self {
+    fn new(target: &Path, owner: &str, content: &str, lang: Lang, method: &str) -> Self {
         let mut target_default = false;
         if let Some(grammar) = crate::lang::outline::outline_language(lang) {
             let mut parser = tree_sitter::Parser::new();
@@ -674,6 +699,9 @@ impl TsExportResolver {
                         if !text.contains("default") {
                             continue;
                         }
+                        target_default |= crate::read::imports::js_export_bindings(text)
+                            .iter()
+                            .any(|(local, public)| local == owner && public == "default");
                         let mut child_cursor = statement.walk();
                         target_default |=
                             statement.named_children(&mut child_cursor).any(|child| {
@@ -692,6 +720,7 @@ impl TsExportResolver {
         Self {
             target: target.to_path_buf(),
             owner: owner.to_string(),
+            method: method.to_string(),
             target_default,
             cache: HashMap::new(),
         }
@@ -708,8 +737,10 @@ impl TsExportResolver {
         visiting: &mut HashSet<(PathBuf, String)>,
         depth: usize,
     ) -> bool {
-        if module == self.target {
-            return exported == self.owner || (exported == "default" && self.target_default);
+        if module == self.target
+            && (exported == self.owner || (exported == "default" && self.target_default))
+        {
+            return true;
         }
         if depth >= 16 {
             return false;
@@ -820,7 +851,15 @@ impl TsExportResolver {
                     } else if let Some((imported, symbol)) = imports.get(&local) {
                         self.resolve_inner(imported, symbol, visiting, depth + 1)
                     } else {
-                        false
+                        self.local_instance_matches(
+                            module,
+                            tree.root_node(),
+                            &local,
+                            content.as_bytes(),
+                            &imports,
+                            visiting,
+                            depth,
+                        )
                     };
                 }
                 if let Some(symbol) = exported.strip_prefix(&format!("{public}.")) {
@@ -832,6 +871,17 @@ impl TsExportResolver {
                 }
             }
             if source.is_none() {
+                if self.local_instance_matches(
+                    module,
+                    statement,
+                    exported,
+                    content.as_bytes(),
+                    &imports,
+                    visiting,
+                    depth,
+                ) {
+                    return true;
+                }
                 let mut children = statement.walk();
                 for child in statement.named_children(&mut children) {
                     if matches!(child.kind(), "class_declaration" | "function_declaration")
@@ -850,6 +900,143 @@ impl TsExportResolver {
                 .iter()
                 .any(|source| self.resolve_inner(source, exported, visiting, depth + 1))
     }
+
+    fn local_instance_matches(
+        &mut self,
+        module: &Path,
+        root: tree_sitter::Node,
+        name: &str,
+        bytes: &[u8],
+        imports: &HashMap<String, (PathBuf, String)>,
+        visiting: &mut HashSet<(PathBuf, String)>,
+        depth: usize,
+    ) -> bool {
+        fn find<'a>(
+            node: tree_sitter::Node<'a>,
+            name: &str,
+            bytes: &[u8],
+        ) -> Option<tree_sitter::Node<'a>> {
+            if name == "default" && node.kind() == "export_statement" {
+                if let Some(value) = node
+                    .child_by_field_name("value")
+                    .filter(|value| value.kind() == "new_expression")
+                {
+                    return Some(value);
+                }
+            }
+            if node.kind() == "variable_declarator"
+                && node
+                    .child_by_field_name("name")
+                    .and_then(|n| n.utf8_text(bytes).ok())
+                    == Some(name)
+            {
+                return Some(node);
+            }
+            if !matches!(
+                node.kind(),
+                "program" | "export_statement" | "lexical_declaration" | "variable_declaration"
+            ) {
+                return None;
+            }
+            let mut cursor = node.walk();
+            let found = node
+                .named_children(&mut cursor)
+                .find_map(|child| find(child, name, bytes));
+            found
+        }
+        let Some(binding) = find(root, name, bytes) else {
+            return false;
+        };
+        let mut cursor = binding.walk();
+        let annotation = binding
+            .named_children(&mut cursor)
+            .find(|n| n.kind() == "type_annotation")
+            .and_then(|n| n.named_child(0));
+        let ty = if binding.kind() == "new_expression" {
+            binding
+                .child_by_field_name("constructor")
+                .and_then(|n| n.utf8_text(bytes).ok())
+        } else if let Some(annotation) = annotation {
+            // A union or structural type does not establish one receiver class.
+            let node = if annotation.kind() == "generic_type" {
+                annotation.child_by_field_name("name").unwrap_or(annotation)
+            } else {
+                annotation
+            };
+            if !matches!(
+                node.kind(),
+                "type_identifier" | "nested_type_identifier" | "identifier"
+            ) {
+                return false;
+            }
+            node.utf8_text(bytes).ok()
+        } else {
+            binding
+                .child_by_field_name("value")
+                .filter(|n| n.kind() == "new_expression")
+                .and_then(|n| n.child_by_field_name("constructor"))
+                .and_then(|n| n.utf8_text(bytes).ok())
+        };
+        let Some(ty) = ty else {
+            return false;
+        };
+        self.type_matches_in_module(module, binding, ty, bytes, imports, visiting, depth)
+    }
+
+    fn type_matches_in_module(
+        &mut self,
+        module: &Path,
+        binding: tree_sitter::Node,
+        ty: &str,
+        bytes: &[u8],
+        imports: &HashMap<String, (PathBuf, String)>,
+        visiting: &mut HashSet<(PathBuf, String)>,
+        depth: usize,
+    ) -> bool {
+        if depth >= 16 {
+            return false;
+        }
+        if let Some(local) = ts_local_binding(binding, ty, bytes) {
+            if !matches!(local.kind(), "class_declaration" | "class") {
+                return false;
+            }
+            let name = local
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok());
+            if module == self.target && name == Some(self.owner.as_str()) {
+                return true;
+            }
+            let mut subclasses = Vec::new();
+            collect_ts_subclasses(local, bytes, &self.method, &mut subclasses);
+            let Some((_, base)) = subclasses
+                .iter()
+                .find(|(class_name, _)| Some(class_name.as_str()) == name)
+            else {
+                return false;
+            };
+            return self.type_matches_in_module(
+                module,
+                local,
+                base,
+                bytes,
+                imports,
+                visiting,
+                depth + 1,
+            );
+        }
+        let (base, member) = ty.split_once('.').unwrap_or((ty, ""));
+        let Some((imported, symbol)) = imports.get(base) else {
+            return false;
+        };
+        let symbol = if symbol == "*" {
+            member.to_string()
+        } else if member.is_empty() {
+            symbol.clone()
+        } else {
+            format!("{symbol}.{member}")
+        };
+        self.resolve_inner(imported, &symbol, visiting, depth + 1)
+    }
 }
 
 fn ts_owner_aliases(
@@ -857,6 +1044,7 @@ fn ts_owner_aliases(
     content: &str,
     method: &str,
     resolver: &mut TsExportResolver,
+    receivers: &[String],
 ) -> HashSet<String> {
     let mut aliases = HashSet::new();
     if path == resolver.target {
@@ -909,6 +1097,13 @@ fn ts_owner_aliases(
                 if resolver.resolves(&imported_path, imported_name) {
                     aliases.insert(local_name.to_string());
                 }
+                for receiver in receivers {
+                    if let Some(member) = receiver.strip_prefix(&format!("{local_name}.")) {
+                        if resolver.resolves(&imported_path, &format!("{imported_name}.{member}")) {
+                            aliases.insert(receiver.clone());
+                        }
+                    }
+                }
                 let member = format!("{imported_name}.{}", resolver.owner);
                 if resolver.resolves(&imported_path, &member) {
                     aliases.insert(format!("{local_name}.{}", resolver.owner));
@@ -922,16 +1117,29 @@ fn ts_owner_aliases(
             .unwrap_or(statement_text)
             .trim_start();
         let clause = clause.strip_prefix("type ").unwrap_or(clause);
-        if let Some(namespace) = clause.strip_prefix("* as ") {
+        let namespace_clause = if clause.starts_with('*') {
+            clause
+        } else {
+            clause
+                .split_once(',')
+                .map_or(clause, |(_, rest)| rest.trim_start())
+        };
+        if let Some(namespace) = namespace_clause.strip_prefix("* as ") {
             if let Some(namespace) = namespace.split_whitespace().next() {
+                for receiver in receivers {
+                    if let Some(symbol) = receiver.strip_prefix(&format!("{namespace}.")) {
+                        if resolver.resolves(&imported_path, symbol) {
+                            aliases.insert(receiver.clone());
+                        }
+                    }
+                }
                 let owner = resolver.owner.clone();
                 if resolver.resolves(&imported_path, &owner) {
                     aliases.insert(format!("{namespace}.{owner}"));
                 }
             }
-        } else if let Some(default_name) =
-            clause.split(|c: char| c.is_whitespace() || c == ',').next()
-        {
+        }
+        if let Some(default_name) = clause.split(|c: char| c.is_whitespace() || c == ',').next() {
             if !default_name.is_empty()
                 && !matches!(default_name, "{" | "*" | "from")
                 && resolver.resolves(&imported_path, "default")
@@ -1809,6 +2017,130 @@ mod tests {
     }
 
     #[test]
+    fn grok_ts_imported_singleton_callers() {
+        for (singleton, barrel, client, expected) in [
+            ("export const svc: Service = createLazyProxy(factory);", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", true),
+            ("export const svc = new Service();", "export { svc as renamed } from './singleton';", "import { renamed as svc } from './index'; svc.create();", true),
+            ("const svc: Service = createLazyProxy(factory); export { svc };", "export * from './singleton';", "import { svc } from './index'; svc.create();", true),
+            ("const svc = new Service(); export default svc;", "export { default } from './singleton';", "import svc from './index'; svc.create();", true),
+            ("export const svc: Service = createLazyProxy(factory);", "export * from './singleton';", "import * as api from './index'; api.svc.create();", true),
+            ("export const svc: Service = createLazyProxy(factory);", "export * as api from './singleton';", "import { api } from './index'; api.svc.create();", true),
+            ("export default new Service();", "export { default } from './singleton';", "import svc from './index'; svc.create();", true),
+            ("class Specialized extends Service {} export const svc = new Specialized();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", true),
+            ("class Specialized extends Service { create() {} } export const svc = new Specialized();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", false),
+            ("class Specialized extends Service {} class Leaf extends Specialized {} export default new Leaf();", "export { default } from './singleton';", "import svc from './index'; svc.create();", true),
+            ("class Specialized extends Service { create() {} } class Leaf extends Specialized {} export default new Leaf();", "export { default } from './singleton';", "import svc from './index'; svc.create();", false),
+            ("class Specialized extends Other {} export const svc = new Specialized();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", false),
+            ("import type { Service as S } from './service'; export const svc: S = factory();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", true),
+            ("import * as types from './service'; export const svc: types.Service = factory();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", true),
+            ("export const svc: Service = createLazyProxy(factory);", "export { svc } from './singleton';", "import { svc } from './index'; function f(svc: Other) { svc.create(); }", false),
+            ("export const svc: Service = createLazyProxy(factory);", "export { svc } from './singleton';", "import { svc } from './index'; function f() { const svc = new Other(); svc.create(); }", false),
+            ("export const svc = new Other();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", false),
+            ("export const svc: Other = createLazyProxy(factory);", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", false),
+            ("export const svc: Service | Other = factory();", "export { svc } from './singleton';", "import { svc } from './index'; svc.create();", false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = write_fixture(tmp.path(), "service.ts", "export class Service {\n create() {}\n}\n");
+            write_fixture(tmp.path(), "singleton.ts", &format!("import {{ Service }} from './service'; class Other {{ create() {{}} }}\n{singleton}"));
+            write_fixture(tmp.path(), "index.ts", barrel);
+            write_fixture(tmp.path(), "client.ts", &format!("class Other {{ create() {{}} }}\n{client}"));
+            let result = grok(&format!("{}:2", target.display()), tmp.path(), &BloomFilterCache::default(), &crate::session::Session::default(), GrokCaps::default()).unwrap();
+            assert_eq!(result.callers.iter().any(|c| c.path.ends_with("client.ts")), expected, "{singleton}\n{barrel}\n{client}");
+        }
+    }
+
+    #[test]
+    fn grok_ts_singleton_in_target_module_keeps_all_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export class Service {\n create() {}\n}\nexport const svc: Service = factory();\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "index.ts",
+            "export { svc as instance } from './service';\n",
+        );
+        for i in 0..18 {
+            write_fixture(tmp.path(), &format!("client{i:02}.ts"), &format!("import {{ instance }} from './index';\nfunction caller{i}() {{ instance.create(); }}\n"));
+        }
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps {
+                max_callers: 3,
+                ..GrokCaps::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 18);
+        let filenames: Vec<_> = result
+            .callers
+            .iter()
+            .map(|c| c.path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(filenames, ["client00.ts", "client01.ts", "client02.ts"]);
+    }
+
+    #[test]
+    fn grok_ts_function_does_not_collect_unrelated_downstream_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(tmp.path(), "service.ts", "export function create() {}\n");
+        write_fixture(
+            tmp.path(),
+            "consumer.ts",
+            "import { create } from './service'; export const unrelated = 1;\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "client.ts",
+            "import { unrelated } from './consumer'; function create() {} create();\n",
+        );
+        let result = grok(
+            &format!("{}:1", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 0);
+    }
+
+    #[test]
+    fn grok_ts_singleton_follows_default_class_export_alias() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "class Service {\n create() {}\n}\nexport { Service as default };\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "singleton.ts",
+            "import Service from './service'; export const svc: Service = factory();\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "client.ts",
+            "import { svc } from './singleton'; svc.create();\n",
+        );
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 1);
+        assert!(result.callers[0].path.ends_with("client.ts"));
+    }
+
+    #[test]
     fn grok_ts_method_follows_import_alias_and_lexical_shadowing() {
         let tmp = tempfile::tempdir().unwrap();
         write_fixture(
@@ -1870,6 +2202,95 @@ mod tests {
             .callers
             .iter()
             .any(|caller| caller.path.ends_with("client.ts") && caller.line == 4));
+    }
+
+    #[test]
+    fn grok_ts_function_expression_parameters_stay_in_their_scope() {
+        for expression in [
+            "function(service: Other) {}",
+            "function*(service: Other) {}",
+            "(service: Other) => {}",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let target = write_fixture(
+                tmp.path(),
+                "service.ts",
+                "export class Service {\n create() {}\n}\n",
+            );
+            write_fixture(tmp.path(), "client.ts", &format!("import {{ Service }} from './service';\nclass Other {{ create() {{}} }}\nconst service = new Service();\nconst callback = {expression};\nexport function execute() {{ service.create(); }}\n"));
+            let result = grok(
+                &format!("{}:2", target.display()),
+                tmp.path(),
+                &BloomFilterCache::default(),
+                &crate::session::Session::default(),
+                GrokCaps::default(),
+            )
+            .unwrap();
+            assert_eq!(result.total_callers, 1, "{expression}");
+            assert_eq!(result.callers[0].calling_function, "execute");
+        }
+    }
+
+    #[test]
+    fn grok_ts_combined_default_namespace_import_resolves_both_bindings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "service.ts",
+            "export default class Service {\n create() {}\n}\nexport { Service };\n",
+        );
+        write_fixture(tmp.path(), "client.ts", "import Default, * as ns from './service';\nexport function execute() { new ns.Service().create(); new Default().create(); }\n");
+        let result = grok(
+            &format!("{}:2", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 2);
+        assert!(result
+            .callers
+            .iter()
+            .all(|caller| caller.calling_function == "execute"));
+    }
+
+    #[test]
+    fn grok_js_commonjs_consumers_are_not_filtered_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = write_fixture(
+            tmp.path(),
+            "lib.js",
+            "function run() {}\nmodule.exports = { run };\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "direct.js",
+            "const { run } = require('./lib');\nfunction execute() { run(); }\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "index.js",
+            "module.exports = require('./lib');\n",
+        );
+        write_fixture(
+            tmp.path(),
+            "indirect.js",
+            "const { run } = require('./index');\nfunction execute() { run(); }\n",
+        );
+        let result = grok(
+            &format!("{}:1", target.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 2);
+        assert!(result
+            .callers
+            .iter()
+            .all(|caller| caller.calling_function == "execute"));
     }
 
     #[test]

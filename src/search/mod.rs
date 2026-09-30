@@ -885,9 +885,13 @@ fn group_matches<'a>(matches: &'a [Match], cache: &OutlineCache) -> Vec<Vec<&'a 
                 && prev.path == m.path
                 && m.file_lines >= 50
             {
-                let prev_idx = find_enclosing_outline_idx(&prev.path, prev.line, cache);
-                let curr_idx = find_enclosing_outline_idx(&m.path, m.line, cache);
-                if prev_idx.is_some() && prev_idx == curr_idx {
+                let prev_scope = scope::enclosing_definition_at(&prev.path, prev.line, cache);
+                let curr_scope = scope::enclosing_definition_at(&m.path, m.line, cache);
+                if prev_scope
+                    .as_ref()
+                    .zip(curr_scope.as_ref())
+                    .is_some_and(|(a, b)| a.byte_range == b.byte_range)
+                {
                     last_group.push(m);
                     continue;
                 }
@@ -1891,19 +1895,6 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
         let buf = content.as_bytes();
         read::outline::generate(path, file_type, &content, buf, false)
     }))
-}
-
-/// Find the outline entry index that encloses the given line.
-fn find_enclosing_outline_idx(
-    path: &std::path::Path,
-    match_line: u32,
-    cache: &OutlineCache,
-) -> Option<usize> {
-    let outline_str = get_outline_str(path, cache)?;
-    let outline_lines: Vec<&str> = outline_str.lines().collect();
-    outline_lines.iter().position(|line| {
-        extract_line_range(line).is_some_and(|(s, e)| match_line >= s && match_line <= e)
-    })
 }
 
 /// Build outline context around a match — ±2 entries around the enclosing one.
@@ -3074,6 +3065,49 @@ mod tests {
             out.contains("[usage in function Foo.bar]"),
             "expected scope suffix in output, got: {out}"
         );
+    }
+
+    #[test]
+    fn grouped_usages_keep_method_and_callback_scopes_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("a.ts");
+        let body = "class Foo {\n  first() {\n    target();\n    target();\n  }\n  second() {\n    target();\n    target();\n  }\n}\ndescribe('suite', () => {\n  it('one', () => {\n    target();\n    target();\n  });\n  it('two', () => {\n    target();\n    target();\n  });\n});\n";
+        std::fs::write(&path, format!("{body}{}", "\n".repeat(50))).unwrap();
+        let matches: Vec<Match> = [3, 4, 7, 8, 13, 14, 17, 18]
+            .into_iter()
+            .map(|line| Match {
+                path: path.clone(),
+                line,
+                text: "target();".to_string(),
+                is_definition: false,
+                exact: false,
+                file_lines: 70,
+                mtime: SystemTime::now(),
+                def_range: None,
+                def_name: None,
+                def_weight: 0,
+                impl_target: None,
+            })
+            .collect();
+        let cache = OutlineCache::new();
+        let groups = group_matches(&matches, &cache);
+        assert_eq!(groups.len(), 4);
+        assert!(groups.iter().all(|g| g.len() == 2));
+        let mut output = String::new();
+        for group in &groups {
+            format_grouped_usages(group, tmp.path(), &cache, &mut output);
+        }
+        for label in [
+            "function Foo.first",
+            "function Foo.second",
+            "function it('one') callback",
+            "function it('two') callback",
+        ] {
+            assert!(
+                output.contains(&format!("[2 usages in {label}]")),
+                "{output}"
+            );
+        }
     }
 
     #[test]
