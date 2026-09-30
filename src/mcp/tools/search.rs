@@ -185,6 +185,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn caller_search_preserves_rare_targets_context_and_totals_before_display_caps() {
+        use std::fmt::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        for file in 0..25 {
+            let mut source = String::new();
+            for i in 0..25 {
+                writeln!(source, "fn caller_{file}_{i}() {{ hot(); }}").unwrap();
+            }
+            std::fs::write(root.path().join(format!("part{file:02}.rs")), source).unwrap();
+        }
+        let preferred = root.path().join("zz_preferred.rs");
+        std::fs::write(
+            &preferred,
+            format!("fn late() {{ hot(); cold(); }}\n//{}", "x".repeat(500_001)),
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        for full in [false, true] {
+            let args = serde_json::json!({"query": "hot,cold", "kind": "callers", "scope": root.path(), "context": preferred, "expand": 0, "full": full});
+            let result = tool_search(&args, &cache, &session, &bloom).unwrap();
+            assert!(
+                result.contains("— 626 call sites") && result.contains("— 1 call site"),
+                "{result}"
+            );
+            assert_eq!(
+                result.matches("[caller:").count(),
+                if full { 101 } else { 11 },
+                "{result}"
+            );
+            assert!(
+                result
+                    .lines()
+                    .find(|line| line.starts_with("## "))
+                    .unwrap()
+                    .contains("zz_preferred.rs:1 [caller: late]"),
+                "{result}"
+            );
+            assert_eq!(
+                tool_search(&args, &cache, &session, &bloom).unwrap(),
+                result
+            );
+            let args = serde_json::json!({"query": "hot,cold", "kind": "callers", "scope": root.path(), "context": preferred, "expand": 0, "full": full, "glob": "zz_preferred.rs"});
+            let result = tool_search(&args, &cache, &session, &bloom).unwrap();
+            assert_eq!(result.matches("— 1 call site").count(), 2, "{result}");
+            assert_eq!(result.matches("[caller:").count(), 2, "{result}");
+            let args = serde_json::json!({"query": "hot", "kind": "callers", "scope": root.path(), "expand": 0, "full": full, "budget": 80});
+            let limited = tool_search(&args, &cache, &session, &bloom).unwrap();
+            assert!(
+                limited.contains("— 626 call sites") && limited.contains("budget: 80"),
+                "{limited}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_content_and_regex_search_named_file_text() {
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("first");
