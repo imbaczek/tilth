@@ -33,6 +33,8 @@ const TYPE_KINDS: &[&str] = &[
 /// search formatter to annotate usages with their containing scope.
 #[derive(Debug)]
 pub struct EnclosingScope {
+    /// Exact declaration identity, including declarations on the same line.
+    pub(super) byte_range: (usize, usize),
     /// Normalized kind label (e.g. `"function"`, `"class"`, `"struct"`).
     pub kind: &'static str,
     /// Identifier of the definition. Qualified with its enclosing type or
@@ -50,7 +52,9 @@ pub(super) fn walk_to_enclosing_definition<'a>(
 ) -> Option<(tree_sitter::Node<'a>, String, (u32, u32))> {
     let mut current = Some(node);
     while let Some(n) = current {
-        let def_name = if DEFINITION_KINDS.contains(&n.kind()) {
+        let def_name = if matches!(n.kind(), "arrow_function" | "function_expression") {
+            anonymous_function_name(n, lines)
+        } else if DEFINITION_KINDS.contains(&n.kind()) {
             extract_definition_name(n, lines)
         } else if lang == crate::types::Lang::Elixir && is_elixir_definition(n, lines) {
             extract_elixir_definition_name(n, lines)
@@ -89,6 +93,29 @@ pub(super) fn walk_to_enclosing_definition<'a>(
     None
 }
 
+fn anonymous_function_name(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let parent = node.parent()?;
+    if parent.kind() == "variable_declarator" {
+        return parent
+            .child_by_field_name("name")
+            .map(|name| node_text_simple(name, lines, NodeTextMode::Full));
+    }
+    if parent.kind() == "arguments" {
+        let call = parent.parent()?;
+        let function = call.child_by_field_name("function")?;
+        let name = node_text_simple(function, lines, NodeTextMode::Full);
+        let first = parent.named_child(0);
+        if let Some(title) = first.filter(|n| n.kind() == "string") {
+            return Some(format!(
+                "{name}({}) callback",
+                node_text_simple(title, lines, NodeTextMode::Full)
+            ));
+        }
+        return Some(format!("{name} callback"));
+    }
+    Some("<anonymous>".to_string())
+}
+
 /// Find the nearest enclosing definition for `(path, line)` by re-parsing
 /// the file with tree-sitter (cached on `OutlineCache`). AST-correct across
 /// every language tilth supports — replaces parsing the rendered outline
@@ -111,14 +138,46 @@ pub fn enclosing_definition_at(
         return None;
     }
 
-    let point = tree_sitter::Point { row, column: 0 };
+    let column = lines[row].len() - lines[row].trim_start().len();
+    let point = tree_sitter::Point { row, column };
     let target = parsed
         .tree
         .root_node()
         .descendant_for_point_range(point, point)?;
 
-    let (def_node, name, _range) = walk_to_enclosing_definition(target, &lines, parsed.lang)?;
+    let (mut def_node, mut name, _range) =
+        walk_to_enclosing_definition(target, &lines, parsed.lang)?;
+    // A local binding's initializer is part of its containing function's usage
+    // scope. Starting at its first token must not label the function as that binding.
+    if matches!(
+        def_node.kind(),
+        "lexical_declaration" | "variable_declaration" | "const_item" | "static_item"
+    ) {
+        let mut ancestor = def_node.parent();
+        while let Some(node) = ancestor {
+            if matches!(
+                node.kind(),
+                "function_declaration"
+                    | "function_definition"
+                    | "function_item"
+                    | "method_definition"
+                    | "method_declaration"
+                    | "arrow_function"
+                    | "function_expression"
+                    | "generator_function"
+                    | "generator_function_declaration"
+            ) {
+                let (function, function_name, _) =
+                    walk_to_enclosing_definition(node, &lines, parsed.lang)?;
+                def_node = function;
+                name = function_name;
+                break;
+            }
+            ancestor = node.parent();
+        }
+    }
     Some(EnclosingScope {
+        byte_range: (def_node.start_byte(), def_node.end_byte()),
         kind: kind_label(def_node, &lines, parsed.lang),
         name,
     })
@@ -134,7 +193,9 @@ fn kind_label(node: tree_sitter::Node, lines: &[&str], lang: crate::types::Lang)
         | "function_item"
         | "method_definition"
         | "method_declaration"
-        | "decorated_definition" => "function",
+        | "decorated_definition"
+        | "arrow_function"
+        | "function_expression" => "function",
         "class_declaration" | "class_definition" => "class",
         "struct_item" => "struct",
         "interface_declaration" => "interface",
@@ -193,6 +254,22 @@ mod tests {
         let scope = enclosing_definition_at(&p, 2, &cache).unwrap();
         assert_eq!(scope.kind, "function");
         assert_eq!(scope.name, "foo");
+    }
+
+    #[test]
+    fn enclosing_at_indented_inline_methods_keeps_the_method_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write(
+            tmp.path(),
+            "a.ts",
+            "class Foo {\n  first() { target(); }\n  second() { target(); }\n}\n",
+        );
+        let cache = OutlineCache::new();
+        let first = enclosing_definition_at(&path, 2, &cache).unwrap();
+        let second = enclosing_definition_at(&path, 3, &cache).unwrap();
+        assert_eq!(first.name, "Foo.first");
+        assert_eq!(second.name, "Foo.second");
+        assert_ne!(first.byte_range, second.byte_range);
     }
 
     #[test]
