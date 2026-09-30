@@ -33,6 +33,11 @@ pub(in crate::mcp) fn tool_search(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(2) as usize;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+    if kind != "callers" && (args.get("offset").is_some() || args.get("limit").is_some()) {
+        return Err("offset and limit are supported only for kind: callers".into());
+    }
+    let offset = caller_page_argument(args, "offset", 0, 0)?;
+    let limit = caller_page_argument(args, "limit", if full { 100 } else { 10 }, 1)?;
     let context_path = args
         .get("context")
         .and_then(|v| v.as_str())
@@ -147,16 +152,28 @@ pub(in crate::mcp) fn tool_search(
                 0 => return Err("missing required parameter: query".into()),
                 1 => {
                     session.record_search(targets[0]);
-                    crate::search::callers::search_callers_expanded(
-                        targets[0], &scopes[0], bloom, expand, context, glob, full,
+                    crate::search::callers::search_callers_page(
+                        targets[0],
+                        &scopes[0],
+                        bloom,
+                        expand,
+                        context,
+                        glob,
+                        (offset, limit),
                     )
                 }
                 2..=5 => {
                     for t in &targets {
                         session.record_search(t);
                     }
-                    crate::search::callers::search_callers_multi_expanded(
-                        &targets, &scopes[0], bloom, expand, context, glob, full,
+                    crate::search::callers::search_callers_multi_page(
+                        &targets,
+                        &scopes[0],
+                        bloom,
+                        expand,
+                        context,
+                        glob,
+                        (offset, limit),
                     )
                 }
                 _ => {
@@ -176,13 +193,201 @@ pub(in crate::mcp) fn tool_search(
     .map_err(|e| e.to_string())?;
 
     let mut result = scope_warning.unwrap_or_default();
+    if kind == "callers" {
+        result.push_str(&output);
+        let budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+        // Adapt hints before the final cap so JSON syntax also fits the budget.
+        let formatted = caller_mcp_navigation(&result);
+        let safe = crate::prepare_callers_output_budget(&formatted, budget);
+        return Ok(crate::budget::apply(&caller_mcp_navigation(&safe), budget));
+    }
     result.push_str(&apply_budget(&output, budget));
     Ok(result)
+}
+
+/// Validate rather than silently ignoring malformed paging values.
+fn caller_page_argument(
+    args: &Value,
+    name: &str,
+    default: usize,
+    minimum: usize,
+) -> Result<usize, String> {
+    let Some(value) = args.get(name) else {
+        return Ok(default);
+    };
+    let value = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| format!("{name} must be an integer >= {minimum} that fits this platform"))?;
+    if value < minimum {
+        return Err(format!("{name} must be an integer >= {minimum}"));
+    }
+    Ok(value)
+}
+
+/// Navigation is rendered once by callers; MCP exposes JSON argument syntax.
+fn caller_mcp_navigation(output: &str) -> String {
+    use std::fmt::Write as _;
+    let mut result = String::new();
+    for line in output.lines() {
+        if line.starts_with("> Showing call sites ") {
+            if let Some((prefix, rest)) = line.split_once("Next page: --offset ") {
+                if let Some((offset, rest)) = rest.split_once(" --limit ") {
+                    if let Some((limit, suffix)) = rest.split_once(' ') {
+                        if let (Ok(offset), Ok(limit)) =
+                            (offset.parse::<usize>(), limit.parse::<usize>())
+                        {
+                            result.push_str(prefix);
+                            let _ = write!(
+                                result,
+                                "Next page: {} {suffix}",
+                                serde_json::json!({"offset":offset,"limit":limit})
+                            );
+                            result.push('\n');
+                            continue;
+                        }
+                    }
+                }
+            }
+        } else if line.starts_with("> Budget may truncate this page. Retry --offset ") {
+            if let Some((offset, _)) = line
+                .strip_prefix("> Budget may truncate this page. Retry --offset ")
+                .and_then(|rest| rest.split_once(' '))
+            {
+                if let Ok(offset) = offset.parse::<usize>() {
+                    let _ = writeln!(result, "> Budget may truncate this page. Retry {} with a smaller limit before advancing.", serde_json::json!({"offset":offset}));
+                    continue;
+                }
+            }
+        }
+        result.push_str(line);
+        result.push('\n');
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_mcp_pages_cover_single_and_multiple_targets() {
+        use std::fmt::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        let source = (0..125).fold(String::new(), |mut source, i| {
+            writeln!(source, "fn caller{i:03}() {{ hot(); cold(); }}").unwrap();
+            source
+        });
+        std::fs::write(root.path().join("calls.rs"), source).unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        for query in ["hot", "hot,cold"] {
+            let run = |offset: usize, limit: Option<usize>| {
+                let mut args = serde_json::json!({"query":query,"kind":"callers","scope":root.path(),"full":true,"expand":0,"offset":offset});
+                if let Some(limit) = limit {
+                    args["limit"] = limit.into();
+                }
+                tool_search(&args, &cache, &session, &bloom).unwrap()
+            };
+            let targets = if query.contains(',') { 2 } else { 1 };
+            let first = run(0, None);
+            let second = run(100, None);
+            assert_eq!(first.matches("[caller:").count(), 100 * targets, "{first}");
+            assert_eq!(second.matches("[caller:").count(), 25 * targets, "{second}");
+            assert!(
+                first.contains("\"offset\":100") && first.contains("\"limit\":100"),
+                "{first}"
+            );
+            assert!(!first.contains("--offset"), "{first}");
+            assert_eq!(
+                second.matches("101-125 of 125").count(),
+                targets,
+                "{second}"
+            );
+            for i in 0..125 {
+                let label = format!("[caller: caller{i:03}]");
+                assert_eq!(
+                    first.matches(&label).count() + second.matches(&label).count(),
+                    targets,
+                    "{label}"
+                );
+            }
+            assert_eq!(run(120, Some(3)).matches("[caller:").count(), 3 * targets);
+            assert!(!run(125, None).contains("[caller:"));
+            assert!(!run(usize::MAX, Some(usize::MAX)).contains("[caller:"));
+            assert_eq!(
+                run(120, Some(usize::MAX)).matches("[caller:").count(),
+                5 * targets
+            );
+        }
+        let args = serde_json::json!({"query":"hot,cold,hot","kind":"callers","scope":root.path(),"offset":2,"limit":3,"expand":0});
+        let output = tool_search(&args, &cache, &session, &bloom).unwrap();
+        assert_eq!(output.matches("[caller:").count(), 6);
+        assert_eq!(output.matches("3-5 of 125").count(), 2);
+    }
+
+    #[test]
+    fn caller_mcp_pagination_rejects_invalid_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        for (name, value) in [
+            ("offset", serde_json::json!(-1)),
+            ("offset", serde_json::json!(1.5)),
+            ("offset", serde_json::json!("1")),
+            ("offset", Value::Null),
+            ("limit", serde_json::json!(0)),
+            ("limit", serde_json::json!(-1)),
+            ("limit", serde_json::json!(1.5)),
+            ("limit", serde_json::json!(true)),
+            ("limit", Value::Null),
+        ] {
+            let mut args = serde_json::json!({"query":"hot","kind":"callers","scope":root.path()});
+            args[name] = value;
+            let error = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+            assert!(error.contains(name), "{error}");
+        }
+        for kind in ["symbol", "content", "regex"] {
+            for name in ["offset", "limit"] {
+                let mut args = serde_json::json!({"query":"hot","kind":kind,"scope":root.path()});
+                args[name] = 1.into();
+                let error = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+                assert!(error.contains("callers"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn caller_mcp_budget_retries_current_page_with_json_arguments() {
+        use std::fmt::Write as _;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("calls.rs"),
+            (0..125).fold(String::new(), |mut source, i| {
+                writeln!(source, "fn caller{i:03}() {{ hot(); cold(); }}").unwrap();
+                source
+            }),
+        )
+        .unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        for query in ["hot", "hot,cold"] {
+            let args = serde_json::json!({"query":query,"kind":"callers","scope":root.path(),"offset":10,"limit":100,"expand":0,"budget":150});
+            let output = tool_search(&args, &cache, &session, &bloom).unwrap();
+            assert!(
+                output.contains("Retry") && output.contains("\"offset\":10"),
+                "{output}"
+            );
+            assert!(
+                !output.contains("Next page:") && !output.contains("--offset"),
+                "{output}"
+            );
+            assert!(output.trim_end().len().div_ceil(4) <= 150, "{output}");
+        }
+    }
 
     #[test]
     fn caller_search_preserves_rare_targets_context_and_totals_before_display_caps() {

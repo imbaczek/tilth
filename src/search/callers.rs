@@ -11,6 +11,7 @@ use crate::lang::detect_file_type;
 use crate::lang::outline::outline_language;
 use crate::types::FileType;
 
+#[cfg(test)]
 const MAX_MATCHES: usize = 10;
 /// Max unique caller functions to trace for 2nd hop. Above this = wide fan-out, skip.
 const IMPACT_FANOUT_THRESHOLD: usize = 10;
@@ -21,6 +22,7 @@ const IMPACT_MAX_RESULTS: usize = 15;
 pub(crate) const BATCH_EARLY_QUIT: usize = 50;
 
 /// Display cap when `--full` is set. Mirrors symbol/content search previews.
+#[cfg(test)]
 const FULL_MAX_MATCHES: usize = 100;
 
 /// A single caller match — a call site of a target symbol.
@@ -614,6 +616,7 @@ fn find_enclosing_function(
 }
 
 /// Format and rank caller search results with optional expand.
+#[cfg(test)]
 pub fn search_callers_expanded(
     target: &str,
     scope: &Path,
@@ -886,6 +889,7 @@ fn write_second_hop_impact(
 /// call for that target would produce (PR #138 review: HIGH — 2nd-hop parity;
 /// MED — header shape parity). Collection is complete before partitioning,
 /// so a hit-rich target cannot starve a rarer one.
+#[cfg(test)]
 pub fn search_callers_multi_expanded(
     targets: &[&str],
     scope: &Path,
@@ -895,7 +899,29 @@ pub fn search_callers_multi_expanded(
     glob: Option<&str>,
     full: bool,
 ) -> Result<String, TilthError> {
-    let max_matches = if full { FULL_MAX_MATCHES } else { MAX_MATCHES };
+    search_callers_multi_page(
+        targets,
+        scope,
+        bloom,
+        expand,
+        context,
+        glob,
+        (0, if full { FULL_MAX_MATCHES } else { MAX_MATCHES }),
+    )
+}
+
+/// Render the same zero-based ranked page independently for each target.
+/// Collect once, and compute totals and impact from each complete target bucket.
+pub fn search_callers_multi_page(
+    targets: &[&str],
+    scope: &Path,
+    bloom: &crate::index::bloom::BloomFilterCache,
+    expand: usize,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    page: (usize, usize),
+) -> Result<String, TilthError> {
+    let (offset, limit) = (page.0, page.1.max(1));
 
     // Dedupe targets, preserving first-seen order: a repeated target (e.g.
     // query "foo,foo") must not render an empty no-callers section on its
@@ -943,16 +969,17 @@ pub fn search_callers_multi_expanded(
             .collect();
 
         let all_direct_locations = callers.iter().map(|c| (c.path.clone(), c.line)).collect();
-        callers.truncate(max_matches);
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
 
         write_caller_bucket(
             &mut output,
             target,
             scope,
             total,
-            &callers,
+            &callers[start..end],
             expand,
-            (0, max_matches),
+            (offset, limit),
         );
         write_second_hop_impact(
             &mut output,

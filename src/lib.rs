@@ -234,6 +234,15 @@ pub fn run_callers_paginated(
 /// limit rather than advancing to the originally requested page end.
 #[must_use]
 pub fn apply_callers_output_budget(output: &str, budget_tokens: u64) -> String {
+    budget::apply(
+        &prepare_callers_output_budget(output, budget_tokens),
+        budget_tokens,
+    )
+}
+
+/// Remove unsafe continuation hints before a caller response is budgeted.
+/// The transport may adapt hint syntax before applying the final output cap.
+pub(crate) fn prepare_callers_output_budget(output: &str, budget_tokens: u64) -> String {
     use std::fmt::Write as _;
     if types::estimate_tokens(output.len() as u64) <= budget_tokens {
         return output.to_owned();
@@ -253,7 +262,7 @@ pub fn apply_callers_output_budget(output: &str, budget_tokens: u64) -> String {
         safe.push_str(line);
         safe.push('\n');
     }
-    budget::apply(&safe, budget_tokens)
+    safe
 }
 
 /// Analyze blast-radius dependencies of a file.

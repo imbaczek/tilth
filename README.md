@@ -123,7 +123,11 @@ tilth isTrustedProxy --callers --full --offset 100 --limit 100 --scope .
 
 Each scope is paginated independently. The output reports the range, total and next offset. Keep the query, scopes and filters unchanged between pages; edits to the source can change the ranking. `--budget` still caps the rendered output. If it truncates a page, reduce `--limit` and retry the same offset before advancing.
 
-In MCP mode, use `kind: "callers"` on `tilth_search`; pagination flags are CLI options.
+In MCP mode, use `kind: "callers"` on `tilth_search` with the same zero-based `offset` and positive `limit` parameters. With comma-separated targets, the page applies independently to each target. An explicit `limit` overrides the default 10-result page (100 with `full: true`). Next-page and budget-retry hints use JSON arguments.
+
+```json
+{"query":"isTrustedProxy","kind":"callers","full":true,"offset":100,"limit":100}
+```
 
 ### File dependencies
 
