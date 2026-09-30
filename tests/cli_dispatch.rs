@@ -666,3 +666,178 @@ fn caller_go_local_constant_uses_the_enclosing_function() {
     let output = String::from_utf8(output.stdout).unwrap();
     assert!(output.contains("calls.go:2 [caller: outer]"), "{output}");
 }
+
+#[test]
+fn grok_budget_works_before_and_after_subcommand() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("target.rs");
+    fs::write(
+        &path,
+        format!(
+            "fn target() {{\n{}\n}}\n",
+            "    println!(\"padding\");\n".repeat(80)
+        ),
+    )
+    .unwrap();
+    let run = |before: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tilth"));
+        if before {
+            command.args(["--budget", "80"]);
+        }
+        command
+            .arg("grok")
+            .arg(format!("{}:1", path.display()))
+            .arg("--scope")
+            .arg(root.path());
+        if !before {
+            command.args(["--budget", "80"]);
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let before = run(true);
+    assert_eq!(before, run(false));
+    assert!(before.trim_end().len().div_ceil(4) <= 80, "{before}");
+    assert!(before.contains("budget: 80"), "{before}");
+    let both = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .args(["--budget", "1", "grok"])
+        .arg(format!("{}:1", path.display()))
+        .arg("--scope")
+        .arg(root.path())
+        .args(["--budget", "80"])
+        .output()
+        .unwrap();
+    assert!(both.status.success());
+    assert_eq!(before, String::from_utf8(both.stdout).unwrap());
+}
+#[test]
+fn caller_pages_cover_ranked_results_without_overlap() {
+    let root = tempfile::tempdir().unwrap();
+    let source = (0..125)
+        .map(|i| format!("fn caller{i:03}() {{ target(); }}\n"))
+        .collect::<String>();
+    fs::write(root.path().join("calls.rs"), source).unwrap();
+    let run = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args(["target", "--callers", "--full", "--expand=0", "--scope"])
+            .arg(root.path())
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let first = run(&[]);
+    let second = run(&["--offset", "100"]);
+    assert_eq!(first.matches("[caller:").count(), 100);
+    assert!(!first.contains("```"), "{first}");
+    assert_eq!(second.matches("[caller:").count(), 25);
+    assert!(first.contains("--offset 100"), "{first}");
+    assert!(second.contains("101-125 of 125"), "{second}");
+    for i in 0..125 {
+        let label = format!("[caller: caller{i:03}]");
+        assert_eq!(
+            first.matches(&label).count() + second.matches(&label).count(),
+            1,
+            "{label}"
+        );
+    }
+    let custom = run(&["--offset", "120", "--limit", "3"]);
+    assert_eq!(custom.matches("[caller:").count(), 3);
+    assert!(
+        custom.contains("121-123 of 125") && custom.contains("--offset 123 --limit 3"),
+        "{custom}"
+    );
+    let empty = run(&["--offset", "125"]);
+    assert!(
+        !empty.contains("[caller:") && empty.contains("offset 125"),
+        "{empty}"
+    );
+    for args in [
+        vec!["target", "--callers", "--limit", "0"],
+        vec!["target", "--offset", "1"],
+    ] {
+        assert!(!Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+}
+
+#[test]
+fn caller_budget_does_not_advance_past_hidden_results() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("calls.rs"),
+        (0..125)
+            .map(|i| format!("fn caller{i:03}() {{ target(); }}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .args(["target", "--callers", "--full", "--scope"])
+        .arg(root.path())
+        .args(["--budget", "150"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(output.contains("Retry --offset 0"), "{output}");
+    assert!(!output.contains("Next page:"), "{output}");
+    assert!(output.trim_end().len().div_ceil(4) <= 150, "{output}");
+}
+
+#[test]
+fn caller_pagination_applies_to_each_scope() {
+    let root = tempfile::tempdir().unwrap();
+    for name in ["first", "second"] {
+        let scope = root.path().join(name);
+        fs::create_dir(&scope).unwrap();
+        fs::write(
+            scope.join("calls.rs"),
+            (0..5)
+                .map(|i| format!("fn {name}{i}() {{ target(); }}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    let run = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args(["target", "--callers", "--scope"])
+            .arg(root.path().join("first"))
+            .arg("--scope")
+            .arg(root.path().join("second"))
+            .args(["--offset", "2", "--limit", "2"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let output = run(&[]);
+    assert_eq!(output.matches("[caller:").count(), 4, "{output}");
+    assert_eq!(output.matches("3-4 of 5").count(), 2, "{output}");
+    for name in ["first", "second"] {
+        for i in 0..5 {
+            assert_eq!(
+                output.contains(&format!("[caller: {name}{i}]")),
+                (2..4).contains(&i),
+                "{output}"
+            );
+        }
+    }
+    let limited = run(&["--budget", "140"]);
+    assert!(limited.trim_end().len().div_ceil(4) <= 140, "{limited}");
+    assert!(!limited.contains("Next page:"), "{limited}");
+}

@@ -115,7 +115,15 @@ $ tilth isTrustedProxy --callers --scope .
 -> if (i == 0) || (!engine.isTrustedProxy(ip)) {
 ```
 
-In MCP mode, use `kind: "callers"` on `tilth_search`.
+Caller previews show up to 10 ranked call sites, or 100 with `--full`. On the CLI, use `--offset N` (zero-based) and `--limit N` (positive page size) to reach the remaining results:
+
+```bash
+tilth isTrustedProxy --callers --full --offset 100 --limit 100 --scope .
+```
+
+Each scope is paginated independently. The output reports the range, total and next offset. Keep the query, scopes and filters unchanged between pages; edits to the source can change the ranking. `--budget` still caps the rendered output. If it truncates a page, reduce `--limit` and retry the same offset before advancing.
+
+In MCP mode, use `kind: "callers"` on `tilth_search`; pagination flags are CLI options.
 
 ### File dependencies
 
@@ -166,6 +174,15 @@ def get_typed_signature(call: Callable[..., Any]) -> inspect.Signature
   dependencies/utils.py
     [277]   in get_dependant()
 ```
+
+Grok accepts `--budget` before or after the subcommand:
+
+```bash
+tilth --budget 2000 grok get_typed_signature --scope fastapi
+tilth grok get_typed_signature --scope fastapi --budget 2000
+```
+
+If supplied in both positions, the value after `grok` takes precedence.
 
 In MCP mode, use the `tilth_grok` tool.
 
