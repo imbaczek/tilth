@@ -40,33 +40,57 @@ pub(crate) fn compute_overlay(
         };
     }
 
-    match file_diff.status {
+    let mut overlay = match file_diff.status {
         FileStatus::Modified => compute_modified(file_diff, source, repo),
         FileStatus::Added => compute_added(file_diff, source, repo),
         FileStatus::Deleted => compute_deleted(file_diff, source, repo),
         FileStatus::Renamed => compute_renamed(file_diff, source, repo),
+    };
+    // Unsupported grammars, added/deleted files and unavailable blobs still
+    // have a patch. Never silently discard its lines or report zero totals.
+    if overlay.attributed_hunks.is_empty() {
+        overlay.attributed_hunks = attribute_hunks(&file_diff.hunks, &[], &[], &[]);
     }
+    overlay
 }
 
 /// Cross-file move detection: match Deleted symbols in one file with Added
 /// symbols in another by (kind, name). Unique pairs become `Moved{old_path}`.
 pub(crate) fn cross_file_matching(overlays: &mut [FileOverlay]) {
     // Collect all Deleted and Added symbols with their overlay index + change index.
-    let mut deleted: HashMap<(OutlineKind, String), Vec<(usize, usize)>> = HashMap::new();
-    let mut added: HashMap<(OutlineKind, String), Vec<(usize, usize)>> = HashMap::new();
+    let mut deleted: HashMap<(OutlineKind, String, u64), Vec<(usize, usize)>> = HashMap::new();
+    let mut added: HashMap<(OutlineKind, String, u64), Vec<(usize, usize)>> = HashMap::new();
 
     for (oi, overlay) in overlays.iter().enumerate() {
         for (ci, change) in overlay.symbol_changes.iter().enumerate() {
             match &change.change {
                 ChangeType::Deleted => {
                     deleted
-                        .entry((change.kind, change.name.clone()))
+                        .entry((
+                            change.kind,
+                            change
+                                .name
+                                .rsplit("::")
+                                .next()
+                                .unwrap_or(&change.name)
+                                .to_string(),
+                            change.structural_hash,
+                        ))
                         .or_default()
                         .push((oi, ci));
                 }
                 ChangeType::Added => {
                     added
-                        .entry((change.kind, change.name.clone()))
+                        .entry((
+                            change.kind,
+                            change
+                                .name
+                                .rsplit("::")
+                                .next()
+                                .unwrap_or(&change.name)
+                                .to_string(),
+                            change.structural_hash,
+                        ))
                         .or_default()
                         .push((oi, ci));
                 }
@@ -130,13 +154,15 @@ pub(crate) fn signature_warnings(overlays: &[FileOverlay]) -> Vec<String> {
         }
     }
 
-    counts
+    let mut warnings: Vec<_> = counts
         .into_iter()
         .filter(|(_, count)| *count > 1)
         .map(|(name, count)| {
             format!("warning: `{name}` signature changed in {count} locations — check callers")
         })
-        .collect()
+        .collect();
+    warnings.sort();
+    warnings
 }
 
 /// Scan a file for merge conflict markers and extract conflict blocks.
@@ -237,7 +263,7 @@ fn compute_modified(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Pat
             let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
             let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
             let changes = match_symbols(&old_syms, &new_syms);
-            let attributed = attribute_hunks(&file_diff.hunks, &changes);
+            let attributed = attribute_hunks(&file_diff.hunks, &changes, &old_syms, &new_syms);
             (changes, attributed)
         }
     } else {
@@ -266,12 +292,14 @@ fn compute_added(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path>)
         };
     };
 
-    let symbol_changes = entries_to_changes(&new_content, path, &ChangeType::Added);
+    let symbols = symbols_for_content(&new_content, path);
+    let symbol_changes = match_symbols(&[], &symbols);
+    let attributed_hunks = attribute_hunks(&file_diff.hunks, &symbol_changes, &[], &symbols);
 
     FileOverlay {
         path: path.clone(),
         symbol_changes,
-        attributed_hunks: Vec::new(),
+        attributed_hunks,
         conflicts: Vec::new(),
         new_content: Some(new_content),
     }
@@ -289,12 +317,14 @@ fn compute_deleted(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path
         };
     };
 
-    let symbol_changes = entries_to_changes(&old_content, path, &ChangeType::Deleted);
+    let symbols = symbols_for_content(&old_content, path);
+    let symbol_changes = match_symbols(&symbols, &[]);
+    let attributed_hunks = attribute_hunks(&file_diff.hunks, &symbol_changes, &symbols, &[]);
 
     FileOverlay {
         path: path.clone(),
         symbol_changes,
-        attributed_hunks: Vec::new(),
+        attributed_hunks,
         conflicts: Vec::new(),
         new_content: None,
     }
@@ -328,7 +358,7 @@ fn compute_renamed(file_diff: &FileDiff, source: &DiffSource, repo: Option<&Path
         let old_syms = build_diff_symbols(&old_entries, &old_content, lang);
         let new_syms = build_diff_symbols(&new_entries, &new_content, lang);
         let changes = match_symbols(&old_syms, &new_syms);
-        let attributed = attribute_hunks(&file_diff.hunks, &changes);
+        let attributed = attribute_hunks(&file_diff.hunks, &changes, &old_syms, &new_syms);
         (changes, attributed)
     } else {
         (Vec::new(), Vec::new())
@@ -455,167 +485,80 @@ fn git_show(spec: &str, repo: Option<&Path>) -> Result<String, String> {
     }
 }
 
-fn get_entries_for_path(path: &Path, content: &str) -> Vec<OutlineEntry> {
-    match detect_file_type(path) {
-        FileType::Code(lang) => get_outline_entries(content, lang),
-        _ => Vec::new(),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Hunk-to-function attribution
 // ---------------------------------------------------------------------------
 
-struct SymRange {
-    name: String,
-    start: u32,
-    end: u32,
-    is_deleted: bool,
-}
-
-/// For each symbol change that has a line range, find which diff lines from
-/// the hunks fall within that symbol. Returns `(symbol_name, lines)` pairs.
+/// Attribute every patch line once, using the old outline for removals and
+/// the new outline for additions/context. Nested declarations belong to the
+/// smallest enclosing symbol; lines outside declarations remain visible.
 fn attribute_hunks(
     hunks: &[super::Hunk],
     changes: &[SymbolChange],
+    old: &[super::DiffSymbol],
+    new: &[super::DiffSymbol],
 ) -> Vec<(String, Vec<DiffLine>)> {
     let mut result: Vec<(String, Vec<DiffLine>)> = Vec::new();
-
-    let active_symbols: Vec<&SymbolChange> = changes
-        .iter()
-        .filter(|c| !matches!(c.change, ChangeType::Unchanged))
-        .collect();
-
-    if active_symbols.is_empty() {
-        return result;
-    }
-
-    let mut sym_ranges: Vec<SymRange> = Vec::new();
-    for change in &active_symbols {
-        let start = change.line;
-        let end = if let Some((old_size, new_size)) = change.size_delta {
-            if matches!(change.change, ChangeType::Deleted) {
-                start + old_size.saturating_sub(1)
-            } else {
-                start + new_size.saturating_sub(1)
-            }
-        } else {
-            start
-        };
-        sym_ranges.push(SymRange {
-            name: change.name.clone(),
-            start,
-            end,
-            is_deleted: matches!(change.change, ChangeType::Deleted),
-        });
-    }
-
-    // Pre-allocate buckets for each symbol.
-    let mut buckets: Vec<Vec<DiffLine>> = (0..sym_ranges.len()).map(|_| Vec::new()).collect();
-
     for hunk in hunks {
         let mut old_line = hunk.old_start;
         let mut new_line = hunk.new_start;
-
-        for diff_line in &hunk.lines {
-            match diff_line.kind {
-                DiffLineKind::Context => {
-                    // Attribute by new-file line.
-                    for (si, sr) in sym_ranges.iter().enumerate() {
-                        if !sr.is_deleted && new_line >= sr.start && new_line <= sr.end {
-                            buckets[si].push(DiffLine {
-                                kind: diff_line.kind,
-                                content: diff_line.content.clone(),
-                            });
-                        }
+        for line in &hunk.lines {
+            let removed = matches!(line.kind, DiffLineKind::Removed);
+            let (symbols, number) = if removed {
+                (old, old_line)
+            } else {
+                (new, new_line)
+            };
+            let symbol = symbols
+                .iter()
+                .filter(|s| s.entry.start_line <= number && number <= s.entry.end_line)
+                .min_by_key(|s| {
+                    (
+                        s.entry.end_line - s.entry.start_line,
+                        std::cmp::Reverse(s.entry.start_line),
+                    )
+                });
+            let name = symbol.and_then(|s| {
+                let name = super::matching::symbol_name(s);
+                changes.iter().find(|c| {
+                    c.kind == s.identity.kind && if removed {
+                        c.old_line == Some(s.entry.start_line) && (c.name == name || matches!(&c.change,
+                            ChangeType::Renamed { old_name } | ChangeType::RenamedAndMoved { old_name, .. }
+                                if old_name == &name))
+                    } else {
+                        c.line == s.entry.start_line && c.name == name
+                            && !matches!(c.change, ChangeType::Deleted)
                     }
-                    old_line += 1;
-                    new_line += 1;
-                }
-                DiffLineKind::Added => {
-                    // Attribute by new-file line.
-                    for (si, sr) in sym_ranges.iter().enumerate() {
-                        if !sr.is_deleted && new_line >= sr.start && new_line <= sr.end {
-                            buckets[si].push(DiffLine {
-                                kind: diff_line.kind,
-                                content: diff_line.content.clone(),
-                            });
-                        }
-                    }
-                    new_line += 1;
-                }
-                DiffLineKind::Removed => {
-                    // Attribute by old-file line.
-                    for (si, sr) in sym_ranges.iter().enumerate() {
-                        if sr.is_deleted && old_line >= sr.start && old_line <= sr.end {
-                            buckets[si].push(DiffLine {
-                                kind: diff_line.kind,
-                                content: diff_line.content.clone(),
-                            });
-                        }
-                    }
-                    old_line += 1;
-                }
+                }).map(super::symbol_key)
+            }).unwrap_or_else(|| "<top-level>".to_string());
+            let index = result
+                .iter()
+                .position(|(key, _)| key == &name)
+                .unwrap_or_else(|| {
+                    result.push((name, Vec::new()));
+                    result.len() - 1
+                });
+            result[index].1.push(DiffLine {
+                line: Some(if removed { old_line } else { new_line }),
+                kind: line.kind,
+                content: line.content.clone(),
+            });
+            if !matches!(line.kind, DiffLineKind::Added) {
+                old_line += 1;
+            }
+            if !removed {
+                new_line += 1;
             }
         }
     }
-
-    // Collect non-empty buckets.
-    for (si, lines) in buckets.into_iter().enumerate() {
-        if !lines.is_empty() {
-            result.push((sym_ranges[si].name.clone(), lines));
-        }
-    }
-
     result
 }
 
-// ---------------------------------------------------------------------------
-// Outline → SymbolChange helpers
-// ---------------------------------------------------------------------------
-
-/// Convert outline entries to symbol changes of a single type (Added or Deleted).
-fn entries_to_changes(content: &str, path: &Path, change_type: &ChangeType) -> Vec<SymbolChange> {
-    let entries = get_entries_for_path(path, content);
-    let mut changes = Vec::new();
-    collect_entries_recursive(&entries, change_type, &mut changes);
-    changes
-}
-
-fn collect_entries_recursive(
-    entries: &[OutlineEntry],
-    change_type: &ChangeType,
-    out: &mut Vec<SymbolChange>,
-) {
-    for entry in entries {
-        // Skip imports/exports — not interesting for symbol-level diff.
-        if matches!(entry.kind, OutlineKind::Import | OutlineKind::Export) {
-            continue;
-        }
-
-        let (old_sig, new_sig) = match change_type {
-            ChangeType::Added => (None, entry.signature.clone()),
-            ChangeType::Deleted => (entry.signature.clone(), None),
-            _ => (None, None),
-        };
-
-        out.push(SymbolChange {
-            name: entry.name.clone(),
-            kind: entry.kind,
-            change: change_type.clone(),
-            match_confidence: MatchConfidence::Exact,
-            line: entry.start_line,
-            old_sig,
-            new_sig,
-            size_delta: Some((
-                entry.end_line.saturating_sub(entry.start_line) + 1,
-                entry.end_line.saturating_sub(entry.start_line) + 1,
-            )),
-        });
-
-        if !entry.children.is_empty() {
-            collect_entries_recursive(&entry.children, change_type, out);
-        }
+fn symbols_for_content(content: &str, path: &Path) -> Vec<super::DiffSymbol> {
+    if let FileType::Code(lang) = detect_file_type(path) {
+        build_diff_symbols(&get_outline_entries(content, lang), content, lang)
+    } else {
+        Vec::new()
     }
 }
 

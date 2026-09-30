@@ -181,6 +181,9 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
         let end_line = symbol_end_line(change);
 
         if matches!(change.change, ChangeType::Unchanged) {
+            if !hunk_map.contains_key(super::symbol_key(change).as_str()) {
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "\n## [ ] {} (L{line}-{end_line}, unchanged)",
@@ -209,8 +212,19 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
         }
 
         // Diff lines attributed to this symbol.
-        if let Some(lines) = hunk_map.get(change.name.as_str()) {
+        if let Some(lines) = hunk_map.get(super::symbol_key(change).as_str()) {
             write_diff_lines(&mut out, lines, line);
+        }
+    }
+
+    for (name, lines) in &overlay.attributed_hunks {
+        if !overlay
+            .symbol_changes
+            .iter()
+            .any(|change| &super::symbol_key(change) == name)
+        {
+            let _ = writeln!(out, "\n## {name}");
+            write_diff_lines(&mut out, lines, 1);
         }
     }
 
@@ -223,7 +237,18 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
 
 /// Format detailed view of a single named function within a file's diff.
 pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> String {
-    let change = overlay.symbol_changes.iter().find(|c| c.name == fn_name);
+    let candidates: Vec<_> = overlay
+        .symbol_changes
+        .iter()
+        .filter(|c| c.name == fn_name || c.name.rsplit("::").next() == Some(fn_name))
+        .collect();
+    if candidates.len() > 1 {
+        return format!(
+            "# Diff: {} — `{fn_name}` is ambiguous; use a qualified symbol name",
+            overlay.path.display()
+        );
+    }
+    let change = candidates.first().copied();
 
     let Some(change) = change else {
         return format!(
@@ -258,7 +283,7 @@ pub(crate) fn format_function_detail(overlay: &FileOverlay, fn_name: &str) -> St
     let lines = overlay
         .attributed_hunks
         .iter()
-        .find(|(name, _)| name == fn_name)
+        .find(|(name, _)| name == &super::symbol_key(change))
         .map_or(empty, |(_, lines)| lines.as_slice());
 
     if !lines.is_empty() {
@@ -454,6 +479,9 @@ fn format_symbol_line(change: &SymbolChange) -> String {
                 let _ = write!(s, "  (deleted, {old_sz} lines)");
             }
         }
+        ChangeType::Moved { old_path } | ChangeType::RenamedAndMoved { old_path, .. } => {
+            let _ = write!(s, "  (from {})", old_path.display());
+        }
         _ => {}
     }
 
@@ -484,7 +512,8 @@ fn write_diff_lines(out: &mut String, lines: &[DiffLine], base_line: u32) {
             DiffLineKind::Removed => '-',
             DiffLineKind::Context => ' ',
         };
-        let _ = writeln!(out, "  {prefix}{new_line:>4}| {}", dl.content);
+        let shown_line = dl.line.unwrap_or(new_line);
+        let _ = writeln!(out, "  {prefix}{shown_line:>4}| {}", dl.content);
         match dl.kind {
             DiffLineKind::Added | DiffLineKind::Context => new_line += 1,
             DiffLineKind::Removed => {} // old-file line — don't advance new counter
@@ -555,6 +584,8 @@ mod tests {
             change,
             match_confidence: MatchConfidence::Exact,
             line: 42,
+            old_line: Some(42),
+            structural_hash: 0,
             old_sig: None,
             new_sig: None,
             size_delta: Some((10, 12)),
@@ -568,6 +599,8 @@ mod tests {
             change: ChangeType::SignatureChanged,
             match_confidence: MatchConfidence::Exact,
             line: 42,
+            old_line: Some(42),
+            structural_hash: 0,
             old_sig: Some(old.to_string()),
             new_sig: Some(new.to_string()),
             size_delta: Some((10, 10)),
@@ -647,14 +680,17 @@ mod tests {
             "top".to_string(),
             vec![
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Added,
                     content: "a".to_string(),
                 },
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Removed,
                     content: "b".to_string(),
                 },
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Context,
                     content: "c".to_string(),
                 },
@@ -765,14 +801,17 @@ mod tests {
             "foo".to_string(),
             vec![
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Added,
                     content: "x".to_string(),
                 },
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Added,
                     content: "y".to_string(),
                 },
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Removed,
                     content: "z".to_string(),
                 },
@@ -795,14 +834,17 @@ mod tests {
             "foo".to_string(),
             vec![
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Added,
                     content: "added line".to_string(),
                 },
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Removed,
                     content: "removed line".to_string(),
                 },
                 DiffLine {
+                    line: None,
                     kind: DiffLineKind::Context,
                     content: "context line".to_string(),
                 },
@@ -837,7 +879,15 @@ mod tests {
             make_change("fn_changed", ChangeType::BodyChanged),
             make_change("fn_unchanged", ChangeType::Unchanged),
         ];
-        let overlay = make_overlay("src/lib.rs", changes);
+        let mut overlay = make_overlay("src/lib.rs", changes);
+        overlay.attributed_hunks = vec![(
+            "fn_unchanged@42".to_string(),
+            vec![DiffLine {
+                line: None,
+                kind: DiffLineKind::Context,
+                content: "context".to_string(),
+            }],
+        )];
         let out = format_file_detail(&overlay, None);
         assert!(
             out.contains("[ ] fn_unchanged"),
@@ -854,8 +904,9 @@ mod tests {
             vec![make_change("my_fn", ChangeType::BodyChanged)],
         );
         overlay.attributed_hunks = vec![(
-            "my_fn".to_string(),
+            "my_fn@42".to_string(),
             vec![DiffLine {
+                line: None,
                 kind: DiffLineKind::Added,
                 content: "new code".to_string(),
             }],
@@ -925,18 +976,22 @@ mod tests {
                 "fn_a".to_string(),
                 vec![
                     DiffLine {
+                        line: None,
                         kind: DiffLineKind::Added,
                         content: "a".to_string(),
                     },
                     DiffLine {
+                        line: None,
                         kind: DiffLineKind::Added,
                         content: "b".to_string(),
                     },
                     DiffLine {
+                        line: None,
                         kind: DiffLineKind::Removed,
                         content: "c".to_string(),
                     },
                     DiffLine {
+                        line: None,
                         kind: DiffLineKind::Context,
                         content: "d".to_string(),
                     },
@@ -945,6 +1000,7 @@ mod tests {
             (
                 "fn_b".to_string(),
                 vec![DiffLine {
+                    line: None,
                     kind: DiffLineKind::Removed,
                     content: "e".to_string(),
                 }],
