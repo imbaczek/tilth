@@ -43,7 +43,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "enum": ["symbol", "content", "regex", "callers"],
                         "default": "symbol",
-                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find all call sites of a symbol."
+                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find ranked call sites, with offset/limit pagination per target."
                     },
                     "expand": {
                         "type": "number",
@@ -53,7 +53,18 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Widen the match cap from 10 to 100 per query, for every kind. Costs tokens — use it when 10 matches cannot answer the question."
+                        "description": "Widen the match cap from 10 to 100 per query, for every kind. For callers, an explicit limit overrides this default page size. Costs tokens — use it when 10 matches cannot answer the question."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Skip N ranked call sites per target (zero-based). Only supported for kind: callers. Keep query, scope, context and filters unchanged between pages."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Call sites per page per target. Only supported for kind: callers. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
                     },
                     "context": {
                         "type": "string",
@@ -406,6 +417,23 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn search_schema_exposes_caller_pagination() {
+        let tools = tool_definitions(false);
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "tilth_search")
+            .unwrap();
+        let properties = &search["inputSchema"]["properties"];
+        for (name, minimum) in [("offset", 0), ("limit", 1)] {
+            assert_eq!(properties[name]["type"], "integer");
+            assert_eq!(properties[name]["minimum"], minimum);
+            assert!(properties[name]["description"]
+                .as_str()
+                .unwrap()
+                .contains("callers"));
+        }
+    }
 
     #[test]
     fn tilth_write_schema_requires_mode_specific_fields() {
