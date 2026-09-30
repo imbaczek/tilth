@@ -699,8 +699,32 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
     None
 }
 
-/// Extract a doc comment from the previous sibling.
+/// Collect the contiguous documentation block immediately before a declaration.
 fn extract_doc(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> Option<String> {
+    let mut boundary = node;
+    let mut parts = Vec::new();
+    while let Some(previous) = boundary.prev_sibling() {
+        let Some(part) = extract_doc_comment(boundary, lines, lang) else {
+            break;
+        };
+        parts.push(part);
+        boundary = previous;
+    }
+    parts.reverse();
+    let doc = parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if doc.is_empty() {
+        None
+    } else {
+        Some(doc)
+    }
+}
+
+/// Validate ownership and documentation syntax for one preceding comment node.
+fn extract_doc_comment(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> Option<String> {
     let prev = node.prev_sibling()?;
     let kind = prev.kind();
     if kind.contains("comment") || kind.contains("doc") {
@@ -764,20 +788,68 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> Option<St
         {
             return None;
         }
-        let trimmed = text
-            .trim_start_matches("///")
-            .trim_start_matches("//!")
-            .trim_start_matches("/**")
-            .trim_start_matches('#')
-            .trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
+        // Compiler/tool directives may sit inside a Go documentation group.
+        // Skip their payload without losing adjacent human documentation.
+        if lang == Lang::Go
+            && (text.starts_with("//go:")
+                || text
+                    .strip_prefix("//line")
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace)))
+        {
+            return Some(String::new());
         }
+        let start = prev.start_position();
+        let last_column = if end.column == 0 {
+            lines.get(last_row)?.len()
+        } else {
+            end.column
+        };
+        let full_text =
+            source_text_between(lines, (start.row, start.column), (last_row, last_column));
+        Some(normalize_doc_comment(&full_text, lang))
     } else {
         None
     }
+}
+
+/// Render comment prose as one doc summary, without its syntactic delimiters.
+fn normalize_doc_comment(text: &str, lang: Lang) -> String {
+    if text == "/**/" {
+        return String::new();
+    }
+    let block = text.starts_with("/*");
+    let body = if block {
+        let body = text
+            .strip_prefix("/**")
+            .or_else(|| text.strip_prefix("/*!"))
+            .or_else(|| text.strip_prefix("/*"))
+            .unwrap_or(text);
+        body.strip_suffix("*/").unwrap_or(body)
+    } else {
+        text
+    };
+    body.lines()
+        .flat_map(|line| {
+            let line = line.trim();
+            let prose = if block {
+                line.strip_prefix('*')
+                    .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                    .unwrap_or(line)
+                    .trim()
+            } else if lang == Lang::Go {
+                line.strip_prefix("//").unwrap_or(line).trim()
+            } else {
+                line.strip_prefix("///")
+                    .or_else(|| line.strip_prefix("//!"))
+                    .or_else(|| line.strip_prefix("//"))
+                    .or_else(|| line.strip_prefix('#'))
+                    .unwrap_or(line)
+                    .trim()
+            };
+            prose.split_whitespace()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1278,132 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 #[cfg(test)]
 mod doc_comment_tests {
     use super::*;
+
+    #[test]
+    fn multiline_line_docs_keep_all_lines_without_comment_markers() {
+        for (lang, source) in [
+            (
+                Lang::Go,
+                "package demo\n// First sentence.\n// Second sentence.\nfunc Public() {}\n",
+            ),
+            (
+                Lang::Rust,
+                "/// First sentence.\n/// Second sentence.\npub fn public() {}\n",
+            ),
+            (
+                Lang::TypeScript,
+                "/// First sentence.\n/// Second sentence.\nfunction publicFunction() {}\n",
+            ),
+            (
+                Lang::Python,
+                "# First sentence.\n# Second sentence.\ndef public():\n    pass\n",
+            ),
+        ] {
+            let outline = entries(source, lang);
+            let doc = outline
+                .iter()
+                .find(|e| e.kind == OutlineKind::Function)
+                .unwrap()
+                .doc
+                .as_deref();
+            assert_eq!(doc, Some("First sentence. Second sentence."), "{lang:?}");
+        }
+    }
+
+    #[test]
+    fn multiline_block_docs_keep_content_and_strip_delimiters() {
+        for (lang, source) in [
+            (Lang::TypeScript, "/**\n * First sentence.\n * Second sentence.\n */\nfunction publicFunction() {}\n"),
+            (Lang::Rust, "/**\n * First sentence.\n * Second sentence.\n */\npub fn public() {}\n"),
+            (Lang::Cpp, "/*!\n * First sentence.\n * Second sentence.\n */\nint publicFunction() { return 1; }\n"),
+        ] {
+            let outline = entries(source, lang);
+            assert_eq!(outline[0].doc.as_deref(), Some("First sentence. Second sentence."), "{lang:?}");
+        }
+    }
+
+    #[test]
+    fn multiline_docs_stop_at_ownership_and_syntax_boundaries() {
+        for source in [
+            "/// Detached.\n\n/// Attached.\npub fn function() {}\n",
+            "/// Earlier.\n// section\n/// Attached.\npub fn function() {}\n",
+            "const PREVIOUS: i32 = 1; /// Previous.\n/// Attached.\npub fn function() {}\n",
+            "//! Module.\n/// Attached.\npub fn function() {}\n",
+        ] {
+            let outline = entries(source, Lang::Rust);
+            let function = outline.iter().find(|e| e.name == "function").unwrap();
+            assert_eq!(function.doc.as_deref(), Some("Attached."), "{source}");
+        }
+        let outline = entries(
+            "/// <reference types=\"node\" />\n/// Attached.\nfunction declaration() {}\n",
+            Lang::TypeScript,
+        );
+        assert_eq!(outline[0].doc.as_deref(), Some("Attached."));
+    }
+
+    #[test]
+    fn go_directives_do_not_replace_or_pollute_human_docs() {
+        let outline = entries("package demo\n// First sentence.\n//go:noinline\n// Second sentence.\n//go:linkname Public other.Public\nfunc Public() {}\n//go:noinline\nfunc Bare() {}\n//line other.go:42\nfunc Located() {}\n", Lang::Go);
+        assert_eq!(
+            outline
+                .iter()
+                .find(|e| e.name == "Public")
+                .unwrap()
+                .doc
+                .as_deref(),
+            Some("First sentence. Second sentence.")
+        );
+        for name in ["Bare", "Located"] {
+            assert!(
+                outline
+                    .iter()
+                    .find(|e| e.name == name)
+                    .unwrap()
+                    .doc
+                    .is_none(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn multiline_docs_preserve_unicode_and_prose_delimiters() {
+        let outline = entries(
+            "/// 文档 🦀\n///\n/// https://example.test/a // quoted\npub fn function() {}\n",
+            Lang::Rust,
+        );
+        assert_eq!(
+            outline[0].doc.as_deref(),
+            Some("文档 🦀 https://example.test/a // quoted")
+        );
+        let outline = entries(
+            "/** *important* prose\n * 文档 🦀\n */\nfunction declaration() {}",
+            Lang::TypeScript,
+        );
+        assert_eq!(outline[0].doc.as_deref(), Some("*important* prose 文档 🦀"));
+        let outline = entries("///\n///\npub fn function() {}\n", Lang::Rust);
+        assert!(outline[0].doc.is_none());
+        for comment in ["/**/", "/** */", "/**\n *\n */"] {
+            let outline = entries(
+                &format!("{comment}\nfunction declaration() {{}}\n"),
+                Lang::TypeScript,
+            );
+            assert!(outline[0].doc.is_none(), "{comment}");
+        }
+        let outline = entries(
+            "package demo\n///srv/path\n//! Important.\nfunc Public() {}\n",
+            Lang::Go,
+        );
+        assert_eq!(
+            outline
+                .iter()
+                .find(|e| e.name == "Public")
+                .unwrap()
+                .doc
+                .as_deref(),
+            Some("/srv/path ! Important.")
+        );
+    }
 
     fn entries(source: &str, lang: Lang) -> Vec<OutlineEntry> {
         let mut parser = tree_sitter::Parser::new();

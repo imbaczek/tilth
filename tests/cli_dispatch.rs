@@ -3,6 +3,63 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn multiline_docs_are_readable_in_outline_and_grok() {
+    let root = tempfile::tempdir().unwrap();
+    for (filename, declaration_line, source) in [
+        (
+            "docs.go",
+            4,
+            "package demo\n// First sentence.\n// Second sentence.\nfunc Public() {}\n",
+        ),
+        (
+            "docs.ts",
+            5,
+            "/**\n * First sentence.\n * Second sentence.\n */\nfunction publicFunction() {}\n",
+        ),
+    ] {
+        let path = root.path().join(filename);
+        fs::write(
+            &path,
+            format!(
+                "{source}{}",
+                "// filler to force an outline rather than full content\n".repeat(1000)
+            ),
+        )
+        .unwrap();
+        for grok in [false, true] {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_tilth"));
+            if grok {
+                command
+                    .arg("grok")
+                    .arg(format!("{}:{declaration_line}", path.display()))
+                    .arg("--scope")
+                    .arg(root.path());
+            } else {
+                command.arg(&path);
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let output = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                output.contains("First sentence. Second sentence."),
+                "{filename} grok={grok}: {output}"
+            );
+            assert!(
+                !output.contains("// //") && !output.contains("Second sentence. */"),
+                "{output}"
+            );
+            if !grok {
+                assert!(output.contains("[outline]"), "{output}");
+            }
+        }
+    }
+}
+
+#[test]
 fn joined_file_outline_budget_compacts_before_dropping_symbols() {
     let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
     let fields = (0..30)
