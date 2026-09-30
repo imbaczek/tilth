@@ -504,3 +504,165 @@ fn captured_file_read_honors_explicit_section() {
     assert!(stdout.contains("body_only_marker"));
     assert!(!stdout.contains("operation_59"));
 }
+
+#[test]
+fn caller_initializers_use_enclosing_functions_and_preserve_callbacks() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("calls.ts"),
+        r#"function target() {}
+const globalResult = target();
+function outer() {
+  const result = target();
+  let other = target();
+  var legacy = target();
+  const nested = () => { const result = target(); };
+  it('example', () => { const result = target(); });
+}
+class Service {
+  run() { const result = target(); }
+}
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .args(["target", "--callers", "--scope"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    for (line, label) in [
+        (2, "globalResult"),
+        (4, "outer"),
+        (5, "outer"),
+        (6, "outer"),
+        (7, "nested"),
+        (8, "it('example') callback"),
+        (11, "Service.run"),
+    ] {
+        assert!(
+            output.contains(&format!("calls.ts:{line} [caller: {label}]")),
+            "{output}"
+        );
+    }
+    assert!(
+        !output.contains("[caller: result]") && !output.contains("[caller: Service.result]"),
+        "{output}"
+    );
+}
+
+#[test]
+fn grok_root_relative_path_with_nested_scope_keeps_caller_scope() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir_all(root.path().join("src/nested")).unwrap();
+    fs::write(
+        root.path().join("src/nested/target.rs"),
+        "fn target() {}\nfn inside() { target(); }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("outside.rs"),
+        "fn outside() { target(); }\n",
+    )
+    .unwrap();
+    for target in ["src/nested/target.rs:1", "target.rs:1"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .current_dir(root.path())
+            .args(["grok", target, "--scope", "src/nested"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.starts_with("# grok: target ["), "{output}");
+        assert!(
+            output.contains("inside") && !output.contains("outside"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn caller_local_constants_and_generators_keep_callable_identity() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("calls.rs"), "fn rust_target() {}\nfn rust_outer() { const LOCAL: () = rust_target(); static OTHER: () = rust_target(); }\n").unwrap();
+    fs::write(root.path().join("calls.ts"), "function target() {}\nfunction* generate() { const value = target(); }\nconst nested = function* () { const value = target(); };\n").unwrap();
+    for (target, expected) in [
+        ("rust_target", vec!["rust_outer", "rust_outer"]),
+        ("target", vec!["generate", "nested"]),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args([target, "--callers", "--scope"])
+            .arg(root.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = String::from_utf8(output.stdout).unwrap();
+        assert!(output.contains("— 2 call sites"), "{output}");
+        for label in expected {
+            assert!(output.contains(&format!("[caller: {label}]")), "{output}");
+        }
+        assert!(
+            !output.contains("[caller: LOCAL]")
+                && !output.contains("[caller: OTHER]")
+                && !output.contains("[caller: value]"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn caller_shell_command_substitutions_use_the_enclosing_function() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("calls.sh"),
+        "target() { :; }\nouter() { value=$(target); }\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .args(["target", "--callers", "--scope"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(output.contains("calls.sh:2 [caller: outer]"), "{output}");
+}
+
+#[test]
+fn caller_go_local_constant_uses_the_enclosing_function() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("calls.go"),
+        "package demo\nfunc outer() { const width = len(\"hello\") }\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .args(["len", "--callers", "--scope"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    assert!(output.contains("calls.go:2 [caller: outer]"), "{output}");
+}

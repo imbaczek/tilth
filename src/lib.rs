@@ -239,6 +239,8 @@ pub fn run_deps_with_options(
 ///
 /// `target_spec` accepts a bare symbol name (`parse_unified_diff`), a path:line
 /// pair (`src/diff/parse.rs:7`), or a `Type::method` reference.
+/// Relative target paths resolve within `scope` first, then the current
+/// checkout directory. Caller discovery remains restricted to `scope`.
 pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let session = session::Session::default();
@@ -247,7 +249,9 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
     } else {
         search::grok::GrokCaps::default()
     };
-    let result = search::grok::grok(target_spec, scope, &bloom, &session, caps)?;
+    let root = std::env::current_dir().ok();
+    let result =
+        search::grok::grok_with_root(target_spec, scope, &bloom, &session, caps, root.as_deref())?;
     Ok(search::grok::format_grok(&result, scope))
 }
 

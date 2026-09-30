@@ -66,9 +66,18 @@ fn parse_target_spec(s: &str) -> TargetSpec {
 
 /// Resolve a target spec and return the loaded source plus its detected
 /// language. Single file read; single outline parse downstream.
+#[cfg(test)]
 fn resolve_with_source(
     spec: &str,
     scope: &Path,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    resolve_with_source_at_root(spec, scope, None)
+}
+
+fn resolve_with_source_at_root(
+    spec: &str,
+    scope: &Path,
+    root: Option<&Path>,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     match parse_target_spec(spec) {
         TargetSpec::Symbol(name) => resolve_by_name(&name, scope),
@@ -76,7 +85,18 @@ fn resolve_with_source(
             let path = if path.is_absolute() {
                 path
             } else {
-                scope.join(path)
+                if root.is_some_and(|root| !root.is_absolute()) {
+                    return Err(TilthError::InvalidQuery {
+                        query: spec.to_string(),
+                        reason: "root must be an absolute checkout directory".to_string(),
+                    });
+                }
+                let scoped = scope.join(&path);
+                if scoped.is_file() {
+                    scoped
+                } else {
+                    root.map_or(scoped, |root| root.join(path))
+                }
             };
             resolve_by_path_line(&path, line)
         }
@@ -450,6 +470,7 @@ pub struct GrokResult {
 /// callees walk happen against the live filesystem — they each carry their own
 /// TOCTOU window, but stitching them into one bundle is bounded by the call
 /// duration and acceptable for an interactive code-intelligence tool.
+#[cfg(test)]
 pub fn grok(
     target_spec: &str,
     scope: &Path,
@@ -457,7 +478,20 @@ pub fn grok(
     session: &crate::session::Session,
     caps: GrokCaps,
 ) -> Result<GrokResult, TilthError> {
-    let (target, content, lang) = resolve_with_source(target_spec, scope)?;
+    grok_with_root(target_spec, scope, bloom, session, caps, None)
+}
+
+/// Resolve a scope-relative target first, then fall back to the caller's
+/// checkout root. The caller scan still uses only `scope`.
+pub(crate) fn grok_with_root(
+    target_spec: &str,
+    scope: &Path,
+    bloom: &BloomFilterCache,
+    session: &crate::session::Session,
+    caps: GrokCaps,
+    root: Option<&Path>,
+) -> Result<GrokResult, TilthError> {
+    let (target, content, lang) = resolve_with_source_at_root(target_spec, scope, root)?;
     let entries = get_outline_entries(&content, lang);
 
     // --- Callees -----------------------------------------------------------
@@ -1822,6 +1856,38 @@ fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<Si
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn target_root_fallback_preserves_scope_precedence_and_absolute_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let scope = root.join("nested");
+        fs::create_dir(&scope).unwrap();
+        write_fixture(root, "target.rs", "fn root_target() {}\n");
+        write_fixture(&scope, "target.rs", "fn scoped_target() {}\n");
+        let resolve = |spec: &str, root: Option<&Path>| {
+            resolve_with_source_at_root(spec, &scope, root).unwrap().0
+        };
+        assert_eq!(resolve("target.rs:1", Some(root)).name, "scoped_target");
+        assert_eq!(resolve("target.rs:1", None).name, "scoped_target");
+        assert_eq!(resolve("scoped_target", Some(root)).name, "scoped_target");
+        let absolute = format!("{}:1", root.join("target.rs").display());
+        assert_eq!(resolve(&absolute, Some(root)).name, "root_target");
+        let invalid =
+            resolve_with_source_at_root("target.rs:1", &scope, Some(Path::new("relative")))
+                .unwrap_err();
+        assert!(
+            invalid.to_string().contains("absolute checkout"),
+            "{invalid}"
+        );
+        let missing = resolve_with_source_at_root("missing.rs:1", &scope, Some(root)).unwrap_err();
+        assert!(
+            missing
+                .to_string()
+                .contains(&root.join("missing.rs").display().to_string()),
+            "{missing}"
+        );
+    }
 
     #[test]
     fn named_class_resolution_keeps_same_named_equal_range_constructor_separate() {
