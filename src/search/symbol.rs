@@ -479,7 +479,13 @@ fn walk_for_definitions(
 
         if def_kinds.contains(&kind) {
             // Check if this node defines the queried symbol
-            if let Some(name) = (def_ops.extract_name)(node, lines) {
+            // Export wrappers name the same declaration as their child. Only
+            // the declaration is a definition, even when decorators put the
+            // wrapper and child on different lines.
+            if let Some(name) = (kind != "export_statement")
+                .then(|| (def_ops.extract_name)(node, lines))
+                .flatten()
+            {
                 if name == query {
                     let line_num = node.start_position().row as u32 + 1;
                     let line_text = lines

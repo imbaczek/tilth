@@ -3,6 +3,38 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn decorator_grok_and_symbol_search_keep_one_correct_definition() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("service.ts");
+    fs::write(
+        &path,
+        "@Injectable()\nexport class Service {\n @First()\n method() {}\n}\n",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg("grok")
+        .arg(format!("{}:3", path.display()))
+        .arg("--scope")
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let grok = String::from_utf8(output.stdout).unwrap();
+    assert!(grok.starts_with("# grok: method ["), "{grok}");
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg("Service")
+        .arg("--scope")
+        .arg(root.path())
+        .arg("--expand=0")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let search = String::from_utf8(output.stdout).unwrap();
+    assert!(search.contains("1 definitions"), "{search}");
+    assert_eq!(search.matches("[definition]").count(), 1, "{search}");
+}
+
+#[test]
 fn grok_non_ts_caller_totals_survive_default_and_full_display_caps() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("target.rs");

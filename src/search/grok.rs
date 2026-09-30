@@ -145,10 +145,17 @@ fn resolve_by_path_line(
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let (content, lang) = read_code_file(path)?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_entry_at_line(&entries, line).ok_or_else(|| TilthError::NotFound {
-        path: path.to_path_buf(),
-        suggestion: Some(format!("no definition encloses line {line}")),
-    })?;
+    let decorated_method = crate::lang::treesitter::decorated_method_at_line(&content, lang, line);
+    let entry = decorated_method
+        .as_ref()
+        .and_then(|(declaration_line, name)| {
+            find_named_entry_at_line(&entries, *declaration_line, name)
+        })
+        .or_else(|| find_entry_at_line(&entries, line))
+        .ok_or_else(|| TilthError::NotFound {
+            path: path.to_path_buf(),
+            suggestion: Some(format!("no definition encloses line {line}")),
+        })?;
     let target = target_from_entry(entry, path.to_path_buf(), 0);
     Ok((target, content, lang))
 }
@@ -220,7 +227,8 @@ fn enrich_from_outline(
         other => other,
     })?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_by_start_line(&entries, start_line)
+    let entry = find_named_entry_at_line(&entries, start_line, split_qualified(&name))
+        .or_else(|| find_by_start_line(&entries, start_line))
         .or_else(|| find_entry_at_line(&entries, start_line));
     let target = match entry {
         Some(e) => target_from_entry(e, path, other_def_count),
@@ -267,6 +275,29 @@ fn find_entry_at_line(entries: &[OutlineEntry], line: u32) -> Option<&OutlineEnt
         }
     }
     best
+}
+
+fn find_named_entry_at_line<'a>(
+    entries: &'a [OutlineEntry],
+    line: u32,
+    name: &str,
+) -> Option<&'a OutlineEntry> {
+    for entry in entries {
+        if entry.start_line <= line && line <= entry.end_line {
+            // Preserve the selected declaration when its name and start match;
+            // a same-named constructor may share the class's entire line range.
+            if entry.start_line == line && entry.name == name {
+                return Some(entry);
+            }
+            if let Some(child) = find_named_entry_at_line(&entry.children, line, name) {
+                return Some(child);
+            }
+            if entry.name == name {
+                return Some(entry);
+            }
+        }
+    }
+    None
 }
 
 /// Walk the outline tree and return the first entry whose `start_line == line`.
@@ -1791,6 +1822,128 @@ fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<Si
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn named_class_resolution_keeps_same_named_equal_range_constructor_separate() {
+        let tmp = tempfile::tempdir().unwrap();
+        for source in [
+            "class Example { public Example() {} }\n",
+            "class Example { public Example() {\n work();\n} }\n",
+        ] {
+            write_fixture(tmp.path(), "example.cs", source);
+            let (target, _, _) = resolve_with_source("Example", tmp.path()).unwrap();
+            assert_eq!(target.name, "Example");
+            assert_eq!(target.kind, OutlineKind::Class);
+            assert!(target.signature.is_none());
+        }
+    }
+
+    #[test]
+    fn grok_method_decorator_lookup_excludes_decorator_calls_and_body() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(tmp.path(), "service.ts", "function Wrap(value: unknown) {}\nfunction makeDependency() {}\nfunction realWork() {}\nclass Service {\n @Wrap(makeDependency())\n method() { realWork(); }\n}\n");
+        let result = grok(
+            &format!("{}:5", path.display()),
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.target.name, "method");
+        assert_eq!(result.target.start_line, 6);
+        assert!(result.body.contains("realWork"));
+        assert!(!result.body.contains("Wrap"));
+        assert_eq!(
+            result
+                .callees_internal
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["realWork"]
+        );
+        assert!(
+            result.callees_external.is_empty(),
+            "{:?}",
+            result.callees_external
+        );
+    }
+
+    #[test]
+    fn ts_method_decorator_lines_resolve_to_the_method() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(tmp.path(), "service.ts", "@Injectable()\nexport class Service {\n  @First()\n  @Second({\n    name: 'method'\n  })\n  method() { return 1; }\n  next() {}\n}\n");
+        for line in 3..=7 {
+            let (target, _, _) = resolve_by_path_line(&path, line).unwrap();
+            assert_eq!(target.name, "method", "line {line}");
+            assert_eq!(target.kind, OutlineKind::Function);
+            assert_eq!(target.start_line, 7);
+            assert_eq!(target.end_line, 7);
+        }
+        let (class, _, _) = resolve_by_path_line(&path, 1).unwrap();
+        assert_eq!(class.name, "Service");
+        assert_eq!(class.kind, OutlineKind::Class);
+        let (next, _, _) = resolve_by_path_line(&path, 8).unwrap();
+        assert_eq!(next.name, "next");
+    }
+
+    #[test]
+    fn decorated_ts_class_is_one_definition() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "service.ts",
+            "@Injectable()\nexport class Service { method() {} }\n",
+        );
+        let result = search_symbol_raw("Service", tmp.path(), None, false).unwrap();
+        let definitions: Vec<_> = result.matches.iter().filter(|m| m.is_definition).collect();
+        assert_eq!(definitions.len(), 1, "{definitions:?}");
+        let (target, _, _) = resolve_with_source("Service", tmp.path()).unwrap();
+        assert_eq!(target.other_def_count, 0);
+    }
+
+    #[test]
+    fn decorated_class_variants_preserve_underlying_export_definitions() {
+        for extension in ["ts", "tsx", "js"] {
+            for source in [
+                "@First()\n@Second()\nexport class Service { method() {} }\n",
+                "@First()\nexport default class Service { method() {} }\n",
+                "@First()\nclass Service { method() {} }\n",
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                write_fixture(tmp.path(), &format!("service.{extension}"), source);
+                let result = search_symbol_raw("Service", tmp.path(), None, false).unwrap();
+                assert_eq!(
+                    result.matches.iter().filter(|m| m.is_definition).count(),
+                    1,
+                    "{extension}: {source}\n{result:?}"
+                );
+                let (target, _, _) = resolve_with_source("Service", tmp.path()).unwrap();
+                assert_eq!(target.name, "Service");
+                assert_eq!(target.kind, OutlineKind::Class);
+                assert_eq!(target.other_def_count, 0);
+                let path = tmp.path().join(format!("service.{extension}"));
+                let (from_decorator, _, _) = resolve_by_path_line(&path, 1).unwrap();
+                assert_eq!(from_decorator.name, "Service", "{extension}: {source}");
+                assert_eq!(from_decorator.kind, OutlineKind::Class);
+            }
+        }
+    }
+
+    #[test]
+    fn method_decorator_comments_do_not_capture_the_next_method() {
+        for extension in ["ts", "tsx", "js"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = write_fixture(tmp.path(), &format!("service.{extension}"), "class Service {\n @First()\n // comment between decorator and method\n @Second()\n /* method doc */\n method() {}\n next() {}\n}\n");
+            for line in 2..=6 {
+                let (target, _, _) = resolve_by_path_line(&path, line).unwrap();
+                assert_eq!(target.name, "method", "{extension}, line {line}");
+            }
+            let (next, _, _) = resolve_by_path_line(&path, 7).unwrap();
+            assert_eq!(next.name, "next");
+            assert_eq!(next.start_line, 7);
+        }
+    }
 
     #[test]
     fn non_ts_grok_includes_oversized_caller_files() {

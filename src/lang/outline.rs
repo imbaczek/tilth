@@ -1572,6 +1572,44 @@ mod signature_change_classification_regression_tests {
     use crate::types::Lang;
 
     #[test]
+    fn decorated_method_diff_keeps_full_ast_signature_and_token_comparison() {
+        let old = "class Service {\n @First()\n @Second()\n method(value: string):\n One | Two { return value; }\n}\n";
+        let new = "class Service {\n @First()\n @Second()\n method(value: string):\n | One\n | Two { return value; }\n}\n";
+        let symbols = |source: &str| {
+            build_diff_symbols(
+                &get_outline_entries(source, Lang::TypeScript),
+                source,
+                Lang::TypeScript,
+            )
+        };
+        let old_symbols = symbols(old);
+        let method = old_symbols
+            .iter()
+            .find(|s| s.identity.name == "method")
+            .unwrap();
+        assert_eq!(method.entry.start_line, 4);
+        let signature = method.entry.signature.as_deref().unwrap();
+        assert!(signature.contains('\n'), "{signature}");
+        assert!(!signature.contains("@First"), "{signature}");
+        let formatted = match_symbols(&old_symbols, &symbols(new));
+        assert!(
+            formatted
+                .iter()
+                .filter(|c| c.name == "Service::method")
+                .all(|c| !matches!(c.change, ChangeType::SignatureChanged)),
+            "{formatted:?}"
+        );
+        let changed = match_symbols(&old_symbols, &symbols(&new.replace("Two", "Three")));
+        assert!(
+            changed
+                .iter()
+                .any(|c| c.name == "Service::method"
+                    && matches!(c.change, ChangeType::SignatureChanged)),
+            "{changed:?}"
+        );
+    }
+
+    #[test]
     fn quoted_default_whitespace_is_classified_as_signature_change() {
         let old = "def f(value: str = \"a  b\"):\n    return value\n";
         let new = "def f(value: str = \"a b\"):\n    return value\n";

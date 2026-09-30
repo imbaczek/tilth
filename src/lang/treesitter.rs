@@ -45,6 +45,69 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "export_statement",
 ];
 
+/// Include decorators preceding a declaration in JS/TS class bodies.
+/// These grammars can emit method decorators as siblings rather than children.
+pub(crate) fn declaration_start_line(node: tree_sitter::Node, lang: crate::types::Lang) -> u32 {
+    let mut start = node.start_position().row as u32 + 1;
+    if !matches!(
+        lang,
+        crate::types::Lang::TypeScript | crate::types::Lang::Tsx | crate::types::Lang::JavaScript
+    ) {
+        return start;
+    }
+    let mut previous = node.prev_named_sibling();
+    while let Some(sibling) = previous {
+        match sibling.kind() {
+            "decorator" => start = sibling.start_position().row as u32 + 1,
+            "comment" => {}
+            _ => break,
+        }
+        previous = sibling.prev_named_sibling();
+    }
+    start
+}
+
+/// Resolve a method's leading decorator line without widening its body range.
+pub(crate) fn decorated_method_at_line(
+    content: &str,
+    lang: crate::types::Lang,
+    line: u32,
+) -> Option<(u32, String)> {
+    if !matches!(
+        lang,
+        crate::types::Lang::TypeScript | crate::types::Lang::Tsx | crate::types::Lang::JavaScript
+    ) {
+        return None;
+    }
+    let grammar = crate::lang::outline::outline_language(lang)?;
+    let mut parser = tree_sitter::Parser::new();
+    parser.set_language(&grammar).ok()?;
+    let tree = parser.parse(content, None)?;
+    let lines: Vec<_> = content.lines().collect();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        let declaration_line = node.start_position().row as u32 + 1;
+        if matches!(node.kind(), "method_definition" | "method_declaration")
+            && declaration_start_line(node, lang) <= line
+            && line < declaration_line
+        {
+            return Some((declaration_line, extract_definition_name(node, &lines)?));
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return None;
+            }
+        }
+    }
+}
+
 /// Extract the name defined by a tree-sitter definition node.
 ///
 /// Walks standard field names (`name`, `identifier`, `declarator`) and handles
