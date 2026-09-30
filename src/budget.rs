@@ -10,6 +10,11 @@ pub const DEFAULT_BUDGET: u64 = 24_000;
 /// 2. Truncate content at section boundaries to avoid broken output
 /// 3. Never exceed the budget
 pub fn apply(output: &str, budget: u64) -> String {
+    if estimate_tokens(output.len() as u64) > budget {
+        if let Some(outline) = apply_outline(output, budget) {
+            return outline;
+        }
+    }
     if let Some(errors_start) = output.find("\n\n## Scope errors\n") {
         let lines_start = errors_start + "\n\n## Scope errors\n".len();
         let lines_end = output[lines_start..]
@@ -142,9 +147,222 @@ pub fn apply(output: &str, budget: u64) -> String {
     }
 }
 
+/// Code outlines have navigational entry rows followed by optional signature
+/// rows. Compact those details before dropping whole entries from the end.
+fn apply_outline(output: &str, budget: u64) -> Option<String> {
+    use std::fmt::Write as _;
+    let header = output.lines().next()?;
+    if !(header.starts_with("# Scope: ")
+        || (header.starts_with("# ") && header.ends_with("[outline]")))
+    {
+        return None;
+    }
+    // Each entry carries any immediately preceding scope/file headers so a
+    // retained row always has its file context, including in joined reads.
+    let mut entries: Vec<(String, bool, Vec<&str>)> = Vec::new();
+    let mut pending = String::new();
+    let mut in_outline = false;
+    let mut capped = false;
+    for line in output.lines() {
+        if line.starts_with("# ") {
+            if line.ends_with("[outline]") {
+                in_outline = true;
+            } else if line.starts_with("# Scope: ") {
+                in_outline = false;
+            } else {
+                return None;
+            }
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str(line);
+            pending.push('\n');
+            continue;
+        }
+        if line.is_empty() || line == "---" {
+            continue;
+        }
+        let trimmed = line.trim_start();
+        let is_entry = trimmed
+            .strip_prefix('[')
+            .and_then(|s| s.split_once(']'))
+            .is_some_and(|(range, rest)| {
+                !range.is_empty()
+                    && range.chars().all(|c| c.is_ascii_digit() || c == '-')
+                    && rest.starts_with(' ')
+            });
+        if is_entry && in_outline {
+            if !pending.is_empty() {
+                pending.push('\n');
+            }
+            pending.push_str(line);
+            pending.push('\n');
+            entries.push((std::mem::take(&mut pending), false, Vec::new()));
+        } else if pending.is_empty()
+            && !entries.is_empty()
+            && line.starts_with(' ')
+            && !trimmed.starts_with('>')
+        {
+            entries.last_mut()?.1 = true;
+        } else if line.starts_with("> outline truncated") {
+            capped = true;
+        } else if !pending.is_empty() {
+            pending.push_str(line);
+            pending.push('\n');
+        } else {
+            entries.last_mut()?.2.push(line);
+        }
+    }
+    if entries.is_empty() || !pending.is_empty() {
+        return None;
+    }
+    let total = entries.len();
+    let signatures = entries.iter().any(|entry| entry.1);
+    let mut result = String::new();
+    let mut with_notes = String::new();
+    let mut ends = vec![0];
+    let mut note_ends = vec![0];
+    let mut note_counts = vec![0];
+    for entry in &entries {
+        result.push_str(&entry.0);
+        with_notes.push_str(&entry.0);
+        for note in &entry.2 {
+            with_notes.push_str(note);
+            with_notes.push('\n');
+        }
+        ends.push(result.len());
+        note_ends.push(with_notes.len());
+        note_counts.push(note_counts.last()? + entry.2.len());
+    }
+    for keep in (0..=total).rev() {
+        result.truncate(ends[keep]);
+        with_notes.truncate(note_ends[keep]);
+        let marker = format!(
+            "... outline compacted ({} entries omitted{}{})",
+            total - keep,
+            if signatures {
+                "; signatures omitted"
+            } else {
+                ""
+            },
+            if capped {
+                "; source outline capped"
+            } else {
+                ""
+            }
+        );
+        if estimate_tokens((with_notes.len() + marker.len()) as u64) <= budget {
+            with_notes.push_str(&marker);
+            return Some(with_notes);
+        }
+        if note_counts[keep] > 0 {
+            result.push_str(marker.trim_end_matches(')'));
+            let _ = write!(result, "; {} notes omitted)", note_counts[keep]);
+        } else {
+            result.push_str(&marker);
+        }
+        if estimate_tokens(result.len() as u64) <= budget {
+            return Some(result);
+        }
+    }
+    let marker = "... outline omitted (budget too small)";
+    Some(if estimate_tokens(marker.len() as u64) <= budget {
+        marker.into()
+    } else {
+        String::new()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outline_budget_drops_signatures_before_entries() {
+        let input = format!("# demo.ts (200 lines, ~8k tokens) [outline]\n\n[1-100]      class Demo\n  [2-50]       fn first\n             first({})\n  [51-99]      fn second\n             second({})", "参数".repeat(100), "x".repeat(500));
+        let result = apply(&input, 80);
+        assert!(
+            result.contains("class Demo")
+                && result.contains("fn first")
+                && result.contains("fn second"),
+            "{result}"
+        );
+        assert!(
+            !result.contains("first(") && !result.contains("second("),
+            "{result}"
+        );
+        assert!(
+            result.contains("0 entries omitted; signatures omitted"),
+            "{result}"
+        );
+        assert!(estimate_tokens(result.len() as u64) <= 80);
+        assert_eq!(apply(&input, 1000), input);
+    }
+
+    #[test]
+    fn outline_budget_never_splits_entry_names() {
+        let input = format!("# demo.ts [outline]\n\n[1-100] class Demo\n  [2-3] fn {}\n  [4-5] fn last\n\n> outline truncated — more symbols exist below cap.", "名称".repeat(100));
+        let result = apply(&input, 40);
+        assert!(
+            !result.contains("名称") && !result.contains("fn last"),
+            "{result}"
+        );
+        assert!(
+            result.contains("2 entries omitted") && result.contains("source outline capped"),
+            "{result}"
+        );
+        assert!(estimate_tokens(result.len() as u64) <= 40);
+        assert!(apply(&input, 0).is_empty());
+    }
+
+    #[test]
+    fn outline_budget_preserves_or_reports_navigation_notes() {
+        let input = format!("# demo.ts [outline]\n\n[1-100] fn demo\n             demo({})\n\n> Related: sibling.ts", "x".repeat(1000));
+        let result = apply(&input, 50);
+        assert!(
+            result.contains("fn demo") && result.contains("> Related: sibling.ts"),
+            "{result}"
+        );
+        let input = input.replace("sibling.ts", &"large-related-path".repeat(100));
+        let result = apply(&input, 50);
+        assert!(
+            result.contains("fn demo") && result.contains("1 notes omitted"),
+            "{result}"
+        );
+        assert!(estimate_tokens(result.len() as u64) <= 50);
+    }
+
+    #[test]
+    fn outline_budget_compacts_joined_scope_and_file_outlines() {
+        let file = |name: &str| {
+            format!("# {name}.ts [outline]\n\n[1-10] class Container\n  [2] fn first\n             first({})\n  [3] fn second\n             second({})", "x".repeat(400), "y".repeat(400))
+        };
+        let a = file("a");
+        let b = file("b");
+        for input in [
+            format!("{a}\n\n{b}"),
+            format!("# Scope: a\n\n{a}\n\n---\n# Scope: b\n\n{b}"),
+        ] {
+            let result = apply(&input, 120);
+            assert_eq!(result.matches("class Container").count(), 2, "{result}");
+            assert_eq!(result.matches("fn first").count(), 2, "{result}");
+            assert_eq!(result.matches("fn second").count(), 2, "{result}");
+            assert!(
+                result.contains("# a.ts") && result.contains("# b.ts"),
+                "{result}"
+            );
+            assert!(
+                result.contains("0 entries omitted; signatures omitted"),
+                "{result}"
+            );
+            assert!(estimate_tokens(result.len() as u64) <= 120);
+            let tight = apply(&input, 50);
+            if tight.contains("# b.ts") {
+                assert_eq!(tight.matches("class Container").count(), 2, "{tight}");
+            }
+            assert!(estimate_tokens(tight.len() as u64) <= 50);
+        }
+    }
 
     #[test]
     fn scope_error_budget_keeps_whole_entries_or_reports_omission() {

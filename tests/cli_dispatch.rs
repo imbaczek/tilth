@@ -3,6 +3,95 @@ use std::fs;
 use std::process::Command;
 
 #[test]
+fn joined_file_outline_budget_compacts_before_dropping_symbols() {
+    let roots = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+    let fields = (0..30)
+        .map(|i| format!("field{i}: string"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("class Container {{\n first(argument: {{{fields}}}) {{}}\n second(argument: {{{fields}}}) {{}}\n}}\n{}", "// padding for file view\n".repeat(1000));
+    for root in &roots {
+        fs::write(root.path().join("short.ts"), &source).unwrap();
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .arg("short.ts")
+        .arg("--scope")
+        .arg(roots[0].path())
+        .arg("--scope")
+        .arg(roots[1].path())
+        .args(["--budget", "160"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = String::from_utf8(output.stdout).unwrap();
+    for label in ["class Container", "fn first", "fn second"] {
+        assert_eq!(output.matches(label).count(), 2, "{output}");
+    }
+    assert!(
+        output.contains("0 entries omitted; signatures omitted"),
+        "{output}"
+    );
+    assert!(output.trim_end().len().div_ceil(4) <= 160);
+}
+
+#[test]
+fn file_outline_budget_preserves_navigation_and_method_docs() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("service.ts");
+    let mut source = String::from("class Service {\n");
+    for (name, comment) in [
+        ("first", "// section name"),
+        ("second", "/** Actual method documentation */"),
+        ("third", "// another section"),
+    ] {
+        writeln!(source, "  {comment}\n  {name}(argumentWithAVeryLongName: string, anotherLongArgument: number): string {{").unwrap();
+        for _ in 0..250 {
+            writeln!(source, "    console.log(argumentWithAVeryLongName);").unwrap();
+        }
+        writeln!(source, "    return argumentWithAVeryLongName;\n  }}").unwrap();
+    }
+    source.push_str("}\n");
+    fs::write(&path, source).unwrap();
+    let run = |budget: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .arg(&path)
+            .args(["--budget", budget])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let roomy = run("1000");
+    assert!(roomy.contains("Actual method documentation"), "{roomy}");
+    assert!(
+        !roomy.contains("section name") && !roomy.contains("another section"),
+        "{roomy}"
+    );
+    let compact = run("100");
+    assert!(
+        compact.contains("[outline]") && compact.contains("class Service"),
+        "{compact}"
+    );
+    for name in ["first", "second", "third"] {
+        assert!(compact.contains(&format!("fn {name}")), "{compact}");
+    }
+    assert!(!compact.contains("argumentWithAVeryLongName"), "{compact}");
+    assert!(
+        compact.contains("0 entries omitted; signatures omitted"),
+        "{compact}"
+    );
+    assert!(compact.trim_end().len().div_ceil(4) <= 100);
+}
+
+#[test]
 fn spec_maps_show_test_titles_and_keep_real_code_symbols() {
     let root = tempfile::tempdir().unwrap();
     for filename in ["service.spec.ts", "service.test.tsx", "service.test.js"] {

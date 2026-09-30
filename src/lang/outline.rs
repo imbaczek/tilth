@@ -108,7 +108,7 @@ fn node_to_entry(
             .find(|child| matches!(child.kind(), "function_definition" | "class_definition"))?;
         let mut entry = node_to_entry(declaration, lines, lang, depth)?;
         if entry.doc.is_none() {
-            entry.doc = extract_doc(node, lines);
+            entry.doc = extract_doc(node, lines, lang);
         }
         return Some(entry);
     }
@@ -323,7 +323,7 @@ fn node_to_entry(
     };
 
     // Extract doc comment if present
-    let doc = extract_doc(node, lines);
+    let doc = extract_doc(node, lines, lang);
 
     Some(OutlineEntry {
         kind,
@@ -700,11 +700,70 @@ fn first_identifier_text(node: tree_sitter::Node, lines: &[&str]) -> Option<Stri
 }
 
 /// Extract a doc comment from the previous sibling.
-fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+fn extract_doc(node: tree_sitter::Node, lines: &[&str], lang: Lang) -> Option<String> {
     let prev = node.prev_sibling()?;
     let kind = prev.kind();
     if kind.contains("comment") || kind.contains("doc") {
         let text = node_text(prev, lines);
+        if lang == Lang::Rust
+            && (text.starts_with("////") || text.starts_with("/***") || text == "/**/")
+        {
+            return None;
+        }
+        if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript)
+            && text.strip_prefix("///").is_some_and(|body| {
+                let body = body.trim_start();
+                ["<reference", "<amd-module", "<amd-dependency"]
+                    .iter()
+                    .any(|tag| {
+                        body.strip_prefix(tag).is_some_and(|rest| {
+                            rest.starts_with(char::is_whitespace)
+                                || rest.starts_with('>')
+                                || rest.starts_with('/')
+                        })
+                    })
+            })
+        {
+            return None;
+        }
+        // Ordinary C-style comments often label a section rather than document
+        // its first declaration. These languages have explicit doc markers.
+        if matches!(
+            lang,
+            Lang::Rust
+                | Lang::TypeScript
+                | Lang::Tsx
+                | Lang::JavaScript
+                | Lang::Java
+                | Lang::Scala
+                | Lang::C
+                | Lang::Cpp
+                | Lang::Php
+                | Lang::Swift
+                | Lang::Kotlin
+                | Lang::CSharp
+        ) && !(text.starts_with("///")
+            || text.starts_with("/**")
+            || (matches!(lang, Lang::C | Lang::Cpp) && text.starts_with("//!"))
+            || (lang != Lang::Rust && text.starts_with("/*!")))
+        {
+            return None;
+        }
+        // A separated or trailing comment belongs to its surrounding section
+        // or preceding statement, even if it uses documentation syntax.
+        let end = prev.end_position();
+        let last_row = if end.column == 0 {
+            end.row.saturating_sub(1)
+        } else {
+            end.row
+        };
+        if (last_row != node.start_position().row && last_row + 1 != node.start_position().row)
+            || lines
+                .get(prev.start_position().row)
+                .is_some_and(|line| !line[..prev.start_position().column].trim().is_empty())
+        {
+            return None;
+        }
         let trimmed = text
             .trim_start_matches("///")
             .trim_start_matches("//!")
@@ -1142,6 +1201,125 @@ pub fn get_outline_entries(content: &str, lang: Lang) -> Vec<OutlineEntry> {
 
     let lines: Vec<&str> = content.lines().collect();
     walk_top_level(tree.root_node(), &lines, lang)
+}
+
+#[cfg(test)]
+mod doc_comment_tests {
+    use super::*;
+
+    fn entries(source: &str, lang: Lang) -> Vec<OutlineEntry> {
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&outline_language(lang).unwrap())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        walk_top_level(tree.root_node(), &source.lines().collect::<Vec<_>>(), lang)
+    }
+
+    #[test]
+    fn section_comments_are_not_method_docs() {
+        for lang in [Lang::TypeScript, Lang::Tsx, Lang::JavaScript] {
+            let outline = entries("class Service {\n  // section name\n  first() {}\n  /* Other section */\n  second() {}\n  /** Actual method documentation */\n  documented() {}\n}\n", lang);
+            let children = &outline[0].children;
+            assert_eq!(children.len(), 3);
+            assert!(children[0].doc.is_none() && children[1].doc.is_none());
+            assert!(children[2]
+                .doc
+                .as_deref()
+                .unwrap()
+                .contains("Actual method documentation"));
+        }
+    }
+
+    #[test]
+    fn detached_and_trailing_docs_do_not_attach() {
+        let outline = entries("const previous = 1; /** Previous documentation */\nfunction next() {}\n/** Section documentation */\n\nfunction detached() {}\n/// Actual documentation\nfunction documented() {}\n", Lang::TypeScript);
+        assert!(outline
+            .iter()
+            .find(|e| e.name == "next")
+            .unwrap()
+            .doc
+            .is_none());
+        assert!(outline
+            .iter()
+            .find(|e| e.name == "detached")
+            .unwrap()
+            .doc
+            .is_none());
+        assert_eq!(
+            outline
+                .iter()
+                .find(|e| e.name == "documented")
+                .unwrap()
+                .doc
+                .as_deref(),
+            Some("Actual documentation")
+        );
+    }
+
+    #[test]
+    fn same_line_jsdoc_attaches_to_its_declaration() {
+        let outline = entries(
+            "class Service {\n  /** Alpha docs */ alpha() {}\n}\n",
+            Lang::TypeScript,
+        );
+        assert!(outline[0].children[0]
+            .doc
+            .as_deref()
+            .unwrap()
+            .contains("Alpha docs"));
+    }
+
+    #[test]
+    fn doxygen_line_documentation_remains_supported() {
+        for lang in [Lang::C, Lang::Cpp] {
+            let outline = entries(
+                "//! Doxygen documentation\nint documented() { return 1; }\n",
+                lang,
+            );
+            assert_eq!(outline[0].doc.as_deref(), Some("Doxygen documentation"));
+        }
+    }
+
+    #[test]
+    fn typescript_directives_are_not_declaration_docs() {
+        for directive in [
+            "/// <reference types=\"node\" />",
+            "///<amd-module name=\"service\" />",
+            "/// <amd-dependency path=\"dep\" />",
+        ] {
+            let outline = entries(
+                &format!("{directive}\nclass Service {{}}\n"),
+                Lang::TypeScript,
+            );
+            assert!(outline[0].doc.is_none(), "{directive}");
+        }
+    }
+
+    #[test]
+    fn rust_separator_markers_are_not_docs() {
+        for comment in ["//// section comment", "/*** section comment */", "/**/"] {
+            let outline = entries(&format!("{comment}\npub fn function() {{}}\n"), Lang::Rust);
+            assert!(outline[0].doc.is_none(), "{comment}");
+        }
+    }
+
+    #[test]
+    fn native_plain_comment_docs_remain_supported() {
+        let go = entries(
+            "package demo\n// Public documents the Go function.\nfunc Public() {}\n",
+            Lang::Go,
+        );
+        assert!(go
+            .iter()
+            .find(|e| e.name == "Public")
+            .unwrap()
+            .doc
+            .is_some());
+        let rust = entries("//! Module documentation\npub fn first() {}\n/// Function documentation\npub fn documented() {}\n", Lang::Rust);
+        assert!(rust[0].doc.is_none());
+        assert_eq!(rust[1].doc.as_deref(), Some("Function documentation"));
+    }
 }
 
 #[cfg(test)]
