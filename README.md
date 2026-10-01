@@ -36,6 +36,15 @@ The examples in this README are real output from the [FastAPI](https://github.co
 
 ## Search finds definitions first
 
+Use `tilth search <query>` for an explicit search command. It accepts the same
+options as `tilth <query>`, including `--scope`, `--glob`, `--expand`, and `--json`.
+Options can go before or after `search`. Repeated scopes combine; for options
+with a single value, a value after `search` takes precedence.
+
+```bash
+tilth search get_typed_signature --scope fastapi --expand=1
+```
+
 ````
 $ tilth get_typed_signature --scope fastapi --expand=1
 # Search: "get_typed_signature" in fastapi — 2 matches (1 definitions, 1 usages)

@@ -16,9 +16,31 @@ struct Cli {
     /// File path, symbol name, glob pattern, or text to search.
     query: Option<String>,
 
+    #[command(flatten)]
+    search: SearchOptions,
+
+    /// Run as MCP server (JSON-RPC on stdio).
+    #[arg(long)]
+    mcp: bool,
+
+    /// Enable edit mode: hashline output + tilth_write tool.
+    #[arg(long, conflicts_with_all = ["callers", "deps"])]
+    edit: bool,
+
+    /// Disable project fingerprint in MCP init.
+    #[arg(long)]
+    no_overview: bool,
+
+    /// Print shell completions for the given shell.
+    #[arg(long, value_name = "SHELL")]
+    completions: Option<Shell>,
+}
+
+#[derive(clap::Args)]
+struct SearchOptions {
     /// Directory to search within or resolve relative paths against. Can be
     /// repeated to search in multiple directories.
-    #[arg(long, default_value = ".")]
+    #[arg(long)]
     scope: Vec<PathBuf>,
 
     /// Respect .gitignore, .ignore, and Git exclude files while walking.
@@ -51,18 +73,6 @@ struct Cli {
     #[arg(long)]
     json: bool,
 
-    /// Run as MCP server (JSON-RPC on stdio).
-    #[arg(long)]
-    mcp: bool,
-
-    /// Enable edit mode: hashline output + tilth_write tool.
-    #[arg(long)]
-    edit: bool,
-
-    /// Disable project fingerprint in MCP init.
-    #[arg(long)]
-    no_overview: bool,
-
     /// Inline source for top N search matches (default 2 when flag bare).
     ///
     /// Applies to symbol / text / regex queries. Without the flag the
@@ -86,24 +96,64 @@ struct Cli {
     limit: Option<std::num::NonZeroUsize>,
 
     /// Find callers of a symbol; use --offset and --limit to paginate.
-    #[arg(long, conflicts_with_all = ["deps", "map", "edit"])]
+    #[arg(long, conflicts_with_all = ["deps", "map"])]
     callers: bool,
 
     /// Analyze blast-radius dependencies of a file.
-    #[arg(long, conflicts_with_all = ["callers", "map", "edit"])]
+    #[arg(long, conflicts_with_all = ["callers", "map"])]
     deps: bool,
 
     /// Generate a structural codebase map.
     #[arg(long, conflicts_with_all = ["callers", "deps", "expand", "section", "full"])]
     map: bool,
+}
 
-    /// Print shell completions for the given shell.
-    #[arg(long, value_name = "SHELL")]
-    completions: Option<Shell>,
+impl SearchOptions {
+    fn merge(&mut self, options: Self) {
+        self.scope.extend(options.scope);
+        self.respect_gitignore |= options.respect_gitignore;
+        self.section = options.section.or(self.section.take());
+        self.budget = options.budget.or(self.budget);
+        self.full |= options.full;
+        self.json |= options.json;
+        self.expand = options.expand.or(self.expand);
+        self.glob = options.glob.or(self.glob.take());
+        self.offset = options.offset.or(self.offset);
+        self.limit = options.limit.or(self.limit);
+        self.callers |= options.callers;
+        self.deps |= options.deps;
+        self.map |= options.map;
+    }
+
+    fn validate(&self, edit: bool) -> Result<(), clap::Error> {
+        let conflict = if self.callers && (self.deps || self.map || edit) {
+            Some("--callers conflicts with --deps, --map, and --edit")
+        } else if self.deps && (self.map || edit) {
+            Some("--deps conflicts with --map and --edit")
+        } else if self.map && (self.expand.is_some() || self.section.is_some() || self.full) {
+            Some("--map conflicts with --expand, --section, and --full")
+        } else {
+            None
+        };
+        match conflict {
+            Some(message) => Err(clap::Error::raw(
+                clap::error::ErrorKind::ArgumentConflict,
+                message,
+            )),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Search for a file, symbol, glob pattern, or text.
+    Search {
+        /// File path, symbol name, glob pattern, or text search.
+        query: String,
+        #[command(flatten)]
+        options: SearchOptions,
+    },
     /// Install tilth into an MCP host's config.
     /// Supported hosts: claude-code, cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex, amp, droid, antigravity, zed, copilot-cli, augment, kiro, kilo-code, cline, roo-code, trae, qwen-code, crush, pi
     Install {
@@ -181,9 +231,19 @@ enum Command {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    if let Some(Command::Search { query, options }) = cli
+        .command
+        .take_if(|cmd| matches!(cmd, Command::Search { .. }))
+    {
+        cli.query = Some(query);
+        cli.search.merge(options);
+        if let Err(error) = cli.search.validate(cli.edit) {
+            error.exit();
+        }
+    }
 
-    if cli.respect_gitignore {
+    if cli.search.respect_gitignore {
         std::env::set_var("TILTH_RESPECT_GITIGNORE", "1");
     }
     configure_thread_pools();
@@ -197,6 +257,7 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
+            Command::Search { .. } => unreachable!("search is handled as a query"),
             Command::Install { ref host, edit } => {
                 if let Err(e) = tilth::install::run(host, edit) {
                     eprintln!("install error: {e}");
@@ -221,7 +282,7 @@ fn main() {
                 let scope = scope.canonicalize().unwrap_or(scope);
                 match tilth::run_grok(&target, &scope, full) {
                     Ok(output) => emit_output(
-                        &apply_optional_budget(output, budget.or(cli.budget)),
+                        &apply_optional_budget(output, budget.or(cli.search.budget)),
                         io::stdout().is_terminal(),
                     ),
                     Err(e) => {
@@ -285,13 +346,13 @@ fn main() {
             std::env::set_var("TILTH_NO_OVERVIEW", "1");
         }
         // Pass --scope to MCP if it's not the default "."
-        let mcp_scope = if scopes_are_default(&cli.scope) {
+        let mcp_scope = if scopes_are_default(&cli.search.scope) {
             None
-        } else if cli.scope.len() == 1 {
+        } else if cli.search.scope.len() == 1 {
             Some(
-                cli.scope[0]
+                cli.search.scope[0]
                     .canonicalize()
-                    .unwrap_or_else(|_| cli.scope[0].clone()),
+                    .unwrap_or_else(|_| cli.search.scope[0].clone()),
             )
         } else {
             eprintln!("mcp mode accepts only one --scope");
@@ -307,13 +368,13 @@ fn main() {
     let is_tty = io::stdout().is_terminal();
 
     // Map mode
-    if cli.map {
+    if cli.search.map {
         let cache = tilth::cache::OutlineCache::new();
-        let scopes = resolve_scopes(&cli.scope);
+        let scopes = resolve_scopes(&cli.search.scope);
         let output = run_for_scopes(&scopes, |scope| {
-            Ok(tilth::map::generate(scope, 3, cli.budget, &cache))
+            Ok(tilth::map::generate(scope, 3, cli.search.budget, &cache))
         });
-        let output = apply_optional_budget(output, cli.budget);
+        let output = apply_optional_budget(output, cli.search.budget);
         emit_output(&output, is_tty);
         return;
     }
@@ -327,60 +388,63 @@ fn main() {
     };
 
     let cache = tilth::cache::OutlineCache::new();
-    let scopes = resolve_scopes(&cli.scope);
+    let scopes = resolve_scopes(&cli.search.scope);
 
     // Output destination only controls paging. File views and search expansion
     // are selected by explicit flags, so captured agent calls keep smart views.
-    let expand = compute_expand(cli.expand, cli.full);
+    let expand = compute_expand(cli.search.expand, cli.search.full);
 
     // Callers mode
-    if cli.callers {
+    if cli.search.callers {
         let result = run_query_for_scopes(&scopes, &query, None, |scope| {
             tilth::run_callers_paginated(
                 &query,
                 scope,
                 expand,
                 None,
-                cli.glob.as_deref(),
-                cli.full,
-                (cli.offset.unwrap_or(0), cli.limit.map(|limit| limit.get())),
+                cli.search.glob.as_deref(),
+                cli.search.full,
+                (
+                    cli.search.offset.unwrap_or(0),
+                    cli.search.limit.map(|limit| limit.get()),
+                ),
             )
         });
-        let result = result.map(|output| match cli.budget {
+        let result = result.map(|output| match cli.search.budget {
             Some(budget) => tilth::apply_callers_output_budget(&output, budget),
             None => output,
         });
-        emit_result(result, &query, cli.json, is_tty);
+        emit_result(result, &query, cli.search.json, is_tty);
         return;
     }
 
     // Deps mode
-    if cli.deps {
-        let result = run_query_for_scopes(&scopes, &query, cli.budget, |scope| {
+    if cli.search.deps {
+        let result = run_query_for_scopes(&scopes, &query, cli.search.budget, |scope| {
             let path = resolve_query_path(&query, scope);
-            tilth::run_deps_with_options(&path, scope, cli.budget, cli.full)
+            tilth::run_deps_with_options(&path, scope, cli.search.budget, cli.search.full)
         });
-        emit_result(result, &query, cli.json, is_tty);
+        emit_result(result, &query, cli.search.json, is_tty);
         return;
     }
 
     let result = tilth::run_expanded_scopes(
         &query,
         &scopes,
-        cli.section.as_deref(),
-        cli.budget,
-        cli.full,
+        cli.search.section.as_deref(),
+        cli.search.budget,
+        cli.search.full,
         expand,
-        cli.glob.as_deref(),
+        cli.search.glob.as_deref(),
         &cache,
-        cli.full,
+        cli.search.full,
     );
 
-    emit_result(result, &query, cli.json, is_tty);
+    emit_result(result, &query, cli.search.json, is_tty);
 }
 
 fn scopes_are_default(scopes: &[PathBuf]) -> bool {
-    scopes.len() == 1 && scopes[0].as_os_str() == "."
+    scopes.is_empty() || (scopes.len() == 1 && scopes[0].as_os_str() == ".")
 }
 
 fn resolve_scopes(scopes: &[PathBuf]) -> Vec<PathBuf> {
@@ -642,9 +706,105 @@ mod tests {
     #[test]
     fn piped_invocation_does_not_auto_expand() {
         // Simulating: user ran `tilth foo` (no --full) but stdout is piped.
-        // Output destination does not alter cli.full or the expansion count.
+        // Output destination does not alter cli.search.full or the expansion count.
         let cli_full = false; // user did NOT pass --full
         assert_eq!(compute_expand(None, cli_full), 0);
+    }
+
+    #[test]
+    fn search_subcommand_accepts_query_options() {
+        let cli = Cli::try_parse_from([
+            "tilth",
+            "search",
+            "target",
+            "--scope",
+            "src",
+            "--scope",
+            "tests",
+            "--full",
+            "--expand=0",
+            "--json",
+            "--glob",
+            "*.rs",
+            "--budget",
+            "100",
+            "--respect-gitignore",
+        ])
+        .expect("parse search subcommand");
+        let Some(Command::Search { query, options }) = cli.command else {
+            panic!("expected search subcommand");
+        };
+        assert_eq!(query, "target");
+        assert_eq!(
+            options.scope,
+            vec![PathBuf::from("src"), PathBuf::from("tests")]
+        );
+        assert!(options.full && options.json && options.respect_gitignore);
+        assert_eq!(options.expand, Some(0));
+        assert_eq!(options.glob.as_deref(), Some("*.rs"));
+        assert_eq!(options.budget, Some(100));
+    }
+
+    #[test]
+    fn search_preserves_options_before_verb() {
+        let mut cli = Cli::try_parse_from([
+            "tilth",
+            "--json",
+            "--scope",
+            "src",
+            "--full",
+            "--expand=1",
+            "--glob",
+            "*.rs",
+            "--budget",
+            "100",
+            "--respect-gitignore",
+            "--section",
+            "1-8",
+            "search",
+            "main.rs",
+            "--scope",
+            "tests",
+            "--budget",
+            "200",
+        ])
+        .unwrap();
+        let Some(Command::Search { options, .. }) = cli.command.take() else {
+            panic!("expected search subcommand");
+        };
+        cli.search.merge(options);
+        assert!(cli.search.json && cli.search.full && cli.search.respect_gitignore);
+        assert_eq!(
+            cli.search.scope,
+            vec![PathBuf::from("src"), PathBuf::from("tests")]
+        );
+        assert_eq!(cli.search.budget, Some(200));
+        assert_eq!(cli.search.expand, Some(1));
+        assert_eq!(cli.search.glob.as_deref(), Some("*.rs"));
+        assert_eq!(cli.search.section.as_deref(), Some("1-8"));
+        assert!(cli.search.validate(false).is_ok());
+    }
+
+    #[test]
+    fn search_rejects_conflicts_across_verb() {
+        for flags in [
+            ["--callers", "--deps"],
+            ["--map", "--full"],
+            ["--deps", "--map"],
+        ] {
+            let mut cli =
+                Cli::try_parse_from(["tilth", flags[0], "search", "target", flags[1]]).unwrap();
+            let Some(Command::Search { options, .. }) = cli.command.take() else {
+                panic!("expected search subcommand");
+            };
+            cli.search.merge(options);
+            assert!(cli.search.validate(false).is_err());
+        }
+    }
+
+    #[test]
+    fn search_subcommand_requires_query() {
+        assert!(Cli::try_parse_from(["tilth", "search"]).is_err());
     }
 
     #[test]
@@ -652,7 +812,7 @@ mod tests {
         let cli = Cli::try_parse_from(["tilth", "foo", "--scope", "src", "--scope", "tests"])
             .expect("parse repeated scopes");
         assert_eq!(
-            cli.scope,
+            cli.search.scope,
             vec![PathBuf::from("src"), PathBuf::from("tests")]
         );
     }
