@@ -27,6 +27,8 @@ pub mod install;
 pub(crate) mod lang;
 pub mod map;
 pub mod mcp;
+#[doc(hidden)]
+pub mod output;
 pub mod overview;
 pub(crate) mod read;
 pub(crate) mod search;

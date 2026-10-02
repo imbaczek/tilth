@@ -133,7 +133,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
                     if roots_handoff_allowed(scope_is_explicit, tool_dispatched) {
                         let _ = std::env::set_current_dir(&root_path);
                     } else if !scope_is_explicit {
-                        eprintln!(
+                        crate::diagnostic!(
                             "tilth: warning: ignoring roots/list response that arrived after \
                              tools started; searches keep resolving against the launch directory."
                         );

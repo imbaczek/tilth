@@ -284,7 +284,13 @@ fn main() {
 
     // Shell completions
     if let Some(shell) = cli.completions {
-        clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut io::stdout());
+        // clap_complete panics on writer errors; generate in memory first.
+        let mut output = Vec::new();
+        clap_complete::generate(shell, &mut Cli::command(), "tilth", &mut output);
+        emit_output(
+            &String::from_utf8(output).expect("completions are UTF-8"),
+            false,
+        );
         return;
     }
 
@@ -330,7 +336,7 @@ fn main() {
                 match tilth::mcp::read_for_cli(&args, edit || cli.edit) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(error) => {
-                        eprintln!("read error: {error}");
+                        tilth::diagnostic!("read error: {error}");
                         process::exit(1);
                     }
                 }
@@ -338,7 +344,7 @@ fn main() {
             Command::Search { .. } => unreachable!("search is handled as a query"),
             Command::Install { ref host, edit } => {
                 if let Err(e) = tilth::install::run(host, edit) {
-                    eprintln!("install error: {e}");
+                    tilth::diagnostic!("install error: {e}");
                     process::exit(1);
                 }
             }
@@ -346,10 +352,10 @@ fn main() {
                 let cwd = std::env::current_dir().unwrap_or_default();
                 let output = tilth::overview::fingerprint(&cwd);
                 if output.is_empty() {
-                    eprintln!("No project fingerprint could be generated.");
+                    tilth::diagnostic!("No project fingerprint could be generated.");
                     process::exit(1);
                 }
-                println!("{output}");
+                emit_output(&output, false);
             }
             Command::Grok {
                 target,
@@ -364,7 +370,7 @@ fn main() {
                         io::stdout().is_terminal(),
                     ),
                     Err(e) => {
-                        eprintln!("grok error: {e}");
+                        tilth::diagnostic!("grok error: {e}");
                         process::exit(e.exit_code());
                     }
                 }
@@ -393,7 +399,7 @@ fn main() {
                 ) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("diff error: {e}");
+                        tilth::diagnostic!("diff error: {e}");
                         process::exit(1);
                     }
                 };
@@ -409,7 +415,7 @@ fn main() {
                 ) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {
-                        eprintln!("diff error: {e}");
+                        tilth::diagnostic!("diff error: {e}");
                         process::exit(1);
                     }
                 }
@@ -433,11 +439,11 @@ fn main() {
                     .unwrap_or_else(|_| cli.search.scope[0].clone()),
             )
         } else {
-            eprintln!("mcp mode accepts only one --scope");
+            tilth::diagnostic!("mcp mode accepts only one --scope");
             process::exit(2);
         };
         if let Err(e) = tilth::mcp::run(cli.edit, mcp_scope.as_deref()) {
-            eprintln!("mcp error: {e}");
+            tilth::diagnostic!("mcp error: {e}");
             process::exit(1);
         }
         return;
@@ -461,7 +467,7 @@ fn main() {
     let query = if let Some(q) = cli.query {
         q
     } else {
-        eprintln!("usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]");
+        tilth::diagnostic!("usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]");
         process::exit(3);
     };
 
@@ -645,17 +651,17 @@ fn emit_result(
                     "query": query,
                     "output": output,
                 });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json)
-                        .expect("serde_json::Value is always serializable")
+                emit_output(
+                    &serde_json::to_string_pretty(&json)
+                        .expect("serde_json::Value is always serializable"),
+                    false,
                 );
             } else {
                 emit_output(&output, is_tty);
             }
         }
         Err(e) => {
-            eprintln!("{e}");
+            tilth::diagnostic!("{e}");
             process::exit(e.exit_code());
         }
     }
@@ -673,10 +679,19 @@ fn emit_output(output: &str, is_tty: bool) {
             .stdin(process::Stdio::piped())
             .spawn()
         {
-            if let Some(ref mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(output.as_bytes());
-            }
+            let result = child
+                .stdin
+                .take()
+                .map_or(Ok(()), |mut stdin| stdin.write_all(output.as_bytes()));
             let _ = child.wait();
+            // A pager may close early when the user quits. Other sink failures
+            // still mean the response was not delivered.
+            if let Err(error) = result {
+                if error.kind() != io::ErrorKind::BrokenPipe {
+                    tilth::diagnostic!("output error: {error}");
+                    process::exit(1);
+                }
+            }
             return;
         }
     }
@@ -685,11 +700,10 @@ fn emit_output(output: &str, is_tty: bool) {
     // starts on its own line. Most internal formatters terminate with `\n`,
     // but the search-result footer (e.g. `(~507 tokens)`) and a few other
     // paths do not — guard at the sink rather than auditing every formatter.
-    print!("{output}");
-    if !output.ends_with('\n') {
-        println!();
+    if let Err(error) = tilth::output::write_output(&mut io::stdout().lock(), output) {
+        tilth::diagnostic!("output error: {error}");
+        process::exit(1);
     }
-    let _ = io::stdout().flush();
 }
 
 fn terminal_height() -> usize {

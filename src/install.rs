@@ -90,12 +90,12 @@ pub fn run(host: &str, edit: bool) -> Result<(), String> {
     }
 
     if edit {
-        eprintln!("✓ tilth (edit mode) added to {}", host_info.path.display());
+        crate::diagnostic!("✓ tilth (edit mode) added to {}", host_info.path.display());
     } else {
-        eprintln!("✓ tilth added to {}", host_info.path.display());
+        crate::diagnostic!("✓ tilth added to {}", host_info.path.display());
     }
     if let Some(note) = host_info.note {
-        eprintln!("  {note}");
+        crate::diagnostic!("  {note}");
     }
     Ok(())
 }

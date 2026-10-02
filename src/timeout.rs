@@ -231,7 +231,7 @@ where
                 let n = tracker.record_timeout();
                 coord.ack_timeout();
                 if n == ABANDONED_THREAD_WARN {
-                    eprintln!(
+                    crate::diagnostic!(
                         "tilth: warning: {n} abandoned threads still running. \
                          Consider reducing scope or increasing TILTH_TIMEOUT."
                     );

@@ -24,7 +24,7 @@ pub fn fingerprint(root: &Path) -> String {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fingerprint_inner(root)));
     let elapsed = start.elapsed();
     if elapsed.as_millis() > 250 {
-        eprintln!(
+        crate::diagnostic!(
             "[tilth] fingerprint took {}ms (>250ms budget)",
             elapsed.as_millis()
         );
