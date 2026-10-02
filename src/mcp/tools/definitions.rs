@@ -21,7 +21,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Searches always honor .tilthignore; .gitignore, .ignore, and git excludes are honored only when the MCP server is started with TILTH_RESPECT_GITIGNORE=1.",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Searches honor .tilthignore, .gitignore, .ignore, and Git excludes by default. Set gitignore=false for one call, tilth_config respect_gitignore=false for this server, or TILTH_RESPECT_GITIGNORE=0 at startup to bypass Git ignore rules.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -284,7 +284,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_config",
             "annotations": { "readOnlyHint": false, "idempotentHint": true },
-            "description": "Read or update MCP runtime configuration. Gitignore handling persists for this server process and applies to search, list, map, callers, and other filesystem walks. .tilthignore and built-in junk-directory exclusions always remain active.",
+            "description": "Read or update MCP runtime configuration. Gitignore handling is enabled by default and persists for this server process and applies to search, list, map, callers, and other filesystem walks. .tilthignore and built-in junk-directory exclusions always remain active.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -407,7 +407,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     for tool in &mut tools {
         tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
             "type": "boolean",
-            "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting."
+            "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting (enabled by default)."
         });
     }
 

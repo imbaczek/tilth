@@ -65,9 +65,17 @@ Output per match:
 
 ```bash
 tilth "*.test.ts" --scope <dir>   # glob files (.tilthignore honored)
-tilth --respect-gitignore <symbol> --scope <dir>  # opt into .gitignore/.ignore
+tilth --no-respect-gitignore <symbol> --scope <dir>  # bypass .gitignore/.ignore/Git excludes
 tilth --map --scope <dir>         # codebase skeleton with directory token rollups
 ```
+
+Searches and file walks honor `.gitignore`, `.ignore`, and Git exclude rules by default.
+Use `--no-respect-gitignore` or `TILTH_RESPECT_GITIGNORE=0` to disable them;
+`--respect-gitignore` explicitly enables them and overrides the environment.
+In MCP, pass `gitignore: false` for one call or use
+`tilth_config(action: "set", respect_gitignore: false)` for the server process.
+`tilth_config(action: "reset")` restores environment/default behavior.
+`.tilthignore` and built-in junk-directory exclusions always remain active.
 
 ## Deps (blast radius)
 

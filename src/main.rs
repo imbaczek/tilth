@@ -43,9 +43,13 @@ struct SearchOptions {
     #[arg(long)]
     scope: Vec<PathBuf>,
 
-    /// Respect .gitignore, .ignore, and Git exclude files while walking.
-    #[arg(long)]
+    /// Respect .gitignore, .ignore, and Git exclude files (default; overrides the environment).
+    #[arg(long, conflicts_with = "no_respect_gitignore")]
     respect_gitignore: bool,
+
+    /// Bypass .gitignore, .ignore, and Git exclude files. .tilthignore remains active.
+    #[arg(long, conflicts_with = "respect_gitignore")]
+    no_respect_gitignore: bool,
 
     /// Line range or markdown heading (e.g. "45-89" or "## Architecture"). Bypasses smart view.
     #[arg(long)]
@@ -112,6 +116,7 @@ impl SearchOptions {
     fn merge(&mut self, options: Self) {
         self.scope.extend(options.scope);
         self.respect_gitignore |= options.respect_gitignore;
+        self.no_respect_gitignore |= options.no_respect_gitignore;
         self.section = options.section.or(self.section.take());
         self.budget = options.budget.or(self.budget);
         self.full |= options.full;
@@ -126,7 +131,9 @@ impl SearchOptions {
     }
 
     fn validate(&self, edit: bool) -> Result<(), clap::Error> {
-        let conflict = if self.callers && (self.deps || self.map || edit) {
+        let conflict = if self.respect_gitignore && self.no_respect_gitignore {
+            Some("--respect-gitignore conflicts with --no-respect-gitignore")
+        } else if self.callers && (self.deps || self.map || edit) {
             Some("--callers conflicts with --deps, --map, and --edit")
         } else if self.deps && (self.map || edit) {
             Some("--deps conflicts with --map and --edit")
@@ -245,6 +252,8 @@ fn main() {
 
     if cli.search.respect_gitignore {
         std::env::set_var("TILTH_RESPECT_GITIGNORE", "1");
+    } else if cli.search.no_respect_gitignore {
+        std::env::set_var("TILTH_RESPECT_GITIGNORE", "0");
     }
     configure_thread_pools();
 

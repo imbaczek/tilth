@@ -124,7 +124,7 @@ pub(crate) fn gitignore_config() -> (bool, &'static str) {
     match GITIGNORE_OVERRIDE.load(Ordering::Relaxed) {
         GITIGNORE_OVERRIDE_DISABLED => (false, "runtime"),
         GITIGNORE_OVERRIDE_ENABLED => (true, "runtime"),
-        _ => gitignore_from_env().map_or((false, "default"), |enabled| (enabled, "environment")),
+        _ => gitignore_from_env().map_or((true, "default"), |enabled| (enabled, "environment")),
     }
 }
 
@@ -138,7 +138,7 @@ pub(crate) fn set_gitignore_config(value: Option<bool>) {
 }
 
 /// Shared walker policy: searches files except known junk directories and
-/// `.tilthignore` entries. Gitignore-style files are opt-in.
+/// `.tilthignore` entries. Gitignore-style files are honored by default.
 /// The scope itself is an explicit traversal root: `--scope src/tmp` searches
 /// that directory even if a parent `.gitignore` excludes `src/tmp/`; ignore
 /// rules still filter entries beneath the scope.
@@ -176,7 +176,7 @@ fn include_entry(entry: &ignore::DirEntry) -> bool {
 }
 
 /// Build a parallel directory walker over `.tilthignore`-filtered files except
-/// known junk directories. Gitignore-style files are opt-in.
+/// known junk directories. Gitignore-style files are honored by default.
 /// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
 /// With gitignore enabled, the glob cannot override ignore rules.
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {

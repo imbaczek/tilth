@@ -17,5 +17,5 @@ To read files, use tilth_read instead of Read or Bash(cat).
 To find files, use tilth_list instead of Glob or Bash(find/ls).
 To check what changed, use tilth_diff instead of Bash(git diff/git log).
 DO NOT use Bash(git diff) or Bash(git log --patch). Use tilth_diff instead.
-Use tilth_config(action: "set", respect_gitignore: true) when the user wants searches and file walks to honor .gitignore, .ignore, and Git exclude rules. Use action "get" to inspect the current setting and "reset" to restore startup behavior. .tilthignore is always honored.
+Searches and file walks honor .gitignore, .ignore, and Git exclude rules by default. Pass gitignore: false for one MCP call, or use tilth_config(action: "set", respect_gitignore: false) to disable them for this server. TILTH_RESPECT_GITIGNORE=0 disables them at startup; CLI --no-respect-gitignore overrides the environment. Use action "get" to inspect the current setting and "reset" to restore environment/default behavior. .tilthignore and built-in junk-directory exclusions are always honored.
 DO NOT re-read files already shown in expanded search results.

@@ -21,7 +21,7 @@ pub struct GlobResult {
 }
 
 /// Glob search using `ignore::WalkBuilder` (parallel via `super::walker`,
-/// with the same `.tilthignore` and opt-in gitignore policy).
+/// with the same `.tilthignore` and default-on gitignore policy).
 pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     let glob = Glob::new(pattern).map_err(|e| TilthError::InvalidQuery {
         query: pattern.to_string(),

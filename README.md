@@ -391,8 +391,8 @@ tilth is about 35,000 lines of Rust with no runtime dependencies.
 
 - **tree-sitter** parses 17 languages: Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir and Bash. tilth uses it for definitions, callees, callers and outlines. Dockerfile and Make files are recognised but not parsed.
 - **ripgrep's crates** (`grep-regex`, `grep-searcher`) run content search.
-- The **ignore** crate walks directories in parallel with `.tilthignore` support and optional gitignore handling. It always skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
-- In MCP mode, call `tilth_config` with `{"action":"set","respect_gitignore":true}` to honor `.gitignore`, `.ignore` and Git exclude rules for the lifetime of the server. `TILTH_RESPECT_GITIGNORE=1` remains the startup equivalent.
+- The **ignore** crate walks directories in parallel with `.tilthignore` support and honors `.gitignore`, `.ignore` and Git exclude rules by default. It always skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
+- To bypass `.gitignore`, `.ignore` and Git exclude rules, use CLI `--no-respect-gitignore` or set `TILTH_RESPECT_GITIGNORE=0`. CLI `--respect-gitignore` explicitly enables them and overrides the environment. In MCP mode, pass `gitignore: false` for one call, or call `tilth_config` with `{"action":"set","respect_gitignore":false}` for the server process. `{"action":"reset"}` restores environment/default behavior. `.tilthignore` and built-in junk-directory exclusions always remain active.
 - **memmap2** reads files through memory maps.
 - **DashMap** holds the outline cache, which is invalidated when a file's modified time changes.
 
