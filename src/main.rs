@@ -14,6 +14,7 @@ struct Cli {
     command: Option<Command>,
 
     /// File path, symbol name, glob pattern, or text to search.
+    /// Search multiple terms: tilth "Foo,Bar" --scope src
     query: Option<String>,
 
     #[command(flatten)]
