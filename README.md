@@ -349,10 +349,10 @@ Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-pro
 ## Usage
 
 ```bash
-tilth <path>                      # read file (outline if large)
-tilth <path> --section 45-89      # exact line range
-tilth <path> --section "## Foo"   # markdown heading
-tilth <path> --full               # force full content
+tilth read <path>                 # read file (outline if large)
+tilth read <path> --section 45-89      # exact line range
+tilth read <path> --section "## Foo"   # markdown heading
+tilth read <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
 tilth <symbol> --expand=5         # inline source for top 5 matches
 tilth <symbol> --full             # up to 100 matches instead of 10
@@ -367,6 +367,26 @@ tilth --map --scope <dir>         # codebase skeleton (CLI only)
 ```
 
 `--map` is a command-line feature only. It is not offered as an MCP tool, because in testing agents called it far more often than it helped.
+
+### Explicit file reads
+
+`tilth read <path> [<path> ...]` reads files directly, without classifying the
+argument as a search query. Relative paths use the current directory; pass
+`--root <dir>` to anchor them elsewhere. Legacy `tilth <path>` remains supported.
+
+```bash
+tilth read src/main.rs --mode signature
+tilth read src/main.rs --mode stripped
+tilth read src/main.rs --section 1-20 --section 80-100
+tilth read src/main.rs src/lib.rs --budget 2000
+tilth read src/main.rs --edit
+```
+
+The CLI shares the MCP `tilth_read` implementation: smart `auto` view, `full`,
+`signature`, and `stripped`, plus line ranges and Markdown headings. Use `--full`
+for full content. Sections require one file and auto/full mode. Up to 20 files
+or sections are accepted; batch output shares the token budget. Batch file errors
+are reported alongside successful reads.
 
 ## Speed
 

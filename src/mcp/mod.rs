@@ -19,6 +19,12 @@ use tools::{
     tool_savings, tool_search, tool_session, tool_write,
 };
 
+/// Read with the same views and validation as `tilth_read`.
+/// CLI callers supply an absolute root for relative paths.
+pub fn read_for_cli(args: &Value, edit_mode: bool) -> Result<String, String> {
+    tool_read(args, &OutlineCache::new(), &Session::new(), edit_mode)
+}
+
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
 struct Services {

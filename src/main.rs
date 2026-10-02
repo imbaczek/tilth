@@ -154,6 +154,30 @@ impl SearchOptions {
 
 #[derive(clap::Subcommand)]
 enum Command {
+    /// Read files directly without query classification.
+    Read {
+        /// File paths, at most 20.
+        #[arg(required = true, num_args = 1..=20)]
+        paths: Vec<PathBuf>,
+        /// Directory anchoring relative paths; defaults to the current directory.
+        #[arg(long)]
+        root: Option<PathBuf>,
+        /// Read view.
+        #[arg(long, default_value = "auto", value_parser = ["auto", "full", "signature", "stripped"])]
+        mode: String,
+        /// Force full content; signature and stripped modes take precedence.
+        #[arg(long)]
+        full: bool,
+        /// Line range or heading; repeat for disjoint slices of one file.
+        #[arg(long)]
+        section: Vec<String>,
+        /// Maximum output tokens; also accepted before read.
+        #[arg(long)]
+        budget: Option<u64>,
+        /// Emit hash anchors; also accepted before read.
+        #[arg(long)]
+        edit: bool,
+    },
     /// Search for a file, symbol, glob pattern, or text.
     Search {
         /// File path, symbol name, glob pattern, or text search.
@@ -266,6 +290,50 @@ fn main() {
     // Subcommands
     if let Some(cmd) = cli.command {
         match cmd {
+            Command::Read {
+                paths,
+                root,
+                mode,
+                full,
+                mut section,
+                budget,
+                edit,
+            } => {
+                if let Some(parent_section) = cli.search.section {
+                    section.insert(0, parent_section);
+                }
+                if paths.len() > 1 && !section.is_empty() {
+                    clap::Error::raw(
+                        clap::error::ErrorKind::ArgumentConflict,
+                        "--section requires exactly one file",
+                    )
+                    .exit();
+                }
+                let root =
+                    root.unwrap_or_else(|| std::env::current_dir().expect("current directory"));
+                let root = root.canonicalize().unwrap_or(root);
+                let mut args = serde_json::json!({
+                    "root": root, "mode": mode, "full": full || cli.search.full,
+                    "budget": budget.or(cli.search.budget),
+                });
+                if paths.len() == 1 {
+                    args["path"] = serde_json::json!(paths[0]);
+                } else {
+                    args["paths"] = serde_json::json!(paths);
+                }
+                if section.len() == 1 {
+                    args["section"] = serde_json::json!(section[0]);
+                } else if !section.is_empty() {
+                    args["sections"] = serde_json::json!(section);
+                }
+                match tilth::mcp::read_for_cli(&args, edit || cli.edit) {
+                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                    Err(error) => {
+                        eprintln!("read error: {error}");
+                        process::exit(1);
+                    }
+                }
+            }
             Command::Search { .. } => unreachable!("search is handled as a query"),
             Command::Install { ref host, edit } => {
                 if let Err(e) = tilth::install::run(host, edit) {

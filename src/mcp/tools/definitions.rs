@@ -2,7 +2,7 @@ use serde_json::Value;
 
 pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     let read_desc = if edit_mode {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
+        "Read a file with smart outlining. CLI equivalent: `tilth read <path>` (repeat `--section` for disjoint slices; multiple paths for batch reads). Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Output uses hashline format (line:hash|content) — \
          the line:hash anchors are required by tilth_write. Small files return full hashlined content. \
          Large files return a structural outline (no hashlines); use `section` to get hashlined \
@@ -10,7 +10,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
          from the same file in one call. Use `full` to force complete content. \
          Use `paths` to read multiple files in one call."
     } else {
-        "Read a file with smart outlining. Replaces cat/head/tail and the host Read tool — \
+        "Read a file with smart outlining. CLI equivalent: `tilth read <path>` (repeat `--section` for disjoint slices; multiple paths for batch reads). Replaces cat/head/tail and the host Read tool — \
          use this for all file reading. Small files return full content. Large files return \
          a structural outline (functions, classes, imports) so you see the shape without \
          consuming your context window. Use `section` to read a specific line range or heading. \

@@ -120,9 +120,12 @@ shell with its own concurrency model.
 A clap `derive`-style parser (`Cli` struct) accepts a free-form `query`
 plus flags. The mode is determined by mutually-exclusive flags
 (`--callers`, `--deps`, `--map`, `--mcp`, `--edit`, `--full`,
-`--expand`, `--section`). Three subcommands sit alongside the
+`--expand`, `--section`). Six subcommands sit alongside the
 free-form path:
 
+- `tilth search <query>` — explicit search verb; merges options into the free-form query dispatcher.
+- `tilth grok <target>` — returns the definition, documentation, callees, callers, siblings, and tests for one symbol.
+- `tilth read <path> ...` — explicit file reads using the same reader as MCP `tilth_read`; supports modes, batches, disjoint sections, budgets, and hash anchors.
 - `tilth install <host>` — delegates to `install::run`.
 - `tilth diff [<source>]` — bypasses `lib.rs` entirely and goes
   through `diff::resolve_source` + `diff::diff`.

@@ -5,7 +5,7 @@ Smart code reading for humans and AI agents. tilth parses your code with tree-si
 This package downloads the prebuilt tilth binary for your platform and runs it.
 
 ```bash
-npx tilth <path>                  # read a file, as an outline if it is large
+npx tilth read <path>                  # read a file, as an outline if it is large
 npx tilth <symbol> --scope <dir>  # definitions first, then usages
 npx tilth <symbol> --callers      # every call site of a symbol
 npx tilth install claude-code     # add tilth to an agent host as an MCP server

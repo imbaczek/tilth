@@ -15,13 +15,29 @@ DO NOT re-read files whose content is already shown in expanded search results.
 ## Read
 
 ```bash
-tilth <path>                      # smart view: full if small, outline if large
-tilth <path> --section 45-89      # exact line range
-tilth <path> --section "## Foo"   # markdown heading (suggests fuzzy matches on miss)
-tilth <path> --full               # force full content (file paths)
+tilth read <path>                 # smart view: full if small, outline if large
+tilth read <path> --section 45-89      # exact line range
+tilth read <path> --section "## Foo"   # markdown heading (suggests fuzzy matches on miss)
+tilth read <path> --full               # force full content (file paths)
 ```
 
 Outline format: `[<start>-<end>]  <symbol>`. Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
+
+`tilth read` always treats its arguments as file paths, including extensionless files.
+Relative paths use the current directory, or `--root <dir>`. Legacy `tilth <path>`
+reads remain supported when the query resolves to a file.
+
+```bash
+tilth read src/main.rs --mode signature # declarations with hash anchors
+tilth read src/main.rs --mode stripped  # remove plain comments and debug logs
+tilth read src/main.rs --section 1-20 --section 80-100
+tilth read src/main.rs src/lib.rs --budget 2000 # shared batch budget
+tilth read src/main.rs --edit            # hash anchors for edits
+```
+
+Views are `auto` (default), `full`, `signature`, and `stripped`. `--full` is an alias
+for full content; signature/stripped take precedence. Sections require one file
+and auto/full mode. Batches and disjoint sections are limited to 20 entries.
 
 ## Search
 
