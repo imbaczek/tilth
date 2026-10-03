@@ -77,7 +77,11 @@ pub(crate) fn read_file_with_budget(
 
     // Directory → list contents
     if meta.is_dir() {
-        return list_directory(path);
+        return list_directory(
+            path,
+            crate::listing::Page::new(0, crate::listing::DEFAULT_LIMIT).expect("positive default"),
+            false,
+        );
     }
 
     let byte_len = meta.len();
@@ -575,7 +579,11 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
 }
 
 /// List directory contents — treat as glob on dir/*.
-fn list_directory(path: &Path) -> Result<String, TilthError> {
+pub(crate) fn list_directory(
+    path: &Path,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> Result<String, TilthError> {
     let mut entries: Vec<String> = Vec::new();
     let read_dir = fs::read_dir(path).map_err(|e| TilthError::IoError {
         path: path.to_path_buf(),
@@ -585,7 +593,8 @@ fn list_directory(path: &Path) -> Result<String, TilthError> {
     let mut items: Vec<_> = read_dir.filter_map(std::result::Result::ok).collect();
     items.sort_by_key(std::fs::DirEntry::file_name);
 
-    for entry in &items {
+    let (start, end) = page.bounds(items.len());
+    for entry in &items[start..end] {
         let ft = entry.file_type().ok();
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -606,7 +615,13 @@ fn list_directory(path: &Path) -> Result<String, TilthError> {
     }
 
     let header = format!("# {} ({} items)", path.display(), items.len());
-    Ok(format!("{header}\n\n{}", entries.join("\n")))
+    let mut output = format!(
+        "{header}\n\n{}\n{}",
+        page.summary(items.len(), "items"),
+        entries.join("\n")
+    );
+    page.append_navigation(&mut output, items.len(), mcp);
+    Ok(output)
 }
 
 /// Public entry point for did-you-mean on path-like fallthrough queries.

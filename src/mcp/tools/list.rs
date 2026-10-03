@@ -18,6 +18,7 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         .map(std::path::Path::new);
     let (scope, scope_warning) = resolve_scope(args, root)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+    let page = crate::listing::Page::from_args(args)?;
 
     let patterns_arr = args
         .get("patterns")
@@ -86,9 +87,14 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         }
     }
 
-    let tree = crate::mcp::tree::render_tree(&scope, &entries);
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let (start, end) = page.bounds(entries.len());
+    let tree = crate::mcp::tree::render_tree(&scope, &entries[start..end]);
     let mut result = scope_warning.unwrap_or_default();
-    result.push_str(&apply_budget(&tree, budget));
+    result.push_str(&page.summary(entries.len(), "files"));
+    result.push_str("\n> Tree counts and token rollups cover this page only.\n");
+    result.push_str(&tree);
+    page.append_navigation(&mut result, entries.len(), true);
     if entries.is_empty() {
         if extensions.is_empty() {
             result.push_str("\nno matches\n");
@@ -101,7 +107,7 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
             );
         }
     }
-    Ok(result)
+    Ok(apply_budget(&result, budget))
 }
 
 #[cfg(test)]
@@ -235,5 +241,65 @@ mod tests {
             out.contains("no matches; found extensions:") && out.contains("rs"),
             "expected no-match extension hint: {out}"
         );
+    }
+    #[test]
+    fn list_pages_are_disjoint_and_sorted_across_nested_paths() {
+        let project = tempfile::tempdir().unwrap();
+        for dir in ["z", "a"] {
+            std::fs::create_dir(project.path().join(dir)).unwrap();
+            for name in ["second.rs", "first.rs"] {
+                std::fs::write(project.path().join(dir).join(name), "fn example() {}").unwrap();
+            }
+        }
+        let request = |offset| {
+            tool_list(&serde_json::json!({
+                "scope": project.path(), "patterns": ["*.rs", "**/*.rs"],
+                "offset": offset, "limit": 2,
+            }))
+            .unwrap()
+        };
+        let first = request(0);
+        let second = request(2);
+        assert!(first.contains("a/") && !first.contains("z/"), "{first}");
+        assert!(second.contains("z/") && !second.contains("a/"), "{second}");
+        assert!(first.contains("1-2 of 4") && second.contains("3-4 of 4"));
+        assert!(first.contains(r#""offset":2"#) && !second.contains("Next page:"));
+        assert!(first.contains("2 files") && first.contains("rollups cover this page only"));
+        let beyond = request(usize::MAX);
+        assert!(beyond.contains("Showing files 0 of 4"));
+        assert!(!beyond.contains("no matches") && !beyond.contains("Next page:"));
+    }
+
+    #[test]
+    fn list_default_is_bounded_and_invalid_paging_is_rejected() {
+        let project = tempfile::tempdir().unwrap();
+        for i in (0..55).rev() {
+            std::fs::write(project.path().join(format!("file{i:03}.rs")), "fn x() {}").unwrap();
+        }
+        let base = serde_json::json!({"scope":project.path(), "patterns":["*.rs"]});
+        let out = tool_list(&base).unwrap();
+        assert!(
+            out.contains("1-50 of 55") && out.contains("file049.rs") && !out.contains("file050.rs"),
+            "{out}"
+        );
+        for (key, value) in [
+            ("limit", serde_json::json!(0)),
+            ("offset", serde_json::json!(-1)),
+            ("offset", serde_json::json!(1.5)),
+            ("limit", serde_json::json!("2")),
+            ("offset", serde_json::Value::Null),
+        ] {
+            let mut args = base.clone();
+            args[key] = value;
+            assert!(tool_list(&args).is_err(), "accepted {args}");
+        }
+        let mut args = base;
+        args["budget"] = serde_json::json!(150);
+        let out = tool_list(&args).unwrap();
+        assert!(
+            out.contains("truncated") && !out.contains("Next page:"),
+            "{out}"
+        );
+        assert!(out.contains("retry the same offset"), "{out}");
     }
 }

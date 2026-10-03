@@ -121,6 +121,18 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "default": "auto",
                         "description": "Read view. auto: smart default. full: full content. signature: hash-prefixed declarations only. stripped: whole-file content with plain comments/debug logs/extra blanks removed."
                     },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Skip N immediate directory children sorted by name (zero-based). Only supported for a single directory path; not files or batch paths. Keep path unchanged between pages."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 50,
+                        "description": "Directory entries per page (default 50, including with full:true). Only supported for a single directory path. If budget truncates, retry the same offset with a smaller limit before advancing."
+                    },
                     "budget": {
                         "type": "number",
                         "description": "Max tokens in response."
@@ -154,6 +166,18 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "scope": {
                         "type": "string",
                         "description": "Directory to root the tree at. DO NOT USE scope if you want to list the current working directory."
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "default": 0,
+                        "description": "Skip N matching files sorted by relative path (zero-based). Directory nodes do not count. Keep scope, patterns, depth and ignore settings unchanged between pages."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 50,
+                        "description": "Matching files per page (default 50). Tree counts and token rollups cover this page only. If budget truncates, retry the same offset with a smaller limit before advancing."
                     },
                     "budget": {
                         "type": "number",
@@ -541,6 +565,19 @@ mod tests {
                 "boolean"
             );
             assert_eq!(config["annotations"]["readOnlyHint"], false);
+        }
+    }
+    #[test]
+    fn directory_tools_expose_integer_pagination() {
+        let defs = tool_definitions(false);
+        for name in ["tilth_read", "tilth_list"] {
+            let schema =
+                &defs.iter().find(|d| d["name"] == name).unwrap()["inputSchema"]["properties"];
+            assert_eq!(schema["offset"]["type"], "integer");
+            assert_eq!(schema["offset"]["minimum"], 0);
+            assert_eq!(schema["limit"]["type"], "integer");
+            assert_eq!(schema["limit"]["minimum"], 1);
+            assert_eq!(schema["limit"]["default"], 50);
         }
     }
 }

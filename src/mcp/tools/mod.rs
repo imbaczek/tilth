@@ -16,7 +16,7 @@ pub(super) use deps::tool_deps;
 pub(super) use diff::tool_diff;
 pub(super) use grok::tool_grok;
 pub(super) use list::tool_list;
-pub(super) use read::tool_read;
+pub(super) use read::{read_with_navigation, tool_read};
 pub(super) use savings::tool_savings;
 pub(super) use search::tool_search;
 pub(super) use session::tool_session;

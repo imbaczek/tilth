@@ -25,6 +25,7 @@ pub(crate) mod format;
 pub mod index;
 pub mod install;
 pub(crate) mod lang;
+mod listing;
 pub mod map;
 pub mod mcp;
 #[doc(hidden)]
@@ -179,6 +180,34 @@ pub fn run_expanded_scopes(
     cache: &OutlineCache,
     cli_full: bool,
 ) -> Result<String, TilthError> {
+    run_expanded_scopes_with_listing(
+        query,
+        scopes,
+        section,
+        budget_tokens,
+        full,
+        expand,
+        glob,
+        cache,
+        cli_full,
+        None,
+    )
+}
+
+/// Run queries with optional directory pagination. Paging arguments are rejected
+/// for queries that do not resolve to directories.
+pub fn run_expanded_scopes_with_listing(
+    query: &str,
+    scopes: &[PathBuf],
+    section: Option<&str>,
+    budget_tokens: Option<u64>,
+    full: bool,
+    expand: usize,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    cli_full: bool,
+    listing_page: Option<(usize, Option<usize>)>,
+) -> Result<String, TilthError> {
     run_inner_scopes(
         query,
         scopes,
@@ -189,6 +218,7 @@ pub fn run_expanded_scopes(
         glob,
         cache,
         cli_full,
+        listing_page,
     )
 }
 
@@ -337,6 +367,7 @@ fn run_inner(
         glob,
         cache,
         cli_full,
+        None,
     )
 }
 
@@ -350,6 +381,7 @@ fn run_inner_scopes(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
+    listing_page: Option<(usize, Option<usize>)>,
 ) -> Result<String, TilthError> {
     if scopes.is_empty() {
         return Err(TilthError::NotFound {
@@ -376,6 +408,12 @@ fn run_inner_scopes(
     } else {
         classifications[0].clone()
     };
+    if listing_page.is_some() && !matches!(query_type, QueryType::FilePath(_)) {
+        return Err(TilthError::InvalidQuery {
+            query: query.to_string(),
+            reason: "offset and limit require --callers or a directory path".into(),
+        });
+    }
     let use_expanded =
         expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
 
@@ -441,7 +479,31 @@ fn run_inner_scopes(
                 let QueryType::FilePath(path) = scoped_query_type else {
                     continue;
                 };
-                match read_file_query(&path, scope, section, full, cache, budget_tokens) {
+                let read = if path.is_dir() {
+                    if section.is_some() {
+                        Err(TilthError::InvalidQuery {
+                            query: query.to_string(),
+                            reason: "section is not supported for directory listings".into(),
+                        })
+                    } else {
+                        let (offset, limit) = listing_page.unwrap_or((0, None));
+                        let page =
+                            listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT))
+                                .map_err(|reason| TilthError::InvalidQuery {
+                                    query: query.to_string(),
+                                    reason,
+                                })?;
+                        read::list_directory(&path, page, false)
+                    }
+                } else if listing_page.is_some() {
+                    Err(TilthError::InvalidQuery {
+                        query: query.to_string(),
+                        reason: "offset and limit require --callers or a directory path".into(),
+                    })
+                } else {
+                    read_file_query(&path, scope, section, full, cache, budget_tokens)
+                };
+                match read {
                     Ok(output) => {
                         if multi_scope {
                             let output = apply_budget(output, budget_tokens);

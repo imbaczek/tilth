@@ -388,6 +388,34 @@ for full content. Sections require one file and auto/full mode. Up to 20 files
 or sections are accepted; batch output shares the token budget. Batch file errors
 are reported alongside successful reads.
 
+### Directory listings
+
+Directory paths return 50 immediate children per page, sorted by name. Use a
+positive `--limit` and zero-based `--offset` to choose a page:
+
+```bash
+tilth artifacts/ --limit 20
+tilth artifacts/ --offset 20 --limit 20
+tilth read artifacts/ --offset 20 --limit 20
+```
+
+The output reports the range, total and next offset. `--full` still uses the
+50-entry directory default; set `--limit` explicitly for a larger page.
+`--budget` caps the output independently. If a page is truncated, retry the same
+offset with a smaller limit before advancing. Keep the directory unchanged
+between calls for stable pages. Pagination requires a single directory path
+for `tilth read`; file reads and batch reads reject explicit pagination.
+
+MCP `tilth_read` accepts the same `offset` and `limit` for a single directory
+path. MCP `tilth_list` pages matching files sorted by scope-relative path, then
+renders that page as a tree. Directory nodes do not count against its limit,
+and tree counts and token rollups describe only the selected files. Keep
+patterns, depth and ignore settings unchanged between pages:
+
+```json
+{"patterns":["*.json"],"scope":"/project/artifacts","offset":50,"limit":50}
+```
+
 ## Speed
 
 Median of 15 runs of the release build (main after v0.10.1) on an Apple M5 Pro. Each time includes process startup. MCP mode pays startup once.

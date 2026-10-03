@@ -91,13 +91,13 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Skip N ranked call sites per scope (0-based; requires --callers).
-    #[arg(long, requires = "callers")]
+    /// Skip N sorted directory entries or ranked call sites per scope (0-based).
+    #[arg(long)]
     offset: Option<usize>,
 
-    /// Call sites per page per scope (default 10, or 100 with --full).
-    /// Output remains subject to --budget. Requires --callers.
-    #[arg(long, requires = "callers")]
+    /// Entries per directory page (default 50), or call sites per scope (10/100).
+    /// Output remains subject to --budget. Requires a directory path or --callers.
+    #[arg(long)]
     limit: Option<std::num::NonZeroUsize>,
 
     /// Find callers of a symbol; use --offset and --limit to paginate.
@@ -138,6 +138,8 @@ impl SearchOptions {
             Some("--callers conflicts with --deps, --map, and --edit")
         } else if self.deps && (self.map || edit) {
             Some("--deps conflicts with --map and --edit")
+        } else if (self.offset.is_some() || self.limit.is_some()) && (self.deps || self.map) {
+            Some("--offset and --limit require a directory path or --callers")
         } else if self.map && (self.expand.is_some() || self.section.is_some() || self.full) {
             Some("--map conflicts with --expand, --section, and --full")
         } else {
@@ -175,6 +177,12 @@ enum Command {
         /// Maximum output tokens; also accepted before read.
         #[arg(long)]
         budget: Option<u64>,
+        /// Skip N sorted directory entries (zero-based); directory paths only.
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Directory entries per page (default 50); directory paths only.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroUsize>,
         /// Emit hash anchors; also accepted before read.
         #[arg(long)]
         edit: bool,
@@ -270,9 +278,9 @@ fn main() {
     {
         cli.query = Some(query);
         cli.search.merge(options);
-        if let Err(error) = cli.search.validate(cli.edit) {
-            error.exit();
-        }
+    }
+    if let Err(error) = cli.search.validate(cli.edit) {
+        error.exit();
     }
 
     if cli.search.respect_gitignore {
@@ -304,6 +312,8 @@ fn main() {
                 full,
                 mut section,
                 budget,
+                offset,
+                limit,
                 edit,
             } => {
                 if let Some(parent_section) = cli.search.section {
@@ -323,6 +333,12 @@ fn main() {
                     "root": root, "mode": mode, "full": full || cli.search.full,
                     "budget": budget.or(cli.search.budget),
                 });
+                if let Some(offset) = offset.or(cli.search.offset) {
+                    args["offset"] = serde_json::json!(offset);
+                }
+                if let Some(limit) = limit.or(cli.search.limit) {
+                    args["limit"] = serde_json::json!(limit.get());
+                }
                 if paths.len() == 1 {
                     args["path"] = serde_json::json!(paths[0]);
                 } else {
@@ -516,7 +532,7 @@ fn main() {
         return;
     }
 
-    let result = tilth::run_expanded_scopes(
+    let result = tilth::run_expanded_scopes_with_listing(
         &query,
         &scopes,
         cli.search.section.as_deref(),
@@ -526,6 +542,10 @@ fn main() {
         cli.search.glob.as_deref(),
         &cache,
         cli.search.full,
+        (cli.search.offset.is_some() || cli.search.limit.is_some()).then_some((
+            cli.search.offset.unwrap_or(0),
+            cli.search.limit.map(std::num::NonZeroUsize::get),
+        )),
     );
 
     emit_result(result, &query, cli.search.json, is_tty);

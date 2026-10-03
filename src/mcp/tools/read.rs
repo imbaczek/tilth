@@ -18,6 +18,16 @@ pub(in crate::mcp) fn tool_read(
     session: &Session,
     edit_mode: bool,
 ) -> Result<String, String> {
+    read_with_navigation(args, cache, session, edit_mode, true)
+}
+
+pub(in crate::mcp) fn read_with_navigation(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+    mcp_navigation: bool,
+) -> Result<String, String> {
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
     // Extract optional root for anchoring relative paths. A relative path
     // without an absolute `root` is unresolvable (the server cannot see the
@@ -43,6 +53,12 @@ pub(in crate::mcp) fn tool_read(
     let force_full = full_flag || mode_str == "full";
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
+
+    let paginated = args.get("offset").is_some() || args.get("limit").is_some();
+    let page = crate::listing::Page::from_args(args)?;
+    if paginated && args.get("paths").is_some() {
+        return Err("offset and limit require a single directory path, not paths".into());
+    }
 
     // Multi-file batch read (capped at 20 to bound I/O)
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
@@ -78,7 +94,16 @@ pub(in crate::mcp) fn tool_read(
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
-            let read = if force_signature {
+            let read = if path.is_dir() {
+                if force_signature || force_stripped {
+                    Err(TilthError::InvalidQuery {
+                        query: path.display().to_string(),
+                        reason: "directory listings do not support signature/stripped modes".into(),
+                    })
+                } else {
+                    crate::read::list_directory(&path, page, mcp_navigation)
+                }
+            } else if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
             } else if force_stripped {
                 read_stripped_file(&path, cache).map(|(body, _, _)| body)
@@ -116,6 +141,22 @@ pub(in crate::mcp) fn tool_read(
             "mode={mode_str} cannot be combined with section/sections — \
              {mode_str} reshapes the whole file. Drop section/sections or pick mode=auto/full."
         ));
+    }
+
+    if path.is_dir() {
+        if section.is_some() || sections_arr.is_some() || force_signature || force_stripped {
+            return Err(
+                "directory listings do not support section/sections or signature/stripped modes"
+                    .into(),
+            );
+        }
+        session.record_read(&path);
+        let output =
+            crate::read::list_directory(&path, page, mcp_navigation).map_err(|e| e.to_string())?;
+        return Ok(apply_budget(&output, budget));
+    }
+    if paginated {
+        return Err("offset and limit require a directory path".into());
     }
 
     // Multi-section path: bypass smart view + related-file hints (those only
@@ -765,6 +806,55 @@ mod tests {
             "section reads must not record a full-file baseline"
         );
         assert_eq!(saved, 0, "section reads must not record savings");
+    }
+    #[test]
+    fn read_directory_pages_and_validation() {
+        let project = tempfile::tempdir().unwrap();
+        for i in (0..55).rev() {
+            std::fs::write(project.path().join(format!("file{i:03}.txt")), "data").unwrap();
+        }
+        let cache = OutlineCache::new();
+        let session = Session::default();
+        let run = |args: Value| tool_read(&args, &cache, &session, false);
+        let base = serde_json::json!({"path":project.path()});
+        let first = run(base.clone()).unwrap();
+        assert!(
+            first.contains("1-50 of 55") && first.contains(r#""offset":50"#),
+            "{first}"
+        );
+        assert!(first.contains("file049.txt") && !first.contains("file050.txt"));
+        let second =
+            run(serde_json::json!({"path":project.path(), "offset":50, "limit":5})).unwrap();
+        assert!(second.contains("51-55 of 55") && second.contains("End of listing."));
+        for i in 0..55 {
+            let name = format!("  file{i:03}.txt ");
+            assert_eq!(
+                first.matches(&name).count() + second.matches(&name).count(),
+                1,
+                "{name}"
+            );
+        }
+        for (key, value) in [
+            ("offset", serde_json::json!(-1)),
+            ("offset", serde_json::json!(0.5)),
+            ("limit", serde_json::json!(0)),
+            ("limit", serde_json::json!("3")),
+            ("sections", serde_json::json!(["1-2"])),
+            ("mode", serde_json::json!("stripped")),
+        ] {
+            let mut args = base.clone();
+            args[key] = value;
+            assert!(run(args.clone()).is_err(), "accepted {args}");
+        }
+        assert!(
+            run(serde_json::json!({"path":project.path().join("file000.txt"),"offset":0})).is_err()
+        );
+        assert!(run(serde_json::json!({"paths":[project.path()],"limit":2})).is_err());
+        let batch = run(serde_json::json!({"paths":[project.path()]})).unwrap();
+        assert!(
+            batch.contains(r#""offset":50"#) && !batch.contains("--offset"),
+            "{batch}"
+        );
     }
 }
 

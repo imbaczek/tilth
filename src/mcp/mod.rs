@@ -22,7 +22,13 @@ use tools::{
 /// Read with the same views and validation as `tilth_read`.
 /// CLI callers supply an absolute root for relative paths.
 pub fn read_for_cli(args: &Value, edit_mode: bool) -> Result<String, String> {
-    tool_read(args, &OutlineCache::new(), &Session::new(), edit_mode)
+    tools::read_with_navigation(
+        args,
+        &OutlineCache::new(),
+        &Session::new(),
+        edit_mode,
+        false,
+    )
 }
 
 /// Shared dependencies passed through the request → dispatch pipeline.

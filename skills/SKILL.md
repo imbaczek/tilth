@@ -93,6 +93,21 @@ In MCP, pass `gitignore: false` for one call or use
 `tilth_config(action: "reset")` restores environment/default behavior.
 `.tilthignore` and built-in junk-directory exclusions always remain active.
 
+Directory paths list 50 immediate children per page, sorted by name, including
+with `--full`. Choose a positive page size and zero-based offset:
+
+```bash
+tilth artifacts/ --limit 20
+tilth read artifacts/ --offset 20 --limit 20
+```
+
+MCP `tilth_read` supports `offset`/`limit` only for a single directory `path`;
+files and batch `paths` reject explicit pagination. MCP `tilth_list` pages
+matching files sorted by relative path; directory nodes do not count and tree
+rollups cover only the selected page. Keep path/scope, patterns, depth and ignore
+settings unchanged between pages. If `budget` truncates a page, retry the same
+offset with a smaller limit before advancing.
+
 ## Deps (blast radius)
 
 ```bash
