@@ -56,3 +56,22 @@ fn format_scoped_failures(failures: &[crate::types::ScopeError]) -> String {
         .collect::<Vec<_>>()
         .join("; ")
 }
+
+/// Preserve the I/O error kind and add directory hints for a missing scope.
+#[must_use]
+pub fn scope_io_error(scope: &std::path::Path, source: std::io::Error) -> TilthError {
+    let source = if source.kind() == std::io::ErrorKind::NotFound {
+        let hints = crate::scope_suggestions::suggestion_suffix(scope);
+        if hints.is_empty() {
+            source
+        } else {
+            std::io::Error::new(source.kind(), format!("{source}{hints}"))
+        }
+    } else {
+        source
+    };
+    TilthError::IoError {
+        path: scope.to_path_buf(),
+        source,
+    }
+}

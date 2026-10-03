@@ -124,6 +124,7 @@ fn resolve_scope_at(
     let anchored = anchor_path(&raw, root, "scope")?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
     if !resolved.is_dir() {
+        let hints = crate::scope_suggestions::suggestion_suffix(&resolved);
         // A missing-dir fallback to "." (server cwd) is the exact worktree hazard
         // this PR closes: the server cwd is frozen at spawn and may point at the
         // wrong checkout. Use root when available (that IS the caller's checkout);
@@ -132,12 +133,12 @@ fn resolve_scope_at(
             Some(r) if r.is_absolute() => Ok((
                 r.to_path_buf(),
                 Some(format!(
-                    "scope \"{raw_str}\" is not a valid directory, searching the root/checkout directory instead.\n\n"
+                    "scope \"{raw_str}\" is not a valid directory, searching the root/checkout directory instead.{hints}\n\n"
                 )),
             )),
             _ => Err(format!(
                 "scope \"{raw_str}\" is not a valid directory and no absolute root was provided to fall back to. \
-                 Pass an absolute scope or set \"root\" to an absolute checkout directory."
+                 Pass an absolute scope or set \"root\" to an absolute checkout directory.{hints}"
             )),
         };
     }

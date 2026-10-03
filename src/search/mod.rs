@@ -166,8 +166,11 @@ fn base_walk_builder_with_gitignore(scope: &Path, respect_gitignore: bool) -> Wa
     builder
 }
 
-fn include_entry(entry: &ignore::DirEntry) -> bool {
-    if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+pub(crate) fn include_entry(entry: &ignore::DirEntry) -> bool {
+    if entry
+        .file_type()
+        .is_some_and(|ft| ft.is_dir() || (ft.is_symlink() && entry.path().is_dir()))
+    {
         if let Some(name) = entry.file_name().to_str() {
             return !SKIP_DIRS.contains(&name);
         }
@@ -180,10 +183,8 @@ fn include_entry(entry: &ignore::DirEntry) -> bool {
 /// When `glob` is Some, applies a file-pattern filter (whitelist or negation).
 /// With gitignore enabled, the glob cannot override ignore rules.
 pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkParallel, TilthError> {
-    let metadata = fs::metadata(scope).map_err(|source| TilthError::IoError {
-        path: scope.to_path_buf(),
-        source,
-    })?;
+    let metadata =
+        fs::metadata(scope).map_err(|source| crate::error::scope_io_error(scope, source))?;
     if metadata.is_dir() {
         fs::read_dir(scope).map_err(|source| TilthError::IoError {
             path: scope.to_path_buf(),

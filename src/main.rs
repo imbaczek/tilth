@@ -456,6 +456,8 @@ fn main() {
         let cache = tilth::cache::OutlineCache::new();
         let scopes = resolve_scopes(&cli.search.scope);
         let output = run_for_scopes(&scopes, |scope| {
+            std::fs::metadata(scope)
+                .map_err(|source| tilth::error::scope_io_error(scope, source))?;
             Ok(tilth::map::generate(scope, 3, cli.search.budget, &cache))
         });
         let output = apply_optional_budget(output, cli.search.budget);
@@ -505,6 +507,8 @@ fn main() {
     // Deps mode
     if cli.search.deps {
         let result = run_query_for_scopes(&scopes, &query, cli.search.budget, |scope| {
+            std::fs::metadata(scope)
+                .map_err(|source| tilth::error::scope_io_error(scope, source))?;
             let path = resolve_query_path(&query, scope);
             tilth::run_deps_with_options(&path, scope, cli.search.budget, cli.search.full)
         });

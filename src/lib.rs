@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod output;
 pub mod overview;
 pub(crate) mod read;
+mod scope_suggestions;
 pub(crate) mod search;
 pub(crate) mod session;
 pub(crate) mod timeout;
@@ -427,8 +428,15 @@ fn run_inner_scopes(
             for (scope_index, (scope, scoped_query_type)) in
                 scopes.iter().zip(classifications).enumerate()
             {
+                if let Err(source) = std::fs::metadata(scope) {
+                    failures.push(crate::types::ScopeError {
+                        scope: scope.clone(),
+                        error: crate::error::scope_io_error(scope, source),
+                    });
+                    continue;
+                }
                 if Path::new(query).is_absolute() && scope_index > 0 {
-                    break;
+                    continue;
                 }
                 let QueryType::FilePath(path) = scoped_query_type else {
                     continue;
