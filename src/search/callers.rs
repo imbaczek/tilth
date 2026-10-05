@@ -327,7 +327,10 @@ pub(crate) fn find_callers_treesitter_batch(
                 let mut enclosing_type_range = None;
                 let mut ancestor = cap.node.parent();
                 while let Some(node) = ancestor {
-                    if matches!(node.kind(), "class_declaration" | "class") {
+                    if matches!(
+                        node.kind(),
+                        "class_declaration" | "abstract_class_declaration" | "class"
+                    ) {
                         enclosing_type_range = Some((node.start_byte(), node.end_byte()));
                         break;
                     }
@@ -511,6 +514,7 @@ fn collect_js_binding(
                 | "method_definition"
                 | "arrow_function"
                 | "class_declaration"
+                | "abstract_class_declaration"
                 | "class"
         )
         && !(node.start_byte() <= call_byte && call_byte < node.end_byte())

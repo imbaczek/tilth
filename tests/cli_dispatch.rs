@@ -841,3 +841,42 @@ fn caller_pagination_applies_to_each_scope() {
     assert!(limited.trim_end().len().div_ceil(4) <= 140, "{limited}");
     assert!(!limited.contains("Next page:"), "{limited}");
 }
+
+#[test]
+fn qualified_grok_ignores_unrelated_candidates_above_the_target_read_cap() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("target.ts"),
+        "class Target { foo() { return 1; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        root.path().join("unrelated.ts"),
+        format!(
+            "class Unrelated {{ foo() {{\n{}return 2; }} }}\n",
+            "// padding\n".repeat(100)
+        ),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .env("TILTH_FULL_SIZE_CAP", "200")
+        .args(["grok", "Target.foo", "--scope"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("# grok: foo [target.ts:1]"), "{stdout}");
+    let refused = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .env("TILTH_FULL_SIZE_CAP", "200")
+        .args(["grok", "Unrelated.foo", "--scope"])
+        .arg(root.path())
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("too large"));
+}

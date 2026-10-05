@@ -125,6 +125,7 @@ fn node_to_entry(
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "abstract_method_signature"
         | "constructor_declaration"
         | "init_declaration"
         | "deinit_declaration"
@@ -145,7 +146,7 @@ fn node_to_entry(
         }
 
         // Classes & structs
-        "class_declaration" | "class_definition" => {
+        "class_declaration" | "abstract_class_declaration" | "class_definition" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
                 .unwrap_or_else(|| "<anonymous>".into());
@@ -1254,6 +1255,137 @@ pub(crate) fn extract_import_source(text: &str, lang: Option<crate::types::Lang>
         .last()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// Resolve qualified declarations directly from AST nodes. Display outlines
+/// intentionally cap nesting depth and line numbers do not identify declarations
+/// uniquely, so neither is sufficient for member resolution.
+pub(crate) fn get_qualified_entries(
+    content: &str,
+    lang: Lang,
+    owner: &str,
+    name: &str,
+) -> Vec<OutlineEntry> {
+    let Some(grammar) = outline_language(lang) else {
+        return Vec::new();
+    };
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&grammar).is_err() {
+        return Vec::new();
+    }
+    let Some(tree) = parser.parse(content, None) else {
+        return Vec::new();
+    };
+    let lines: Vec<_> = content.lines().collect();
+    let mut entries = Vec::new();
+    let mut cursor = tree.walk();
+    loop {
+        let node = cursor.node();
+        if node.kind() != "export_statement"
+            && (crate::lang::spec::spec(lang).definitions.extract_name)(node, &lines).as_deref()
+                == Some(name)
+            && declaration_owner_matches(node, &lines, lang, owner)
+        {
+            if let Some(entry) = node_to_entry(node, &lines, lang, 0) {
+                entries.push(entry);
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return entries;
+            }
+        }
+    }
+}
+
+fn declaration_owner_matches(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    qualified_owner: &str,
+) -> bool {
+    let owner = qualified_owner
+        .rsplit([':', '.'])
+        .next()
+        .unwrap_or(qualified_owner);
+    // Go's method declaration carries a receiver instead of a containing class.
+    if let Some(receiver) = node.child_by_field_name("receiver") {
+        return receiver
+            .named_child(0)
+            .and_then(|parameter| find_child_text(parameter, "type", lines))
+            .is_some_and(|ty| ty.trim_start_matches('*').split('[').next() == Some(owner));
+    }
+    let mut parent = node.parent();
+    while let Some(container) = parent {
+        let kind = container.kind();
+        if lang == Lang::Elixir && crate::lang::elixir::is_elixir_definition(container, lines) {
+            let keyword = find_child_text(container, "target", lines);
+            if matches!(
+                keyword.as_deref(),
+                Some("defmodule" | "defprotocol" | "defimpl")
+            ) {
+                return crate::lang::elixir::extract_elixir_definition_name(container, lines)
+                    .as_deref()
+                    == Some(qualified_owner);
+            }
+            return false;
+        }
+        if kind == "impl_item" {
+            return find_child_text(container, "type", lines).is_some_and(|ty| {
+                let ty = ty.split('<').next().unwrap_or(&ty).trim();
+                ty.rsplit([':', '.']).next() == Some(owner)
+            });
+        }
+        if matches!(
+            kind,
+            "class_declaration"
+                | "abstract_class_declaration"
+                | "class_definition"
+                | "class"
+                | "struct_item"
+                | "struct_declaration"
+                | "interface_declaration"
+                | "trait_item"
+                | "trait_declaration"
+                | "trait_definition"
+                | "protocol_declaration"
+                | "object_declaration"
+                | "object_definition"
+                | "mod_item"
+                | "module"
+                | "namespace_declaration"
+                | "namespace_definition"
+                | "file_scoped_namespace_declaration"
+                | "internal_module"
+        ) {
+            return find_child_text(container, "name", lines)
+                .or_else(|| find_child_text(container, "identifier", lines))
+                .as_deref()
+                == Some(owner);
+        }
+        // A local function is owned by its enclosing function, not its class.
+        if matches!(
+            kind,
+            "function_declaration"
+                | "function_definition"
+                | "function_item"
+                | "method_definition"
+                | "method_declaration"
+                | "arrow_function"
+                | "function_expression"
+                | "lambda_expression"
+        ) {
+            return false;
+        }
+        parent = container.parent();
+    }
+    false
 }
 
 /// Get structured outline entries for file content.

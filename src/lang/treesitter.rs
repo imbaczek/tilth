@@ -11,8 +11,10 @@ pub(crate) const DEFINITION_KINDS: &[&str] = &[
     "function_item",
     "method_definition",
     "method_declaration",
+    "abstract_method_signature",
     // Classes, structs & Kotlin objects
     "class_declaration",
+    "abstract_class_declaration",
     "class_definition",
     "struct_item",
     "object_declaration",
@@ -286,7 +288,9 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "function_item"
         | "method_definition"
         | "method_declaration"
+        | "abstract_method_signature"
         | "class_declaration"
+        | "abstract_class_declaration"
         | "class_definition"
         | "struct_item"
         | "interface_declaration"

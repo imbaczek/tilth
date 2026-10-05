@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use crate::error::TilthError;
 use crate::index::bloom::BloomFilterCache;
 use crate::lang::detect_file_type;
-use crate::lang::outline::get_outline_entries;
+use crate::lang::outline::{get_outline_entries, get_qualified_entries};
 use crate::search::callees::{extract_callee_names, resolve_callees, ResolvedCallee};
 use crate::search::callers::{find_callers_batch_with_size_limit, CallerMatch};
 use crate::search::search_symbol_raw;
@@ -29,6 +29,8 @@ pub struct ResolvedTarget {
     /// Count of *other* matching definitions when resolving by name.
     /// 0 means unambiguous; >0 means the formatter should warn the agent.
     pub other_def_count: usize,
+    /// Explains when resolution returned an enclosing symbol instead of the requested definition.
+    pub resolution_note: Option<String>,
 }
 
 /// Parsed form of the target spec passed to grok.
@@ -104,24 +106,59 @@ fn resolve_with_source_at_root(
 }
 
 fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
-    // The literal spec (`Type::method`) never equals a bare definition name, so
-    // this attempt only fires for genuinely bare targets.
-    if let Some(resolved) = resolve_def_by_query(name, scope)? {
-        return Ok(resolved);
-    }
-    // Qualified target (`Type::method` or `Type.method`): retry with the trailing
-    // segment. The retry is bounded — it fires only when the literal lookup found
-    // no definition, leaving bare-symbol resolution unchanged.
     let bare = split_qualified(name);
     if bare != name && !bare.is_empty() {
-        if let Some(resolved) = resolve_def_by_query(bare, scope)? {
+        let prefix = name[..name.len() - bare.len() - 1].trim_end_matches(':');
+        if let Some(resolved) = resolve_qualified_method(prefix, bare, scope)? {
             return Ok(resolved);
         }
+    } else if let Some(resolved) = resolve_def_by_query(name, scope)? {
+        return Ok(resolved);
     }
     Err(TilthError::NotFound {
         path: PathBuf::from(name),
         suggestion: None,
     })
+}
+
+/// Check the enclosing owner without capping candidates. A common
+/// method name can have many unrelated definitions across the scope.
+fn resolve_qualified_method(
+    owner: &str,
+    method: &str,
+    scope: &Path,
+) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
+    let (mut definitions, _, _) = super::symbol::find_definitions(method, scope, None, usize::MAX)?;
+    super::rank::sort(&mut definitions, method, scope, None);
+    let mut seen = HashSet::new();
+    let mut selected = None;
+    let mut count: usize = 0;
+    for definition in definitions {
+        let FileType::Code(lang) = detect_file_type(&definition.path) else {
+            continue;
+        };
+        if !seen.insert(definition.path.clone()) {
+            continue;
+        }
+        // Search already bounds candidate files to 500 KB. Qualify before
+        // enforcing grok's target read cap: unrelated definitions must not
+        // abort a valid request when TILTH_FULL_SIZE_CAP is lower than that.
+        let Ok(content) = fs::read_to_string(&definition.path) else {
+            continue;
+        };
+        let entries = get_qualified_entries(&content, lang, owner, method);
+        count += entries.len();
+        if selected.is_none() {
+            if let Some(entry) = entries.first() {
+                let (content, lang) = read_code_file(&definition.path)?;
+                selected = Some((target_from_entry(entry, definition.path, 0), content, lang));
+            }
+        }
+    }
+    if let Some((target, _, _)) = &mut selected {
+        target.other_def_count = count.saturating_sub(1);
+    }
+    Ok(selected)
 }
 
 /// Split a qualified target into its bare trailing name.
@@ -176,7 +213,23 @@ fn resolve_by_path_line(
             path: path.to_path_buf(),
             suggestion: Some(format!("no definition encloses line {line}")),
         })?;
-    let target = target_from_entry(entry, path.to_path_buf(), 0);
+    let mut target = target_from_entry(entry, path.to_path_buf(), 0);
+    if line != entry.start_line
+        && matches!(
+            entry.kind,
+            OutlineKind::Class
+                | OutlineKind::Struct
+                | OutlineKind::Module
+                | OutlineKind::Interface
+                | OutlineKind::Export
+        )
+    {
+        target.resolution_note = Some(format!(
+            "no member definition encloses line {line}; showing enclosing {} `{}`",
+            kind_label(entry.kind),
+            entry.name
+        ));
+    }
     Ok((target, content, lang))
 }
 
@@ -251,7 +304,17 @@ fn enrich_from_outline(
         .or_else(|| find_by_start_line(&entries, start_line))
         .or_else(|| find_entry_at_line(&entries, start_line));
     let target = match entry {
-        Some(e) => target_from_entry(e, path, other_def_count),
+        Some(e) => {
+            let mut target = target_from_entry(e, path, other_def_count);
+            if e.name != split_qualified(&name) {
+                target.resolution_note = Some(format!(
+                    "definition `{name}` is missing from the outline; showing enclosing {} `{}`",
+                    kind_label(e.kind),
+                    e.name
+                ));
+            }
+            target
+        }
         None => ResolvedTarget {
             name,
             path,
@@ -261,6 +324,9 @@ fn enrich_from_outline(
             signature: None,
             doc: None,
             other_def_count,
+            resolution_note: Some(
+                "definition is missing from the outline; showing its start line only".to_string(),
+            ),
         },
     };
     Ok((target, content, lang))
@@ -280,6 +346,7 @@ fn target_from_entry(
         signature: entry.signature.clone(),
         doc: entry.doc.clone(),
         other_def_count,
+        resolution_note: None,
     }
 }
 
@@ -695,6 +762,7 @@ pub(crate) fn grok_with_root(
                     signature: callee.signature.clone(),
                     doc: None,
                     other_def_count: 0,
+                    resolution_note: None,
                 };
                 let sliced = body_with_dedup(&callee_target, &cc, session, caps.max_body_lines);
                 // Record the callee expansion so repeat-grok of the callee
@@ -772,11 +840,13 @@ impl TsExportResolver {
                         let mut child_cursor = statement.walk();
                         target_default |=
                             statement.named_children(&mut child_cursor).any(|child| {
-                                matches!(child.kind(), "class_declaration" | "class")
-                                    && child
-                                        .child_by_field_name("name")
-                                        .and_then(|name| name.utf8_text(content.as_bytes()).ok())
-                                        == Some(owner)
+                                matches!(
+                                    child.kind(),
+                                    "class_declaration" | "abstract_class_declaration" | "class"
+                                ) && child
+                                    .child_by_field_name("name")
+                                    .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+                                    == Some(owner)
                             });
                         target_default |=
                             text.trim().starts_with(&format!("export default {owner}"));
@@ -951,11 +1021,13 @@ impl TsExportResolver {
                 }
                 let mut children = statement.walk();
                 for child in statement.named_children(&mut children) {
-                    if matches!(child.kind(), "class_declaration" | "function_declaration")
-                        && child
-                            .child_by_field_name("name")
-                            .and_then(|name| name.utf8_text(content.as_bytes()).ok())
-                            == Some(exported)
+                    if matches!(
+                        child.kind(),
+                        "class_declaration" | "abstract_class_declaration" | "function_declaration"
+                    ) && child
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(content.as_bytes()).ok())
+                        == Some(exported)
                     {
                         return false;
                     }
@@ -1064,7 +1136,10 @@ impl TsExportResolver {
             return false;
         }
         if let Some(local) = ts_local_binding(binding, ty, bytes) {
-            if !matches!(local.kind(), "class_declaration" | "class") {
+            if !matches!(
+                local.kind(),
+                "class_declaration" | "abstract_class_declaration" | "class"
+            ) {
                 return false;
             }
             let name = local
@@ -1238,7 +1313,10 @@ fn collect_ts_subclasses(
     method: &str,
     classes: &mut Vec<(String, String)>,
 ) {
-    if matches!(node.kind(), "class_declaration" | "class") {
+    if matches!(
+        node.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class"
+    ) {
         let name = node
             .child_by_field_name("name")
             .and_then(|n| n.utf8_text(bytes).ok());
@@ -1382,7 +1460,10 @@ fn ts_class_matches(
     aliases: &HashSet<String>,
     depth: usize,
 ) -> bool {
-    if !matches!(class.kind(), "class_declaration" | "class") {
+    if !matches!(
+        class.kind(),
+        "class_declaration" | "abstract_class_declaration" | "class"
+    ) {
         return false;
     }
     if depth >= 16 {
@@ -1420,7 +1501,11 @@ fn ts_local_binding<'a>(
     ) -> Option<tree_sitter::Node<'a>> {
         if matches!(
             node.kind(),
-            "class_declaration" | "class" | "function_declaration" | "variable_declarator"
+            "class_declaration"
+                | "abstract_class_declaration"
+                | "class"
+                | "function_declaration"
+                | "variable_declarator"
         ) && node
             .child_by_field_name("name")
             .and_then(|n| n.utf8_text(bytes).ok())
@@ -1601,6 +1686,10 @@ pub fn format_grok(result: &GrokResult, scope: &Path) -> String {
             "\n> ambiguous: {} other definition{} {} this name — re-run with --scope to narrow",
             result.target.other_def_count, suffix, verb,
         );
+    }
+
+    if let Some(note) = &result.target.resolution_note {
+        let _ = writeln!(out, "\n> {note}");
     }
 
     // Signature
@@ -1856,6 +1945,291 @@ fn collect_siblings(entries: &[OutlineEntry], target: &ResolvedTarget) -> Vec<Si
 mod tests {
     use super::*;
     use std::io::Write;
+
+    const ABSTRACT_CLASS_REPRO: &str = "export abstract class Abs {\n    public a(): number {\n        return 1;\n    }\n\n    private b(): number {\n        return this.a() + 1;\n    }\n}\n";
+
+    #[test]
+    fn abstract_class_methods_resolve_by_name_and_line() {
+        for extension in ["ts", "tsx"] {
+            for prefix in [
+                "export abstract class",
+                "abstract class",
+                "export default abstract class",
+            ] {
+                let tmp = tempfile::tempdir().unwrap();
+                let source = ABSTRACT_CLASS_REPRO.replace("export abstract class", prefix);
+                let file = format!("abs.{extension}");
+                write_fixture(tmp.path(), &file, &source);
+                for (method, start, end) in [("a", 2, 4), ("b", 6, 8)] {
+                    for spec in [
+                        method.to_string(),
+                        format!("Abs.{method}"),
+                        format!("Abs::{method}"),
+                        format!("{file}:{start}"),
+                        format!("{file}:{}", start + 1),
+                    ] {
+                        let (target, _, _) = resolve_with_source(&spec, tmp.path()).unwrap();
+                        assert_eq!(target.name, method, "{prefix}, {spec}");
+                        assert_eq!(target.kind, OutlineKind::Function);
+                        assert_eq!((target.start_line, target.end_line), (start, end));
+                    }
+                }
+                let (class, _, _) = resolve_with_source("Abs", tmp.path()).unwrap();
+                assert_eq!(class.name, "Abs");
+                assert_eq!(class.kind, OutlineKind::Class);
+                assert_eq!(class.other_def_count, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn abstract_method_signatures_resolve_as_members() {
+        for extension in ["ts", "tsx"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let file = format!("contract.{extension}");
+            write_fixture(
+                tmp.path(),
+                &file,
+                "export abstract class Contract {\n abstract compute(): number;\n}\n",
+            );
+            for spec in [
+                "compute".to_string(),
+                "Contract.compute".to_string(),
+                format!("{file}:2"),
+            ] {
+                let (target, _, _) = resolve_with_source(&spec, tmp.path()).unwrap();
+                assert_eq!(target.name, "compute");
+                assert_eq!(target.kind, OutlineKind::Function);
+                assert_eq!((target.start_line, target.end_line), (2, 2));
+                assert!(target
+                    .signature
+                    .as_deref()
+                    .unwrap()
+                    .contains("compute(): number"));
+            }
+        }
+    }
+
+    #[test]
+    fn qualified_methods_match_the_owner_before_search_caps() {
+        let tmp = tempfile::tempdir().unwrap();
+        let abs = write_fixture(tmp.path(), "abs.ts", ABSTRACT_CLASS_REPRO);
+        let plain = write_fixture(
+            tmp.path(),
+            "plain.ts",
+            &ABSTRACT_CLASS_REPRO.replace("abstract class Abs", "class Plain"),
+        );
+        // More unrelated definitions than the ordinary search's display and walk caps.
+        let mut decoys = String::new();
+        for i in 0..80 {
+            writeln!(decoys, "export class Decoy{i} {{ a() {{}} b() {{}} }}").unwrap();
+        }
+        write_fixture(tmp.path(), "decoys.ts", &decoys);
+        for (owner, path) in [("Abs", abs), ("Plain", plain)] {
+            for (method, line) in [("a", 2), ("b", 6)] {
+                let (target, _, _) =
+                    resolve_with_source(&format!("{owner}.{method}"), tmp.path()).unwrap();
+                assert_eq!(target.path, path);
+                assert_eq!(target.name, method);
+                assert_eq!(target.start_line, line);
+                assert_eq!(target.other_def_count, 0);
+            }
+        }
+        for spec in ["Missing.b", "Abs.missing", "Decoy.b"] {
+            assert!(
+                matches!(
+                    resolve_with_source(spec, tmp.path()),
+                    Err(TilthError::NotFound { .. })
+                ),
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_rust_methods_match_the_impl_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "types.rs", "struct First;\nstruct Second;\nimpl First { fn same(&self) {} }\nimpl Second { fn same(&self) {} }\nfn same() {}\n");
+        write_fixture(
+            tmp.path(),
+            "generic.rs",
+            "struct Generic<T>(T);\nimpl<T> Generic<T> { fn same(&self) {} }\n",
+        );
+        for (owner, line) in [("First", 3), ("Second", 4), ("Generic", 2)] {
+            let (target, _, _) =
+                resolve_with_source(&format!("{owner}::same"), tmp.path()).unwrap();
+            assert_eq!(target.name, "same");
+            assert_eq!(target.start_line, line);
+            assert_eq!(target.other_def_count, 0);
+        }
+        assert!(matches!(
+            resolve_with_source("Missing::same", tmp.path()),
+            Err(TilthError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn qualified_go_methods_match_value_pointer_and_generic_receivers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "types.go", "package example\ntype First struct{}\ntype Second struct{}\ntype Generic[T any] struct{}\nfunc (f First) Same() {}\nfunc (s *Second) Same() {}\nfunc (g *Generic[T]) Same() {}\nfunc Same() {}\n");
+        for (owner, line) in [("First", 5), ("Second", 6), ("Generic", 7)] {
+            let (target, _, _) = resolve_with_source(&format!("{owner}.Same"), tmp.path()).unwrap();
+            assert_eq!(target.name, "Same");
+            assert_eq!(target.start_line, line);
+            assert_eq!(target.other_def_count, 0);
+        }
+        assert!(matches!(
+            resolve_with_source("Missing.Same", tmp.path()),
+            Err(TilthError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn qualified_methods_resolve_below_the_outline_depth_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "module.rs",
+            "mod inner {\n struct Thing;\n impl Thing {\n  fn ping(&self) {}\n }\n}\n",
+        );
+        let (target, _, _) = resolve_with_source("Thing::ping", tmp.path()).unwrap();
+        assert_eq!(target.name, "ping");
+        assert_eq!((target.start_line, target.end_line), (4, 4));
+        assert_eq!(target.other_def_count, 0);
+        assert!(target.signature.as_deref().unwrap().contains("fn ping"));
+        write_fixture(
+            tmp.path(),
+            "nested.ts",
+            "class Outer { method() { class Inner { ping() { return 7; } } } }\n",
+        );
+        let (target, _, _) = resolve_with_source("Inner.ping", tmp.path()).unwrap();
+        assert_eq!(target.name, "ping");
+        assert!(target.signature.as_deref().unwrap().contains("ping()"));
+        assert!(matches!(
+            resolve_with_source("Outer.ping", tmp.path()),
+            Err(TilthError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn qualified_methods_preserve_same_line_declaration_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "same.ts",
+            "class First { foo() { return 1; } } class Second { foo() { return 2; } }\n",
+        );
+        for owner in ["First", "Second"] {
+            let (target, _, _) = resolve_with_source(&format!("{owner}.foo"), tmp.path()).unwrap();
+            assert_eq!(target.name, "foo");
+            assert_eq!(target.other_def_count, 0);
+        }
+        write_fixture(tmp.path(), "same.go", "package example\ntype First struct{}\ntype Second struct{}\nfunc (f First) Same() {}; func (s Second) Same() {}\n");
+        for (owner, signature) in [
+            ("First", "func (f First) Same()"),
+            ("Second", "func (s Second) Same()"),
+        ] {
+            let (target, _, _) = resolve_with_source(&format!("{owner}.Same"), tmp.path()).unwrap();
+            assert_eq!(target.name, "Same");
+            assert_eq!(target.other_def_count, 0);
+            assert!(
+                target.signature.as_deref().unwrap().contains(signature),
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn qualified_elixir_functions_use_module_aliases_and_definition_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "modules.ex", "defmodule Example do\n def foo(x), do: x\nend\ndefmodule Other do\n def foo(x), do: x + 1\nend\ndefmodule Named.Owner do\n def foo(x), do: x + 2\nend\n");
+        for (owner, line) in [("Example", 2), ("Other", 5), ("Named.Owner", 8)] {
+            let (target, _, _) = resolve_with_source(&format!("{owner}.foo"), tmp.path()).unwrap();
+            assert_eq!(target.name, "foo");
+            assert_eq!((target.start_line, target.end_line), (line, line));
+            assert_eq!(target.other_def_count, 0);
+            assert!(target.signature.as_deref().unwrap().contains("def foo(x)"));
+        }
+        assert!(matches!(
+            resolve_with_source("Wrong.Owner.foo", tmp.path()),
+            Err(TilthError::NotFound { .. })
+        ));
+    }
+
+    #[test]
+    fn grok_abstract_method_keeps_body_callees_and_callers() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(tmp.path(), "abs.ts", ABSTRACT_CLASS_REPRO);
+        write_fixture(tmp.path(), "consumer.ts", "import { Abs } from './abs';\nfunction use(value: Abs) { return value.a(); }\nclass Child extends Abs { relay() { return this.a(); } }\n");
+        let result = grok(
+            "Abs.a",
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.target.name, "a");
+        assert!(result.body.contains("return 1"));
+        assert!(!result.body.contains("private b"));
+        assert_eq!(result.total_callers, 3);
+        for name in ["b", "use", "Child.relay"] {
+            assert!(
+                result
+                    .callers
+                    .iter()
+                    .any(|caller| caller.calling_function == name),
+                "missing {name}: {:?}",
+                result.callers
+            );
+        }
+        let result = grok(
+            "Abs.b",
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.target.name, "b");
+        assert!(result.body.contains("this.a()"));
+        assert!(result
+            .callees_internal
+            .iter()
+            .any(|callee| callee.name == "a"));
+    }
+
+    #[test]
+    fn grok_reports_enclosing_symbol_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_fixture(
+            tmp.path(),
+            "nested.ts",
+            "class Container {\n method() {\n  function nested() {}\n }\n}\n",
+        );
+        let (target, _, _) = enrich_from_outline(path, 3, "nested".to_string(), 0).unwrap();
+        assert_eq!(target.name, "method");
+        assert!(target
+            .resolution_note
+            .as_deref()
+            .unwrap()
+            .contains("enclosing"));
+        write_fixture(tmp.path(), "abs.ts", ABSTRACT_CLASS_REPRO);
+        let result = grok(
+            "abs.ts:5",
+            tmp.path(),
+            &BloomFilterCache::default(),
+            &crate::session::Session::default(),
+            GrokCaps::default(),
+        )
+        .unwrap();
+        assert_eq!(result.target.name, "Abs");
+        let output = format_grok(&result, tmp.path());
+        assert!(
+            output.contains("enclosing") && output.contains("line 5"),
+            "{output}"
+        );
+    }
 
     #[test]
     fn target_root_fallback_preserves_scope_precedence_and_absolute_paths() {
@@ -2930,6 +3304,7 @@ mod tests {
             signature: None,
             doc: None,
             other_def_count: 0,
+            resolution_note: None,
         }
     }
 
@@ -3232,6 +3607,7 @@ pub fn target() {
             signature: Some("fn foo()".into()),
             doc: None,
             other_def_count: 3,
+            resolution_note: None,
         };
         let result = GrokResult {
             target,
@@ -3263,6 +3639,7 @@ pub fn target() {
             signature: None,
             doc: None,
             other_def_count: 0,
+            resolution_note: None,
         };
         // Manually construct a result where callers count > total displayed.
         let result = GrokResult {

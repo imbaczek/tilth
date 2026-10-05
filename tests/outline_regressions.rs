@@ -99,3 +99,27 @@ fn outline_preserves_multiline_parameters_and_return_type() {
     }
     assert!(!output.contains("body_only_marker"));
 }
+
+#[test]
+fn outline_keeps_typescript_abstract_class_members() {
+    for extension in ["ts", "tsx"] {
+        for prefix in [
+            "abstract class",
+            "export abstract class",
+            "export default abstract class",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(format!("abs.{extension}"));
+            let source = format!("{prefix} Abs {{\n public a(): number {{ return 1; }}\n private b(): number {{ return this.a() + 1; }}\n abstract compute(): number;\n}}\n");
+            fs::write(&path, format!("{source}{}", padding())).unwrap();
+            let output = read(&path, &OutlineCache::new(), None);
+            assert!(output.contains("[outline]"));
+            for name in ["class Abs", "a()", "b()", "compute()"] {
+                assert!(
+                    output.contains(name),
+                    "{prefix}, {extension}: missing {name}: {output}"
+                );
+            }
+        }
+    }
+}

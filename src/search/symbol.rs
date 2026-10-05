@@ -259,7 +259,7 @@ pub(super) fn search_collected(
 /// Single-read design: reads each file once, checks for symbol via
 /// `memchr::memmem` (SIMD), then reuses the buffer for tree-sitter parsing.
 /// Early termination: quits the parallel walker once enough defs are found.
-fn find_definitions(
+pub(super) fn find_definitions(
     query: &str,
     scope: &Path,
     glob: Option<&str>,
@@ -541,7 +541,10 @@ fn walk_for_definitions(
                         });
                     }
                 }
-            } else if kind == "class_declaration" || kind == "class_definition" {
+            } else if matches!(
+                kind,
+                "class_declaration" | "abstract_class_declaration" | "class_definition"
+            ) {
                 let interfaces = extract_implemented_interfaces(node, lines);
                 if interfaces.iter().any(|i| i == query) {
                     let class_name = extract_definition_name(node, lines)
