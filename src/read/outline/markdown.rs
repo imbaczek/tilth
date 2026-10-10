@@ -1,9 +1,7 @@
-/// Markdown outline via tree-sitter-md. The block grammar emits `section`
-/// nodes that group each heading with its content (and any nested sections),
-/// so heading hierarchy + section spans drop out of the AST instead of
-/// requiring a hand-rolled fence-aware ATX scan. Fenced code blocks are
-/// `fenced_code_block` nodes and never produce false-positive headings.
-use crate::lang::outline::{heading_level, heading_text, parse_markdown};
+/// Markdown outlines share section spans and TOC addresses with section
+/// selection, including headings nested inside blockquotes and lists.
+use crate::lang::outline::parse_markdown;
+use crate::read::heading_sections_from_tree;
 
 pub fn outline(buf: &[u8], max_lines: usize) -> String {
     let Ok(content) = std::str::from_utf8(buf) else {
@@ -13,96 +11,90 @@ pub fn outline(buf: &[u8], max_lines: usize) -> String {
         return String::new();
     };
     let lines: Vec<&str> = content.lines().collect();
+    let sections = heading_sections_from_tree(tree.root_node(), &lines, max_lines);
+    let mut entries: Vec<_> = sections
+        .iter()
+        .map(|section| {
+            let indent = "  ".repeat(usize::from(section.level).saturating_sub(1));
+            let hashes = "#".repeat(usize::from(section.level));
+            let display = if section.title.len() > 80 {
+                format!("{}...", crate::types::truncate_str(&section.title, 77))
+            } else {
+                section.title.clone()
+            };
+            format!(
+                "[{}-{}] {} {indent}{hashes} {display}",
+                section.start, section.end, section.address
+            )
+        })
+        .collect();
 
-    let mut entries = Vec::new();
-    let mut code_block_count = 0u32;
-    walk(
-        tree.root_node(),
-        &lines,
-        max_lines,
-        &mut entries,
-        &mut code_block_count,
-    );
-
+    // Preserve the capped outline's code-block summary: count only blocks
+    // visited before the final heading that exhausted the entry cap.
+    let until_line = if sections.len() >= max_lines {
+        sections.last().map_or(1, |section| section.start)
+    } else {
+        usize::MAX
+    };
+    let code_block_count = count_code_blocks(tree.root_node(), until_line);
     if code_block_count > 0 {
         entries.push(format!("\n({code_block_count} code blocks)"));
     }
     entries.join("\n")
 }
 
-fn walk(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    max_lines: usize,
-    entries: &mut Vec<String>,
-    code_block_count: &mut u32,
-) {
+fn count_code_blocks(node: tree_sitter::Node, until_line: usize) -> usize {
+    if node.start_position().row + 1 >= until_line {
+        return 0;
+    }
+    if node.kind() == "fenced_code_block" {
+        return 1;
+    }
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if entries.len() >= max_lines {
-            return;
-        }
-        match child.kind() {
-            "section" => {
-                emit_section_heading(child, lines, entries);
-                walk(child, lines, max_lines, entries, code_block_count);
-            }
-            "fenced_code_block" => {
-                *code_block_count += 1;
-            }
-            _ => walk(child, lines, max_lines, entries, code_block_count),
-        }
-    }
-}
-
-/// If `section` opens with an `atx_heading` or `setext_heading`, append an
-/// entry of the form `[start-end] {indent}{hashes} {text}` to `entries`.
-fn emit_section_heading(section: tree_sitter::Node, lines: &[&str], entries: &mut Vec<String>) {
-    let mut cursor = section.walk();
-    for inner in section.children(&mut cursor) {
-        // Only ATX headings nest as proper sections in the block grammar;
-        // setext headings sit as siblings inside one big document section,
-        // so section-span computation doesn't apply. Preserve the old
-        // hand-rolled scanner's behavior of silently ignoring setext.
-        if inner.kind() != "atx_heading" {
-            continue;
-        }
-        let Some(level) = heading_level(inner) else {
-            return;
-        };
-        let start_line = (inner.start_position().row + 1) as u32;
-        let end_line = section_end_line(section);
-        let text = heading_text(inner, lines);
-        let indent = "  ".repeat((level as usize).saturating_sub(1));
-        let hashes = "#".repeat(level as usize);
-        let display = if text.len() > 80 {
-            format!("{}...", crate::types::truncate_str(&text, 77))
-        } else {
-            text
-        };
-        entries.push(format!(
-            "[{start_line}-{end_line}] {indent}{hashes} {display}"
-        ));
-        return;
-    }
-}
-
-/// Convert a section node's exclusive end position to a 1-indexed inclusive
-/// line. Tree-sitter end positions point one past the last character — when
-/// the section ends with a newline, end.column is 0 on the row after the
-/// content; otherwise end.row is the row containing the last character.
-fn section_end_line(section: tree_sitter::Node) -> u32 {
-    let end = section.end_position();
-    if end.column == 0 {
-        end.row as u32
-    } else {
-        (end.row + 1) as u32
-    }
+    node.children(&mut cursor)
+        .map(|child| count_code_blocks(child, until_line))
+        .sum()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_outline_address_selects_its_displayed_range() {
+        let input = b"## Root\n###### Shared\nfirst\n\n> # Nested\n> ## Shared\n> inside\n\n### Shared\noutside\n## Next\nend\n";
+        let listed = String::from_utf8_lossy(input).replace(
+            "> # Nested\n> ## Shared\n> inside",
+            "- # Nested\n  ## Shared\n  inside",
+        );
+        for input in [input.as_slice(), listed.as_bytes()] {
+            let result = outline(input, 100);
+            assert!(result.contains("toc:1.2     ### Shared"), "{result}");
+            for entry in result.lines().filter(|line| line.starts_with('[')) {
+                let mut parts = entry.split_whitespace();
+                let displayed = parts.next().unwrap().trim_matches(['[', ']']);
+                let address = parts.next().unwrap();
+                assert!(address.starts_with("toc:"), "{entry}");
+                assert_eq!(
+                    crate::read::resolve_range(input, address).unwrap(),
+                    crate::read::parse_range(displayed).unwrap(),
+                    "{entry}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn capped_outline_addresses_match_uncapped_prefix() {
+        let input = b"# Root\n~~~md\n# Fake\n~~~\n### Child\n## Sibling\n~~~\ncode\n~~~\n# Next\n";
+        let full = outline(input, 100);
+        let capped = outline(input, 2);
+        let prefix = full.lines().take(2).collect::<Vec<_>>().join("\n");
+        assert!(capped.starts_with(&prefix), "{capped}");
+        assert!(capped.contains("(1 code blocks)"), "{capped}");
+        assert!(!capped.contains("Sibling"), "{capped}");
+        assert!(outline(input, 0).is_empty());
+    }
 
     #[test]
     fn basic_headings() {
@@ -112,9 +104,9 @@ mod tests {
 
         assert_eq!(lines.len(), 2);
         // H1 extends to end of file (line 4) since no other H1
-        assert_eq!(lines[0], "[1-4] # H1");
+        assert_eq!(lines[0], "[1-4] toc:1 # H1");
         // H2 also extends to end of file (line 4)
-        assert_eq!(lines[1], "[3-4]   ## H2");
+        assert_eq!(lines[1], "[3-4] toc:1.1   ## H2");
     }
 
     #[test]
@@ -123,7 +115,7 @@ mod tests {
         let result = outline(input, 100);
 
         // Should only find the real heading, not any inside code block
-        assert!(result.starts_with("[1-5] # Real Heading"));
+        assert!(result.starts_with("[1-5] toc:1 # Real Heading"));
         assert!(result.contains("(1 code blocks)"));
         assert!(!result.contains("Fake Heading"));
     }
@@ -144,13 +136,13 @@ mod tests {
 
         assert_eq!(lines.len(), 4);
         // A extends until D (line 7), so ends at line 6
-        assert_eq!(lines[0], "[1-6] # A");
+        assert_eq!(lines[0], "[1-6] toc:1 # A");
         // B extends until C (line 5), so ends at line 4
-        assert_eq!(lines[1], "[3-4]   ## B");
+        assert_eq!(lines[1], "[3-4] toc:1.1   ## B");
         // C extends until D (line 7), so ends at line 6
-        assert_eq!(lines[2], "[5-6]   ## C");
+        assert_eq!(lines[2], "[5-6] toc:1.2   ## C");
         // D extends to end of file (line 8)
-        assert_eq!(lines[3], "[7-8] # D");
+        assert_eq!(lines[3], "[7-8] toc:2 # D");
     }
 
     #[test]
@@ -159,7 +151,7 @@ mod tests {
         let result = outline(input, 100);
 
         // Heading should extend to line 4 (total line count)
-        assert_eq!(result, "[1-4] # Heading");
+        assert_eq!(result, "[1-4] toc:1 # Heading");
     }
 
     #[test]

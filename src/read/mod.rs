@@ -248,8 +248,18 @@ fn heading_sections(buf: &[u8]) -> Vec<HeadingSection> {
         return Vec::new();
     };
     let lines: Vec<&str> = content.lines().collect();
+    heading_sections_from_tree(tree.root_node(), &lines, usize::MAX)
+}
+
+/// Shared by section selection and Markdown outlines. Limiting the collected
+/// prefix does not change its addresses; later headings cannot affect ancestry.
+fn heading_sections_from_tree(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    max_sections: usize,
+) -> Vec<HeadingSection> {
     let mut sections = Vec::new();
-    collect_sections(tree.root_node(), &lines, &mut sections);
+    collect_sections(node, lines, &mut sections, max_sections);
 
     // Number actual siblings using section containment, independent of ATX
     // level gaps. Container headings (quotes/lists) can have the same level
@@ -280,7 +290,15 @@ fn heading_sections(buf: &[u8]) -> Vec<HeadingSection> {
     sections
 }
 
-fn collect_sections(node: tree_sitter::Node, lines: &[&str], out: &mut Vec<HeadingSection>) {
+fn collect_sections(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    out: &mut Vec<HeadingSection>,
+    max_sections: usize,
+) {
+    if out.len() >= max_sections {
+        return;
+    }
     if node.kind() == "section" {
         let mut cursor = node.walk();
         let heading = node
@@ -301,11 +319,14 @@ fn collect_sections(node: tree_sitter::Node, lines: &[&str], out: &mut Vec<Headi
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
+        if out.len() >= max_sections {
+            break;
+        }
         if !matches!(
             child.kind(),
             "fenced_code_block" | "indented_code_block" | "html_block"
         ) {
-            collect_sections(child, lines, out);
+            collect_sections(child, lines, out, max_sections);
         }
     }
 }
