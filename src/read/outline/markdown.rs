@@ -12,22 +12,40 @@ pub fn outline(buf: &[u8], max_lines: usize) -> String {
     };
     let lines: Vec<&str> = content.lines().collect();
     let sections = heading_sections_from_tree(tree.root_node(), &lines, max_lines);
-    let mut entries: Vec<_> = sections
+    let rows: Vec<_> = sections
         .iter()
         .map(|section| {
-            let indent = "  ".repeat(usize::from(section.level).saturating_sub(1));
             let hashes = "#".repeat(usize::from(section.level));
             let display = if section.title.len() > 80 {
                 format!("{}...", crate::types::truncate_str(&section.title, 77))
             } else {
                 section.title.clone()
             };
-            format!(
-                "[{}-{}] {} {indent}{hashes} {display}",
-                section.start, section.end, section.address
+            (
+                format!("[{}-{}]", section.start, section.end),
+                section
+                    .address
+                    .strip_prefix("toc:")
+                    .expect("TOC address prefix"),
+                format!("{hashes} {display}"),
             )
         })
         .collect();
+    let line_width = rows.iter().map(|row| row.0.len()).max().unwrap_or(0).max(5);
+    let toc_width = rows.iter().map(|row| row.1.len()).max().unwrap_or(0).max(3);
+    let mut entries = Vec::new();
+    if !rows.is_empty() {
+        entries.push(format!(
+            "{:line_width$}  {:toc_width$}  Heading",
+            "Lines", "TOC"
+        ));
+        for (range, address, heading) in rows {
+            entries.push(format!(
+                "{range:line_width$}  {address:toc_width$}  {heading}"
+            ));
+        }
+        entries.push("\nSelect with --section toc:<TOC>.".into());
+    }
 
     // Preserve the capped outline's code-block summary: count only blocks
     // visited before the final heading that exhausted the entry cap.
@@ -69,14 +87,20 @@ mod tests {
         );
         for input in [input.as_slice(), listed.as_bytes()] {
             let result = outline(input, 100);
-            assert!(result.contains("toc:1.2     ### Shared"), "{result}");
+            assert!(
+                result
+                    .lines()
+                    .any(|line| line.split_whitespace().collect::<Vec<_>>()
+                        == ["[9-10]", "1.2", "###", "Shared"]),
+                "{result}"
+            );
             for entry in result.lines().filter(|line| line.starts_with('[')) {
                 let mut parts = entry.split_whitespace();
                 let displayed = parts.next().unwrap().trim_matches(['[', ']']);
                 let address = parts.next().unwrap();
-                assert!(address.starts_with("toc:"), "{entry}");
+                assert!(!address.starts_with("toc:"), "{entry}");
                 assert_eq!(
-                    crate::read::resolve_range(input, address).unwrap(),
+                    crate::read::resolve_range(input, &format!("toc:{address}")).unwrap(),
                     crate::read::parse_range(displayed).unwrap(),
                     "{entry}"
                 );
@@ -89,24 +113,60 @@ mod tests {
         let input = b"# Root\n~~~md\n# Fake\n~~~\n### Child\n## Sibling\n~~~\ncode\n~~~\n# Next\n";
         let full = outline(input, 100);
         let capped = outline(input, 2);
-        let prefix = full.lines().take(2).collect::<Vec<_>>().join("\n");
-        assert!(capped.starts_with(&prefix), "{capped}");
+        let full_rows: Vec<_> = full
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .take(2)
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .collect();
+        let capped_rows: Vec<_> = capped
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+            .collect();
+        assert_eq!(capped_rows, full_rows);
         assert!(capped.contains("(1 code blocks)"), "{capped}");
         assert!(!capped.contains("Sibling"), "{capped}");
         assert!(outline(input, 0).is_empty());
     }
 
     #[test]
+    fn table_columns_align_and_toc_prefix_is_shown_once() {
+        let input = format!("# Root\n{}## Child\nbody\n", "padding\n".repeat(100));
+        let result = outline(input.as_bytes(), 100);
+        let rows: Vec<_> = result
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect();
+        let header = result.lines().next().unwrap();
+        let heading_column = header.find("Heading").unwrap();
+        let toc_column = header.find("TOC").unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(row.find('#').unwrap(), heading_column, "{result}");
+            let range_end = row.find(']').unwrap() + 1;
+            let address_start =
+                range_end + row[range_end..].find(|c: char| !c.is_whitespace()).unwrap();
+            assert_eq!(address_start, toc_column, "{result}");
+        }
+        assert_eq!(result.matches("toc:").count(), 1, "{result}");
+        assert!(result.contains("--section toc:<TOC>"), "{result}");
+    }
+
+    #[test]
     fn basic_headings() {
         let input = b"# H1\nSome text\n## H2\nMore text\n";
         let result = outline(input, 100);
-        let lines: Vec<&str> = result.lines().collect();
+        let lines: Vec<&str> = result
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect();
 
         assert_eq!(lines.len(), 2);
         // H1 extends to end of file (line 4) since no other H1
-        assert_eq!(lines[0], "[1-4] toc:1 # H1");
+        assert_eq!(lines[0], "[1-4]  1    # H1");
         // H2 also extends to end of file (line 4)
-        assert_eq!(lines[1], "[3-4] toc:1.1   ## H2");
+        assert_eq!(lines[1], "[3-4]  1.1  ## H2");
     }
 
     #[test]
@@ -115,7 +175,7 @@ mod tests {
         let result = outline(input, 100);
 
         // Should only find the real heading, not any inside code block
-        assert!(result.starts_with("[1-5] toc:1 # Real Heading"));
+        assert!(result.contains("[1-5]  1    # Real Heading"));
         assert!(result.contains("(1 code blocks)"));
         assert!(!result.contains("Fake Heading"));
     }
@@ -132,17 +192,20 @@ mod tests {
     fn nested_heading_ranges() {
         let input = b"# A\ntext\n## B\ntext\n## C\ntext\n# D\ntext\n";
         let result = outline(input, 100);
-        let lines: Vec<&str> = result.lines().collect();
+        let lines: Vec<&str> = result
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect();
 
         assert_eq!(lines.len(), 4);
         // A extends until D (line 7), so ends at line 6
-        assert_eq!(lines[0], "[1-6] toc:1 # A");
+        assert_eq!(lines[0], "[1-6]  1    # A");
         // B extends until C (line 5), so ends at line 4
-        assert_eq!(lines[1], "[3-4] toc:1.1   ## B");
+        assert_eq!(lines[1], "[3-4]  1.1  ## B");
         // C extends until D (line 7), so ends at line 6
-        assert_eq!(lines[2], "[5-6] toc:1.2   ## C");
+        assert_eq!(lines[2], "[5-6]  1.2  ## C");
         // D extends to end of file (line 8)
-        assert_eq!(lines[3], "[7-8] toc:2 # D");
+        assert_eq!(lines[3], "[7-8]  2    # D");
     }
 
     #[test]
@@ -151,7 +214,7 @@ mod tests {
         let result = outline(input, 100);
 
         // Heading should extend to line 4 (total line count)
-        assert_eq!(result, "[1-4] toc:1 # Heading");
+        assert!(result.contains("[1-4]  1    # Heading"), "{result}");
     }
 
     #[test]
@@ -170,7 +233,10 @@ mod tests {
     fn hash_inside_fenced_code_does_not_become_heading() {
         let input = b"# Real\n\n```python\n# fake heading\nprint('x')\n```\n\n## Also Real\n";
         let result = outline(input, 100);
-        let lines: Vec<&str> = result.lines().collect();
+        let lines: Vec<&str> = result
+            .lines()
+            .filter(|line| line.starts_with('['))
+            .collect();
         let heading_lines: Vec<&&str> = lines.iter().filter(|l| l.starts_with('[')).collect();
         assert_eq!(heading_lines.len(), 2);
         assert!(heading_lines[0].contains("# Real"));

@@ -33,7 +33,14 @@ tilth docs/guide.md --section "Installation"
 tilth docs/guide.md --section "toc:1.2"
 ```
 
-Markdown outlines show copyable TOC addresses beside each line range, for example `[3-8] toc:1.2   ## Installation`. Use `--section toc:1.2` to read that section.
+Markdown outlines align line ranges, TOC addresses, and headings in columns:
+
+```text
+Lines  TOC  Heading
+[3-8]  1.2  ## Installation
+```
+
+The `TOC` column omits the repeated `toc:` prefix; use `--section toc:1.2` to read that section. The selector syntax is shown once below the table.
 
 Markdown titles match exactly with or without a `#` prefix; a prefix constrains the heading level. Ambiguous titles return parent paths, line ranges, and copyable `toc:` addresses. `toc:1.2` selects the second child of the first top-level ATX heading; indices start at 1 and skipped heading levels add no phantom entries. Addresses follow document order and may change when headings move. Line ranges such as `123-456` take precedence; use a `#` prefix for a title that looks like a line range or starts with `toc:`. Setext headings remain unsupported.
 

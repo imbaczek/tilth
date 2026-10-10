@@ -38,25 +38,33 @@ pub fn generate(
         FileType::Log => fallback::log_view(content),
         FileType::Other => fallback::head_tail(content),
     };
-    with_omission_note(outline, max_lines)
+    if matches!(file_type, FileType::Markdown) {
+        // Table headers and selector hints are not heading entries.
+        let entries = outline.lines().filter(|line| line.starts_with('[')).count();
+        with_omission_note_for_entries(outline, max_lines, entries)
+    } else {
+        with_omission_note(outline, max_lines)
+    }
 }
 
 /// Append a note when the outline likely hit `max_lines` and more symbols
 /// exist below. Without this note, agents read the outline as exhaustive
 /// and miss symbols below the cap.
 ///
-/// Note: `max_lines` is an entry cap inside `format_entries` (one
-/// `out.push(...)` per entry, joined with `\n`). For the code-outline path
-/// `outline.lines().count() == entry_count` exactly. For other backends
-/// (markdown, structured, tabular) the same identity holds because each
-/// pushes single-line entries. So the heuristic compares like-for-like.
-/// We avoid claiming a specific count in the user-facing message — we
-/// only state that more symbols exist, which is the actionable signal.
+/// Most backends emit one line per entry. Markdown tables include a header
+/// and selector hint, so `generate()` supplies their heading-row count directly.
+/// This remains a heuristic: reaching the cap can mean more entries exist;
+/// avoid claiming a specific omitted count.
 fn with_omission_note(outline: String, max_lines: usize) -> String {
+    let entries = outline.lines().count();
+    with_omission_note_for_entries(outline, max_lines, entries)
+}
+
+fn with_omission_note_for_entries(outline: String, max_lines: usize, entries: usize) -> String {
     if max_lines == usize::MAX {
         return outline;
     }
-    if outline.lines().count() < max_lines {
+    if entries < max_lines {
         return outline;
     }
     format!(
@@ -70,6 +78,32 @@ fn with_omission_note(outline: String, max_lines: usize) -> String {
 mod tests {
     use super::with_omission_note;
     use std::fmt::Write as _;
+
+    #[test]
+    fn markdown_table_header_and_hint_do_not_consume_heading_cap() {
+        for count in [98, 99, 100, 101] {
+            let content = (0..count).fold(String::new(), |mut text, i| {
+                let _ = writeln!(text, "# Heading {i}\nbody");
+                text
+            });
+            let result = super::generate(
+                std::path::Path::new("guide.md"),
+                crate::types::FileType::Markdown,
+                &content,
+                content.as_bytes(),
+                true,
+            );
+            assert_eq!(
+                result.lines().filter(|line| line.starts_with('[')).count(),
+                count.min(100)
+            );
+            assert_eq!(
+                result.contains("outline truncated"),
+                count >= 100,
+                "{count}: {result}"
+            );
+        }
+    }
 
     #[test]
     fn note_appended_when_at_cap() {

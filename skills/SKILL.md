@@ -23,7 +23,7 @@ tilth read <path> --section toc:1.2    # select an address from the outline or h
 tilth read <path> --full               # force full content (file paths)
 ```
 
-Code outline format: `[<start>-<end>]  <symbol>`. Markdown outlines include copyable addresses: `[<start>-<end>] toc:1.2   ## Foo`. Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
+Code outline format: `[<start>-<end>]  <symbol>`. Markdown outlines align `Lines`, `TOC`, and `Heading` columns: `[<start>-<end>]  1.2  ## Foo`. The TOC column omits the repeated `toc:` prefix; select its entry with `--section toc:1.2` (syntax shown once below the table). Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
 
 Markdown section titles match exactly, with an optional ATX level prefix (`#` through `######`). Ambiguous titles report parent paths, line ranges, and selectable `toc:` addresses; missing titles suggest nearby headings with addresses. `toc:1.2` selects the second child of the first root ATX section. Indices start at 1; skipped heading levels add no phantom entries, and container headings follow section containment. Addresses follow document order and may change when headings move. Valid line ranges such as `123-456` take precedence; use an ATX prefix to select a title that looks like a range or starts with `toc:`. Setext headings are unsupported.
 
