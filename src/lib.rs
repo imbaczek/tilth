@@ -411,7 +411,9 @@ fn run_inner_scopes(
     if listing_page.is_some() && !matches!(query_type, QueryType::FilePath(_)) {
         return Err(TilthError::InvalidQuery {
             query: query.to_string(),
-            reason: "offset and limit require --callers or a directory path".into(),
+            reason:
+                "offset and limit require --callers, a directory path, or a Markdown file outline"
+                    .into(),
         });
     }
     let use_expanded =
@@ -495,11 +497,32 @@ fn run_inner_scopes(
                                 })?;
                         read::list_directory(&path, page, false)
                     }
-                } else if listing_page.is_some() {
-                    Err(TilthError::InvalidQuery {
-                        query: query.to_string(),
-                        reason: "offset and limit require --callers or a directory path".into(),
-                    })
+                } else if let Some((offset, limit)) = listing_page {
+                    if multi_scope
+                        && !Path::new(query).is_absolute()
+                        && matches!(
+                            crate::lang::detect_file_type(&path),
+                            crate::types::FileType::Markdown
+                        )
+                    {
+                        Err(TilthError::InvalidQuery {
+                            query: query.to_string(),
+                            reason: "Markdown outline pagination requires a single scope".into(),
+                        })
+                    } else if section.is_some() || full {
+                        Err(TilthError::InvalidQuery {
+                            query: query.to_string(),
+                            reason: "Markdown outline pagination cannot be combined with section or full".into(),
+                        })
+                    } else {
+                        let page =
+                            listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT))
+                                .map_err(|reason| TilthError::InvalidQuery {
+                                    query: query.to_string(),
+                                    reason,
+                                })?;
+                        read::read_markdown_outline_page(&path, page, false)
+                    }
                 } else {
                     read_file_query(&path, scope, section, full, cache, budget_tokens)
                 };

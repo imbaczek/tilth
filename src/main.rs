@@ -91,12 +91,12 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Skip N sorted directory entries or ranked call sites per scope (0-based).
+    /// Skip N directory entries, Markdown headings, or ranked call sites per scope (0-based).
     #[arg(long)]
     offset: Option<usize>,
 
-    /// Entries per directory page (default 50), or call sites per scope (10/100).
-    /// Output remains subject to --budget. Requires a directory path or --callers.
+    /// Entries per directory/Markdown page (default 50), or call sites per scope (10/100).
+    /// Output remains subject to --budget. Requires a directory/Markdown path or --callers.
     #[arg(long)]
     limit: Option<std::num::NonZeroUsize>,
 
@@ -139,7 +139,7 @@ impl SearchOptions {
         } else if self.deps && (self.map || edit) {
             Some("--deps conflicts with --map and --edit")
         } else if (self.offset.is_some() || self.limit.is_some()) && (self.deps || self.map) {
-            Some("--offset and --limit require a directory path or --callers")
+            Some("--offset and --limit require a directory/Markdown path or --callers")
         } else if self.map && (self.expand.is_some() || self.section.is_some() || self.full) {
             Some("--map conflicts with --expand, --section, and --full")
         } else {
@@ -177,10 +177,10 @@ enum Command {
         /// Maximum output tokens; also accepted before read.
         #[arg(long)]
         budget: Option<u64>,
-        /// Skip N sorted directory entries (zero-based); directory paths only.
+        /// Skip N directory entries or Markdown headings (zero-based).
         #[arg(long)]
         offset: Option<usize>,
-        /// Directory entries per page (default 50); directory paths only.
+        /// Directory entries or Markdown headings per page (default 50).
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
         /// Emit hash anchors; also accepted before read.

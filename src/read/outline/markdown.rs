@@ -1,5 +1,7 @@
 /// Markdown outlines share section spans and TOC addresses with section
 /// selection, including headings nested inside blockquotes and lists.
+use std::fmt::Write as _;
+
 use crate::lang::outline::parse_markdown;
 use crate::read::heading_sections_from_tree;
 
@@ -12,6 +14,41 @@ pub fn outline(buf: &[u8], max_lines: usize) -> String {
     };
     let lines: Vec<&str> = content.lines().collect();
     let sections = heading_sections_from_tree(tree.root_node(), &lines, max_lines);
+    let mut output = render_sections(&sections);
+
+    // Preserve the capped outline's code-block summary: count only blocks
+    // visited before the final heading that exhausted the entry cap.
+    let until_line = if sections.len() >= max_lines {
+        sections.last().map_or(1, |section| section.start)
+    } else {
+        usize::MAX
+    };
+    let code_block_count = count_code_blocks(tree.root_node(), until_line);
+    if code_block_count > 0 {
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        let _ = write!(output, "({code_block_count} code blocks)");
+    }
+    output
+}
+
+/// TOC addresses retain their global indices across page boundaries.
+pub(crate) fn outline_page(buf: &[u8], page: crate::listing::Page) -> (String, usize) {
+    let Ok(content) = std::str::from_utf8(buf) else {
+        return (String::new(), 0);
+    };
+    let Some(tree) = parse_markdown(content) else {
+        return (String::new(), 0);
+    };
+    let lines: Vec<_> = content.lines().collect();
+    let sections = heading_sections_from_tree(tree.root_node(), &lines, usize::MAX);
+    let total = sections.len();
+    let (start, end) = page.bounds(total);
+    (render_sections(&sections[start..end]), total)
+}
+
+fn render_sections(sections: &[crate::read::HeadingSection]) -> String {
     let rows: Vec<_> = sections
         .iter()
         .map(|section| {
@@ -35,6 +72,7 @@ pub fn outline(buf: &[u8], max_lines: usize) -> String {
     let toc_width = rows.iter().map(|row| row.1.len()).max().unwrap_or(0).max(3);
     let mut entries = Vec::new();
     if !rows.is_empty() {
+        entries.push("Select with --section toc:<TOC>.\n".into());
         entries.push(format!(
             "{:line_width$}  {:toc_width$}  Heading",
             "Lines", "TOC"
@@ -44,20 +82,8 @@ pub fn outline(buf: &[u8], max_lines: usize) -> String {
                 "{range:line_width$}  {address:toc_width$}  {heading}"
             ));
         }
-        entries.push("\nSelect with --section toc:<TOC>.".into());
     }
 
-    // Preserve the capped outline's code-block summary: count only blocks
-    // visited before the final heading that exhausted the entry cap.
-    let until_line = if sections.len() >= max_lines {
-        sections.last().map_or(1, |section| section.start)
-    } else {
-        usize::MAX
-    };
-    let code_block_count = count_code_blocks(tree.root_node(), until_line);
-    if code_block_count > 0 {
-        entries.push(format!("\n({code_block_count} code blocks)"));
-    }
     entries.join("\n")
 }
 
@@ -138,7 +164,10 @@ mod tests {
             .lines()
             .filter(|line| line.starts_with('['))
             .collect();
-        let header = result.lines().next().unwrap();
+        let header = result
+            .lines()
+            .find(|line| line.starts_with("Lines"))
+            .unwrap();
         let heading_column = header.find("Heading").unwrap();
         let toc_column = header.find("TOC").unwrap();
         assert_eq!(rows.len(), 2);

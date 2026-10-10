@@ -156,8 +156,9 @@ pub(crate) fn read_file_with_budget(
         #[allow(clippy::cast_precision_loss)]
         let file_mb = byte_len as f64 / 1_000_000.0;
 
-        let outline = cache.get_or_compute_with_cap(path, mtime, true, || {
-            outline::generate(path, file_type, &content, buf, true)
+        let capped = budget.is_none();
+        let outline = cache.get_or_compute_with_cap(path, mtime, capped, || {
+            outline::generate(path, file_type, &content, buf, capped)
         });
 
         let header = format::file_header(path, byte_len, line_count, ViewMode::Outline);
@@ -190,7 +191,9 @@ pub(crate) fn read_file_with_budget(
     let file_type = detect_file_type(path);
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
-    let capped = byte_len > FILE_SIZE_CAP;
+    // An explicit token budget replaces the independent large-file entry cap.
+    // The caller applies that budget after formatting, keeping whole outline rows.
+    let capped = byte_len > FILE_SIZE_CAP && budget.is_none();
 
     let outline = cache.get_or_compute_with_cap(path, mtime, capped, || {
         outline::generate(path, file_type, &content, buf, capped)
@@ -210,6 +213,42 @@ pub(crate) fn read_file_with_budget(
     };
     let header = format::file_header(path, byte_len, line_count, mode);
     Ok(format!("{header}\n\n{outline}"))
+}
+
+/// Explicit Markdown pagination always returns a heading outline, even for
+/// small files. Addresses are computed globally before selecting the page.
+pub(crate) fn read_markdown_outline_page(
+    path: &Path,
+    page: crate::listing::Page,
+    mcp_navigation: bool,
+) -> Result<String, TilthError> {
+    if !matches!(detect_file_type(path), FileType::Markdown) {
+        return Err(TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: "offset and limit require a directory or a Markdown file outline".into(),
+        });
+    }
+    let buf = fs::read(path).map_err(|source| TilthError::IoError {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if crate::lang::detection::is_binary(&buf) {
+        return Err(TilthError::InvalidQuery {
+            query: path.display().to_string(),
+            reason: "binary files do not support outline pagination".into(),
+        });
+    }
+    let (outline, total) = outline::markdown::outline_page(&buf, page);
+    #[allow(clippy::cast_possible_truncation)]
+    let line_count = memchr::memchr_iter(b'\n', &buf).count() as u32 + 1;
+    let header = format::file_header(path, buf.len() as u64, line_count, ViewMode::Outline);
+    let mut out = format!(
+        "{header}\n\n{}\n\n{outline}",
+        page.summary(total, "headings")
+            .replacen("> Showing headings", "> Requested headings", 1)
+    );
+    page.append_navigation(&mut out, total, mcp_navigation);
+    Ok(out)
 }
 
 /// Would this file produce an outline (rather than full content) in default read mode?
@@ -728,6 +767,30 @@ pub(crate) fn mime_from_ext(path: &Path) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_budget_lifts_entry_cap_without_polluting_default_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guide.md");
+        let mut content = String::from("# Root\n");
+        for i in 0..240 {
+            writeln!(content, "## Heading {i}\n{}", "padding body\n".repeat(800)).unwrap();
+        }
+        assert!(content.len() as u64 > full_read_size_cap());
+        fs::write(&path, content).unwrap();
+        let cache = OutlineCache::new();
+        for full in [false, true] {
+            for (budget, expected) in [(None, 100), (Some(20_000), 241), (None, 100)] {
+                let output =
+                    read_file_with_budget(&path, None, full, &cache, false, budget).unwrap();
+                assert_eq!(
+                    output.lines().filter(|line| line.starts_with('[')).count(),
+                    expected
+                );
+                assert_eq!(output.contains("Heading 239"), budget.is_some());
+            }
+        }
+    }
 
     #[test]
     fn plain_titles_and_level_constraints() {

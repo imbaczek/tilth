@@ -57,7 +57,9 @@ pub(in crate::mcp) fn read_with_navigation(
     let paginated = args.get("offset").is_some() || args.get("limit").is_some();
     let page = crate::listing::Page::from_args(args)?;
     if paginated && args.get("paths").is_some() {
-        return Err("offset and limit require a single directory path, not paths".into());
+        return Err(
+            "offset and limit require a single directory or Markdown path, not paths".into(),
+        );
     }
 
     // Multi-file batch read (capped at 20 to bound I/O)
@@ -156,7 +158,21 @@ pub(in crate::mcp) fn read_with_navigation(
         return Ok(apply_budget(&output, budget));
     }
     if paginated {
-        return Err("offset and limit require a directory path".into());
+        if section.is_some()
+            || sections_arr.is_some()
+            || force_full
+            || force_signature
+            || force_stripped
+        {
+            return Err(
+                "Markdown outline pagination requires auto mode without full, section, or sections"
+                    .into(),
+            );
+        }
+        session.record_read(&path);
+        let output = crate::read::read_markdown_outline_page(&path, page, mcp_navigation)
+            .map_err(|e| e.to_string())?;
+        return Ok(apply_budget(&output, budget));
     }
 
     // Multi-section path: bypass smart view + related-file hints (those only
@@ -992,7 +1008,7 @@ mod outline_cache_regression_tests {
     fn capped_read_is_independent_of_prior_uncapped_search() {
         let dir = tempfile::tempdir().unwrap();
         let path = large_outline_fixture(dir.path());
-        let baseline = read(&path, &OutlineCache::new(), Some(100_000));
+        let baseline = read(&path, &OutlineCache::new(), None);
         assert!(baseline.contains("outline truncated"));
         assert!(!baseline.contains("sample_149"));
         let cache = OutlineCache::new();
@@ -1001,7 +1017,7 @@ mod outline_cache_regression_tests {
             overview.contains("sample_149"),
             "fixture must prime an uncapped outline"
         );
-        let after_search = read(&path, &cache, Some(100_000));
+        let after_search = read(&path, &cache, None);
         assert_eq!(
             after_search.lines().count(),
             baseline.lines().count(),
@@ -1017,7 +1033,7 @@ mod outline_cache_regression_tests {
         let baseline = file_overview(dir.path(), &OutlineCache::new());
         assert!(baseline.contains("sample_149"));
         let cache = OutlineCache::new();
-        let first_read = read(&path, &cache, Some(100_000));
+        let first_read = read(&path, &cache, None);
         assert!(first_read.contains("outline truncated"));
         let after_read = file_overview(dir.path(), &cache);
         assert!(
@@ -1025,6 +1041,19 @@ mod outline_cache_regression_tests {
             "prior read hid the final symbol"
         );
         assert_eq!(after_read, baseline);
+    }
+
+    #[test]
+    fn explicit_read_budget_reveals_entries_beyond_default_cached_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = large_outline_fixture(dir.path());
+        let cache = OutlineCache::new();
+        let default = read(&path, &cache, None);
+        assert!(!default.contains("sample_149"));
+        let expanded = read(&path, &cache, Some(100_000));
+        assert!(expanded.contains("sample_149"), "{expanded}");
+        assert!(!expanded.contains("outline truncated"), "{expanded}");
+        assert_eq!(read(&path, &cache, None), default);
     }
 }
 
@@ -1078,5 +1107,68 @@ mod elixir_signature_view_regression_tests {
             "{output}"
         );
         assert!(!output.contains("do: x"), "{output}");
+    }
+}
+
+#[cfg(test)]
+mod markdown_pagination_tests {
+    use super::*;
+
+    #[test]
+    fn markdown_pages_preserve_global_toc_and_mcp_navigation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("guide.md");
+        std::fs::write(&path, "# Root\n## Shared\na\n## Shared\nb\n## Last\nc\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let first = tool_read(
+            &serde_json::json!({"path":path,"offset":0,"limit":2}),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        let second = tool_read(
+            &serde_json::json!({"path":path,"offset":2,"limit":2}),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(first.contains("Requested headings 1-2 of 4"), "{first}");
+        assert!(first.contains(r#""offset":2"#), "{first}");
+        assert!(second.contains("1.2") && second.contains("1.3"), "{second}");
+        assert!(second.contains("End of listing."), "{second}");
+        let selected = tool_read(
+            &serde_json::json!({"path":path,"section":"toc:1.2"}),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(selected.contains("5  b"), "{selected}");
+        let beyond = tool_read(
+            &serde_json::json!({"path":path,"offset":usize::MAX,"limit":2}),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(beyond.contains("Requested headings 0 of 4"), "{beyond}");
+        assert!(!beyond.contains("Next page:"), "{beyond}");
+        for extra in [
+            serde_json::json!({"full":true}),
+            serde_json::json!({"mode":"full"}),
+            serde_json::json!({"mode":"signature"}),
+            serde_json::json!({"mode":"stripped"}),
+            serde_json::json!({"section":"Root"}),
+            serde_json::json!({"sections":["Root"]}),
+        ] {
+            let mut args = serde_json::json!({"path":path,"offset":0});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(tool_read(&args, &cache, &session, false).is_err(), "{args}");
+        }
     }
 }

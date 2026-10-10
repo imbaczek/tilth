@@ -40,11 +40,21 @@ Lines  TOC  Heading
 [3-8]  1.2  ## Installation
 ```
 
-The `TOC` column omits the repeated `toc:` prefix; use `--section toc:1.2` to read that section. The selector syntax is shown once below the table.
+The `TOC` column omits the repeated `toc:` prefix; use `--section toc:1.2` to read that section. The selector syntax is shown once above the table.
 
 Markdown titles match exactly with or without a `#` prefix; a prefix constrains the heading level. Ambiguous titles return parent paths, line ranges, and copyable `toc:` addresses. `toc:1.2` selects the second child of the first top-level ATX heading; indices start at 1 and skipped heading levels add no phantom entries. Addresses follow document order and may change when headings move. Line ranges such as `123-456` take precedence; use a `#` prefix for a title that looks like a line range or starts with `toc:`. Setext headings remain unsupported.
 
 The examples in this README are real output from the [FastAPI](https://github.com/fastapi/fastapi) and [Gin](https://github.com/gin-gonic/gin) repositories. Lines marked `...` are cut for length.
+
+For files over 500 KB, the default outline shows at most 100 entries. An explicit `--budget` replaces that fixed entry cap with a token limit, so increasing the budget can reveal more entries. Markdown outlines also support zero-based heading pagination (default page size 50):
+
+```bash
+tilth docs/experiment_log.md --budget 20000
+tilth docs/experiment_log.md --offset 100 --limit 100
+tilth read docs/experiment_log.md --offset 200 --limit 100
+```
+
+`--limit` controls heading rows; `--budget` controls the total response size. If the budget truncates a page, retry the same offset with a smaller limit before advancing. Keep the file unchanged between pages.
 
 ## Search finds definitions first
 
@@ -416,11 +426,11 @@ The output reports the range, total and next offset. `--full` still uses the
 50-entry directory default; set `--limit` explicitly for a larger page.
 `--budget` caps the output independently. If a page is truncated, retry the same
 offset with a smaller limit before advancing. Keep the directory unchanged
-between calls for stable pages. Pagination requires a single directory path
-for `tilth read`; file reads and batch reads reject explicit pagination.
+between calls for stable pages. Pagination requires a single directory or Markdown path
+for `tilth read`; other file types and batch reads reject explicit pagination. Markdown paging uses heading order and requires auto mode without `full`, `section`, or `sections`.
 
 MCP `tilth_read` accepts the same `offset` and `limit` for a single directory
-path. MCP `tilth_list` pages matching files sorted by scope-relative path, then
+or Markdown path. MCP `tilth_list` pages matching files sorted by scope-relative path, then
 renders that page as a tree. Directory nodes do not count against its limit,
 and tree counts and token rollups describe only the selected files. Keep
 patterns, depth and ignore settings unchanged between pages:

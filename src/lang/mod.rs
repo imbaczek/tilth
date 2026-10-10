@@ -82,7 +82,7 @@ pub fn detect_file_type(path: &Path) -> FileType {
             }
             // Non-code extensions stay enumerated here.
             match ext {
-                "md" | "mdx" | "rst" => FileType::Markdown,
+                "md" | "markdown" | "mdx" | "rst" => FileType::Markdown,
                 "json" | "yaml" | "yml" | "toml" | "xml" | "ini" => FileType::StructuredData,
                 "csv" | "tsv" => FileType::Tabular,
                 "log" => FileType::Log,

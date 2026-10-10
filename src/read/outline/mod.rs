@@ -69,8 +69,9 @@ fn with_omission_note_for_entries(outline: String, max_lines: usize, entries: us
     }
     format!(
         "{outline}\n\n> outline truncated — more symbols exist below the cap. \
-         Use section=\"<start>-<end>\" with the line numbers shown in [...] \
-         brackets above, or tilth_search \"<name>\" for a specific symbol."
+         Use --budget <tokens> (MCP: budget) to request a larger file outline. \
+         For Markdown, page with --offset {max_lines} --limit {max_lines} (MCP: offset/limit). \
+         Read a section using the line range shown above, or search for a specific symbol."
     )
 }
 

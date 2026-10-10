@@ -23,7 +23,7 @@ tilth read <path> --section toc:1.2    # select an address from the outline or h
 tilth read <path> --full               # force full content (file paths)
 ```
 
-Code outline format: `[<start>-<end>]  <symbol>`. Markdown outlines align `Lines`, `TOC`, and `Heading` columns: `[<start>-<end>]  1.2  ## Foo`. The TOC column omits the repeated `toc:` prefix; select its entry with `--section toc:1.2` (syntax shown once below the table). Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
+Code outline format: `[<start>-<end>]  <symbol>`. Markdown outlines align `Lines`, `TOC`, and `Heading` columns: `[<start>-<end>]  1.2  ## Foo`. The TOC column omits the repeated `toc:` prefix; select its entry with `--section toc:1.2` (syntax shown once above the table). Full/section format: `<line> │ <content>`. Binary files print `[skipped]`; lockfiles, minified bundles, generated code print `[generated]`.
 
 Markdown section titles match exactly, with an optional ATX level prefix (`#` through `######`). Ambiguous titles report parent paths, line ranges, and selectable `toc:` addresses; missing titles suggest nearby headings with addresses. `toc:1.2` selects the second child of the first root ATX section. Indices start at 1; skipped heading levels add no phantom entries, and container headings follow section containment. Addresses follow document order and may change when headings move. Valid line ranges such as `123-456` take precedence; use an ATX prefix to select a title that looks like a range or starts with `toc:`. Setext headings are unsupported.
 
@@ -105,8 +105,7 @@ tilth artifacts/ --limit 20
 tilth read artifacts/ --offset 20 --limit 20
 ```
 
-MCP `tilth_read` supports `offset`/`limit` only for a single directory `path`;
-files and batch `paths` reject explicit pagination. MCP `tilth_list` pages
+MCP `tilth_read` supports `offset`/`limit` for a single directory or Markdown `path`. Markdown paging requires auto mode without `full`, `section`, or `sections`; it forces an outline even for small files. Batch `paths` reject explicit pagination. MCP `tilth_list` pages
 matching files sorted by relative path; directory nodes do not count and tree
 rollups cover only the selected page. Keep path/scope, patterns, depth and ignore
 settings unchanged between pages. If `budget` truncates a page, retry the same
@@ -139,4 +138,13 @@ Function-level change detection — `[+]` added, `[-]` removed, `[~]` modified, 
 tilth <args> --budget 2000        # cap response at ~N tokens
 ```
 
-Use when an outline or search returns more than you need.
+Use when an outline or search returns more than you need. File outlines over 500 KB default to at most 100 entries; an explicit budget replaces that fixed entry cap with the requested token limit. Increase `--budget` (MCP: `budget`) to see more entries.
+
+Page Markdown headings in document order with stable TOC addresses:
+
+```bash
+tilth docs/experiment_log.md --offset 100 --limit 100
+tilth read docs/experiment_log.md --offset 200 --limit 100 --budget 4000
+```
+
+Offsets are zero-based; the default page size is 50. `limit` controls heading rows and `budget` controls output tokens. Keep the file unchanged between pages. If the budget truncates a page, retry the same offset with a smaller limit before advancing.

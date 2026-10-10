@@ -125,17 +125,17 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Skip N immediate directory children sorted by name (zero-based). Only supported for a single directory path; not files or batch paths. Keep path unchanged between pages."
+                        "description": "Skip N directory children sorted by name or Markdown headings in document order (zero-based). Single path only; Markdown paging requires auto mode without full/section/sections. TOC addresses stay stable across pages."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "default": 50,
-                        "description": "Directory entries per page (default 50, including with full:true). Only supported for a single directory path. If budget truncates, retry the same offset with a smaller limit before advancing."
+                        "description": "Directory entries or Markdown headings per page (default 50). Single path only. If budget truncates, retry the same offset with a smaller limit before advancing."
                     },
                     "budget": {
                         "type": "number",
-                        "description": "Max tokens in response."
+                        "description": "Max tokens in response. For file outlines, an explicit budget replaces the default 100-entry large-file cap. Increase it for more outline entries."
                     },
                     "root": {
                         "type": "string",
