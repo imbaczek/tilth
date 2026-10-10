@@ -218,99 +218,99 @@ pub fn would_outline(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| !m.is_dir() && estimate_tokens(m.len()) > TOKEN_THRESHOLD)
 }
 
-/// Resolve a heading address to a line range in a markdown file.
-/// Returns `(start_line, end_line)` as 1-indexed inclusive range.
-/// Returns `None` if heading not found.
-///
-/// Walks the `tree-sitter-md` `section` tree: each ATX heading owns a
-/// `section` node spanning from the heading line through the line before
-/// the next same-or-higher-level heading (sub-headings nest as child
-/// sections and don't terminate the parent). Headings inside fenced /
-/// indented code blocks aren't emitted as `atx_heading` nodes, so the
-/// fence-state tracking the previous hand-rolled scanner needed is now
-/// the parser's responsibility.
-fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
-    let heading_trimmed = heading.trim_end();
-    let query_level = heading_trimmed.chars().take_while(|&c| c == '#').count();
-    if query_level == 0 || query_level > 6 {
-        return None;
-    }
-    // Normalise the query the same way `heading_text` normalises an
-    // `atx_heading` node — strip leading `#`s, surrounding whitespace,
-    // and any ATX-close `#`s — so `## Foo`, `## Foo ##`, and `##  Foo`
-    // all match the same node.
-    let query_text = heading_trimmed[query_level..]
-        .trim()
-        .trim_end_matches('#')
-        .trim();
-    if query_text.is_empty() {
-        return None;
-    }
-
-    let content = std::str::from_utf8(buf).ok()?;
-    let tree = parse_markdown(content)?;
-    let lines: Vec<&str> = content.lines().collect();
-
-    #[allow(clippy::cast_possible_truncation)]
-    let level = query_level as u8;
-    find_section(tree.root_node(), &lines, level, query_text)
+/// An ATX heading and its complete section, with a copyable TOC address.
+struct HeadingSection {
+    level: u8,
+    title: String,
+    start: usize,
+    end: usize,
+    address: String,
+    ancestry: String,
 }
 
-/// Recursive section-tree walk for `resolve_heading`. Returns the first
-/// section whose `atx_heading` matches `(level, text)`.
-fn find_section(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    target_level: u8,
-    target_text: &str,
-) -> Option<(usize, usize)> {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "section" => {
-                if let Some(hit) = match_section(child, lines, target_level, target_text) {
-                    return Some(hit);
-                }
-                if let Some(hit) = find_section(child, lines, target_level, target_text) {
-                    return Some(hit);
-                }
-            }
-            // The parser owns these — no headings hide inside.
-            "fenced_code_block" | "indented_code_block" | "html_block" => {}
-            _ => {
-                if let Some(hit) = find_section(child, lines, target_level, target_text) {
-                    return Some(hit);
-                }
+impl HeadingSection {
+    fn describe(&self) -> String {
+        format!(
+            "{}  {} (lines {}-{})",
+            self.address, self.ancestry, self.start, self.end
+        )
+    }
+}
+
+/// Use the parser's section spans so nested headings belong to their parent,
+/// and headings inside code or HTML blocks never become selectable sections.
+/// Setext headings remain unsupported, as in the markdown outline.
+fn heading_sections(buf: &[u8]) -> Vec<HeadingSection> {
+    let Ok(content) = std::str::from_utf8(buf) else {
+        return Vec::new();
+    };
+    let Some(tree) = parse_markdown(content) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = content.lines().collect();
+    let mut sections = Vec::new();
+    collect_sections(tree.root_node(), &lines, &mut sections);
+
+    // Number actual siblings using section containment, independent of ATX
+    // level gaps. Container headings (quotes/lists) can have the same level
+    // as their enclosing heading, so levels alone cannot determine parents.
+    let mut stack: Vec<usize> = Vec::new();
+    let mut children = vec![0; sections.len()];
+    let mut roots = 0;
+    for i in 0..sections.len() {
+        while stack.last().is_some_and(|&j| {
+            sections[j].end < sections[i].start || sections[j].end < sections[i].end
+        }) {
+            stack.pop();
+        }
+        let (address, ancestry) = if let Some(&parent) = stack.last() {
+            children[parent] += 1;
+            (
+                format!("{}.{}", sections[parent].address, children[parent]),
+                format!("{} > {}", sections[parent].ancestry, sections[i].title),
+            )
+        } else {
+            roots += 1;
+            (format!("toc:{roots}"), sections[i].title.clone())
+        };
+        sections[i].address = address;
+        sections[i].ancestry = ancestry;
+        stack.push(i);
+    }
+    sections
+}
+
+fn collect_sections(node: tree_sitter::Node, lines: &[&str], out: &mut Vec<HeadingSection>) {
+    if node.kind() == "section" {
+        let mut cursor = node.walk();
+        let heading = node
+            .children(&mut cursor)
+            .find(|c| c.kind() == "atx_heading");
+        if let Some(heading) = heading {
+            if let Some(level) = heading_level(heading) {
+                out.push(HeadingSection {
+                    level,
+                    title: heading_text(heading, lines),
+                    start: heading.start_position().row + 1,
+                    end: section_end_line(node),
+                    address: String::new(),
+                    ancestry: String::new(),
+                });
             }
         }
     }
-    None
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if !matches!(
+            child.kind(),
+            "fenced_code_block" | "indented_code_block" | "html_block"
+        ) {
+            collect_sections(child, lines, out);
+        }
+    }
 }
 
-fn match_section(
-    section: tree_sitter::Node,
-    lines: &[&str],
-    target_level: u8,
-    target_text: &str,
-) -> Option<(usize, usize)> {
-    let mut cursor = section.walk();
-    let heading = section
-        .children(&mut cursor)
-        .find(|c| c.kind() == "atx_heading")?;
-    if heading_level(heading) != Some(target_level) {
-        return None;
-    }
-    if heading_text(heading, lines) != target_text {
-        return None;
-    }
-    let start_line = heading.start_position().row + 1;
-    let end_line = section_end_line(section);
-    Some((start_line, end_line))
-}
-
-/// 1-indexed inclusive last line of a tree-sitter `section` node.
-/// `end_position` is exclusive; col 0 means we landed on the next line's
-/// row, so the section's last line is `end.row` itself.
+/// 1-indexed inclusive last line of a tree-sitter section (end is exclusive).
 fn section_end_line(section: tree_sitter::Node) -> usize {
     let end = section.end_position();
     if end.column == 0 {
@@ -320,81 +320,100 @@ fn section_end_line(section: tree_sitter::Node) -> usize {
     }
 }
 
-/// Return up to `top_n` markdown headings ranked by edit distance to `query`.
-///
-/// Used when a heading lookup misses — agents typo'd anchors, or the heading
-/// renamed since they last read. Returning the closest matches lets them
-/// retry with the right anchor without re-reading the whole file.
-///
-/// Walks `atx_heading` nodes from `tree-sitter-md`, which by construction
-/// covers `CommonMark` §4.6 (1–6 `#`s followed by space/EOL) and excludes
-/// headings inside fenced or indented code blocks. `Setext` headings
-/// (`Title\n===`) are silently ignored — see `find_defs_markdown_buf` for
-/// the same trade-off; the block grammar puts them at document scope so
-/// span computation doesn't apply.
-///
-/// Caveat on ranking: Levenshtein favours candidates of similar length to
-/// the query, so very short queries against long headings can rank tighter
-/// matches first; this is acceptable for a hint and aligned with the rest
-/// of the project's `edit_distance` use.
+/// Plain titles match every level; an optional ATX prefix constrains the level.
+fn heading_query(query: &str) -> Option<(Option<u8>, &str)> {
+    let query = query.trim();
+    let level = query.bytes().take_while(|&c| c == b'#').count();
+    if level == 0 {
+        return (!query.is_empty()).then_some((None, query));
+    }
+    if level > 6 {
+        return None;
+    }
+    let title = query[level..].trim().trim_end_matches('#').trim();
+    #[allow(clippy::cast_possible_truncation)]
+    (!title.is_empty()).then_some((Some(level as u8), title))
+}
+
+/// Rank miss suggestions while retaining unique addresses and parent context.
+fn closest_headings(sections: &[HeadingSection], query: &str, top_n: usize) -> Vec<String> {
+    let Some((_, title)) = heading_query(query) else {
+        return Vec::new();
+    };
+    let q_lower = title.to_ascii_lowercase();
+    let mut scored: Vec<_> = sections
+        .iter()
+        .filter_map(|section| {
+            let clean = section
+                .title
+                .split('{')
+                .next()
+                .unwrap_or(&section.title)
+                .trim();
+            (!clean.is_empty()).then(|| {
+                (
+                    edit_distance(&q_lower, &clean.to_ascii_lowercase()),
+                    section,
+                )
+            })
+        })
+        .collect();
+    scored.sort_by_key(|(distance, _)| *distance);
+    scored
+        .into_iter()
+        .take(top_n)
+        .map(|(_, section)| section.describe())
+        .collect()
+}
+
+#[cfg(test)]
 fn suggest_headings(buf: &[u8], query: &str, top_n: usize) -> Vec<String> {
-    let q_text = query.trim_end().trim_start_matches('#').trim();
-    if q_text.is_empty() {
-        return Vec::new();
-    }
-    let q_lower = q_text.to_ascii_lowercase();
-
-    let Ok(content) = std::str::from_utf8(buf) else {
-        return Vec::new();
-    };
-    let Some(tree) = parse_markdown(content) else {
-        return Vec::new();
-    };
-    let lines: Vec<&str> = content.lines().collect();
-
-    let mut scored: Vec<(usize, String)> = Vec::new();
-    collect_atx_headings(tree.root_node(), &lines, &q_lower, &mut scored);
-    scored.sort_by_key(|(d, _)| *d);
-    scored.into_iter().take(top_n).map(|(_, h)| h).collect()
+    closest_headings(&heading_sections(buf), query, top_n)
 }
 
-/// Recursively collect `atx_heading` nodes scored by edit distance to
-/// `q_lower`. Code blocks are skipped — the grammar already guarantees
-/// no `atx_heading` nests inside them, but we elide the recursion to
-/// avoid walking large fenced bodies.
-fn collect_atx_headings(
-    node: tree_sitter::Node,
-    lines: &[&str],
-    q_lower: &str,
-    out: &mut Vec<(usize, String)>,
-) {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        match child.kind() {
-            "atx_heading" => {
-                let h_text = heading_text(child, lines);
-                // Strip kramdown attr blocks before scoring (e.g. `## Foo {#id}`).
-                let h_clean = h_text.split('{').next().unwrap_or(&h_text).trim();
-                if h_clean.is_empty() {
-                    continue;
-                }
-                let dist = edit_distance(q_lower, &h_clean.to_ascii_lowercase());
-                let row = child.start_position().row;
-                let line_text = lines.get(row).copied().unwrap_or("").trim_end().to_string();
-                out.push((dist, line_text));
-            }
-            "fenced_code_block" | "indented_code_block" | "html_block" => {}
-            _ => collect_atx_headings(child, lines, q_lower, out),
-        }
-    }
+#[cfg(test)]
+fn resolve_heading(buf: &[u8], heading: &str) -> Option<(usize, usize)> {
+    resolve_range(buf, heading).ok()
 }
 
-/// Resolve a single range string (line range like "45-89" or heading like
-/// "## Architecture") to a 1-indexed inclusive `(start, end)` pair.
+/// Line ranges take precedence; `toc:` reserves a separate numeric grammar.
+/// Every heading lookup must identify exactly one section.
 fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> {
-    if range.starts_with('#') {
-        resolve_heading(buf, range).ok_or_else(|| {
-            let suggestions = suggest_headings(buf, range, 5);
+    let invalid = |reason: String| TilthError::InvalidQuery {
+        query: range.to_string(),
+        reason,
+    };
+    let query = range.trim();
+    if let Some(lines) = parse_range(query) {
+        return Ok(lines);
+    }
+    let sections = heading_sections(buf);
+    if let Some(address) = query.strip_prefix("toc:") {
+        if address.split('.').any(|part| {
+            part.is_empty()
+                || !part.bytes().all(|b| b.is_ascii_digit())
+                || part.starts_with('0')
+                || part.parse::<usize>().is_err()
+        }) {
+            return Err(invalid("invalid TOC address: expected toc:1 or toc:1.2 (positive sibling indices, no leading zeros)".into()));
+        }
+        return sections
+            .iter()
+            .find(|s| s.address == query)
+            .map(|s| (s.start, s.end))
+            .ok_or_else(|| invalid("TOC address not found in file".into()));
+    }
+    let Some((level, title)) = heading_query(query) else {
+        return Err(invalid("expected a line range (45-89), heading title (Architecture or ## Architecture), or TOC address (toc:1.2)".into()));
+    };
+    let matches: Vec<_> = sections
+        .iter()
+        .filter(|s| level.is_none_or(|level| level == s.level) && s.title == title)
+        .collect();
+    match matches.as_slice() {
+        [section] => Ok((section.start, section.end)),
+        [] => {
+            let suggestions = closest_headings(&sections, query, 5);
             let reason = if suggestions.is_empty() {
                 "heading not found in file".to_string()
             } else {
@@ -403,16 +422,16 @@ fn resolve_range(buf: &[u8], range: &str) -> Result<(usize, usize), TilthError> 
                     suggestions.join("\n  ")
                 )
             };
-            TilthError::InvalidQuery {
-                query: range.to_string(),
-                reason,
-            }
-        })
-    } else {
-        parse_range(range).ok_or_else(|| TilthError::InvalidQuery {
-            query: range.to_string(),
-            reason: "expected format: \"start-end\" (e.g. \"45-89\") or heading (e.g. \"## Architecture\")".into(),
-        })
+            Err(invalid(reason))
+        }
+        _ => Err(invalid(format!(
+            "ambiguous heading; select a TOC address with --section (or section in MCP):\n  {}",
+            matches
+                .iter()
+                .map(|s| s.describe())
+                .collect::<Vec<_>>()
+                .join("\n  ")
+        ))),
     }
 }
 
@@ -424,8 +443,8 @@ struct Block {
 }
 
 /// Read one or more line ranges from a file. Each range is "start-end"
-/// (e.g. "45-89") or a heading anchor (e.g. "## Architecture") for
-/// markdown files. Mmaps the file once and emits a single `[section]`
+/// (e.g. "45-89"), a heading title (optional ATX level prefix), or a TOC
+/// address (e.g. "toc:1.2") for markdown files. Mmaps the file once and emits a single `[section]`
 /// header followed by the formatted blocks; when more than one range is
 /// requested, each block is preceded by a `─── lines X-Y ───` delimiter.
 ///
@@ -690,6 +709,98 @@ mod tests {
     use super::*;
 
     #[test]
+    fn plain_titles_and_level_constraints() {
+        let input = b"# Title\n## Shared\na\n### Shared\nb\n## Other ##\nc\n";
+        assert_eq!(resolve_range(input, "Title").unwrap(), (1, 7));
+        assert_eq!(resolve_range(input, "  Other  ").unwrap(), (6, 7));
+        assert_eq!(resolve_range(input, "## Shared").unwrap(), (2, 5));
+        assert_eq!(resolve_range(input, "### Shared").unwrap(), (4, 5));
+        assert!(resolve_range(input, "Shared")
+            .unwrap_err()
+            .to_string()
+            .contains("ambiguous heading"));
+    }
+
+    #[test]
+    fn ambiguous_titles_offer_parent_paths_and_round_trip_addresses() {
+        let input = b"# One\n### Shared\na\n### Shared\nb\n# Two\n## Shared\nc\n";
+        for query in ["Shared", "### Shared"] {
+            let err = resolve_range(input, query).unwrap_err().to_string();
+            assert!(err.contains("toc:1.1  One > Shared (lines 2-3)"), "{err}");
+            assert!(err.contains("toc:1.2  One > Shared (lines 4-5)"), "{err}");
+        }
+        let err = resolve_range(input, "Shared").unwrap_err().to_string();
+        assert!(err.contains("toc:2.1  Two > Shared (lines 7-8)"), "{err}");
+        assert_eq!(resolve_range(input, "toc:1.1").unwrap(), (2, 3));
+        assert_eq!(resolve_range(input, "toc:1.2").unwrap(), (4, 5));
+        assert_eq!(resolve_range(input, "toc:2.1").unwrap(), (7, 8));
+        assert_eq!(resolve_range(input, "toc:1").unwrap(), (1, 5));
+    }
+
+    #[test]
+    fn toc_addresses_skip_level_gaps_and_code_blocks() {
+        let input = b"## Root\n~~~md\n# Fake\n~~~\n###### Child\nx\n### Sibling\ny\n## Next\nz";
+        assert_eq!(resolve_range(input, "toc:1.1").unwrap(), (5, 6));
+        assert_eq!(resolve_range(input, "toc:1.2").unwrap(), (7, 8));
+        assert_eq!(resolve_range(input, "toc:2").unwrap(), (9, 10));
+        assert!(resolve_range(input, "Fake").is_err());
+    }
+
+    #[test]
+    fn toc_ancestry_respects_blockquote_and_list_section_boundaries() {
+        for container in [
+            "> # Nested\n> ## Shared\n> inside\n",
+            "- # Nested\n  ## Shared\n  inside\n",
+        ] {
+            let input = format!("# Outer\n\n{container}\n## Shared\noutside\n");
+            let sections = heading_sections(input.as_bytes());
+            let shared: Vec<_> = sections.iter().filter(|s| s.title == "Shared").collect();
+            assert_eq!(shared.len(), 2, "{input}");
+            assert_eq!(shared[0].address, "toc:1.1.1", "{input}");
+            assert_eq!(shared[0].ancestry, "Outer > Nested > Shared", "{input}");
+            assert_eq!(shared[1].address, "toc:1.2", "{input}");
+            assert_eq!(shared[1].ancestry, "Outer > Shared", "{input}");
+            assert_eq!(resolve_range(input.as_bytes(), "toc:1.2").unwrap(), (7, 8));
+            let err = resolve_range(input.as_bytes(), "Shared")
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("toc:1.2  Outer > Shared (lines 7-8)"), "{err}");
+        }
+    }
+
+    #[test]
+    fn toc_grammar_does_not_conflict_with_lines_or_numeric_titles() {
+        let input = b"# 1.2\n## 1-2\n## toc:1\nbody\n";
+        assert_eq!(resolve_range(input, "1.2").unwrap(), (1, 4));
+        assert_eq!(resolve_range(input, "1-2").unwrap(), (1, 2));
+        assert_eq!(resolve_range(input, "## 1-2").unwrap(), (2, 2));
+        assert_eq!(resolve_range(input, "## toc:1").unwrap(), (3, 4));
+        for query in [
+            "toc:",
+            "toc:0",
+            "toc:1.0",
+            "toc:01",
+            "toc:1.",
+            "toc:1..2",
+            "toc:1-2",
+            "toc:1.foo",
+            "toc:999999999999999999999999999999",
+        ] {
+            assert!(
+                resolve_range(input, query)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid TOC address"),
+                "{query}"
+            );
+        }
+        assert!(resolve_range(input, "toc:2")
+            .unwrap_err()
+            .to_string()
+            .contains("not found"));
+    }
+
+    #[test]
     fn heading_found() {
         let input = b"# Title\nSome content\n## Section\nSection content\n";
         let result = resolve_heading(input, "## Section");
@@ -719,8 +830,8 @@ mod tests {
         let input = b"## First\ntext\n## First\ntext\n";
         let result = resolve_heading(input, "## First");
 
-        // Should return the first occurrence
-        assert_eq!(result, Some((1, 2)));
+        // Duplicate headings require an explicit TOC address.
+        assert_eq!(result, None);
     }
 
     #[test]

@@ -103,12 +103,12 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "section": {
                         "type": "string",
-                        "description": "Line range e.g. '45-89', or heading e.g. '## Architecture'. Bypasses smart view. Use `sections` for multiple ranges."
+                        "description": "Line range '45-89', heading title 'Architecture' (optional '##' level prefix), or TOC address 'toc:1.2'. Ambiguous titles return parent paths and copyable TOC addresses. Bypasses smart view. Use `sections` for multiple ranges."
                     },
                     "sections": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range or heading. Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
+                        "description": "Multiple ranges from the same file in one call. Each entry is a line range, heading title (optional # prefix), or TOC address (toc:1.2). Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",

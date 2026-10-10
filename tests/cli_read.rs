@@ -137,3 +137,50 @@ fn section_before_read_is_applied_and_combines_with_repeated_sections() {
     assert!(!run(&["notes.md"]).status.success());
     assert!(!run(&["--mode", "signature"]).status.success());
 }
+
+#[test]
+fn markdown_section_titles_report_ambiguity_and_accept_toc_addresses() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("guide.md"),
+        "# First\n## Shared\nalpha\n# Second\n## Shared\nbeta\n## Unique\ngamma\n",
+    )
+    .unwrap();
+    let plain = text(&read(root.path(), &["guide.md", "--section", "Unique"]));
+    assert!(
+        plain.contains("gamma") && !plain.contains("beta"),
+        "{plain}"
+    );
+    // Cover the original implicit file-read CLI as well as explicit read.
+    let ambiguous = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .current_dir(root.path())
+        .args(["guide.md", "--section", "Shared"])
+        .output()
+        .unwrap();
+    assert_eq!(ambiguous.status.code(), Some(3));
+    let error = String::from_utf8(ambiguous.stderr).unwrap();
+    assert!(error.contains("toc:1.1  First > Shared"), "{error}");
+    assert!(error.contains("toc:2.1  Second > Shared"), "{error}");
+    let selected = text(&read(root.path(), &["guide.md", "--section", "toc:2.1"]));
+    assert!(
+        selected.contains("beta") && !selected.contains("alpha"),
+        "{selected}"
+    );
+    let mixed = text(&read(
+        root.path(),
+        &[
+            "guide.md",
+            "--section",
+            "1-1",
+            "--section",
+            "Unique",
+            "--section",
+            "toc:2.1",
+        ],
+    ));
+    assert!(mixed.contains("─── lines 1-1 ───"), "{mixed}");
+    assert!(
+        mixed.find("gamma").unwrap() < mixed.find("beta").unwrap(),
+        "{mixed}"
+    );
+}

@@ -52,7 +52,7 @@ struct SearchOptions {
     #[arg(long, conflicts_with = "respect_gitignore")]
     no_respect_gitignore: bool,
 
-    /// Line range or markdown heading (e.g. "45-89" or "## Architecture"). Bypasses smart view.
+    /// Line range (45-89), heading title (Architecture or ## Architecture), or TOC address (toc:1.2). Bypasses smart view.
     #[arg(long)]
     section: Option<String>,
 
@@ -171,7 +171,7 @@ enum Command {
         /// Force full content; signature and stripped modes take precedence.
         #[arg(long)]
         full: bool,
-        /// Line range or heading; repeat for disjoint slices of one file.
+        /// Line range, heading title (optional # prefix), or TOC address (toc:1.2); repeat for disjoint slices.
         #[arg(long)]
         section: Vec<String>,
         /// Maximum output tokens; also accepted before read.

@@ -29,8 +29,11 @@ Small files come back whole. Large files come back as an outline with line range
 
 ```bash
 tilth fastapi/dependencies/utils.py --section 218-232
-tilth docs/guide.md --section "## Installation"
+tilth docs/guide.md --section "Installation"
+tilth docs/guide.md --section "toc:1.2"
 ```
+
+Markdown titles match exactly with or without a `#` prefix; a prefix constrains the heading level. Ambiguous titles return parent paths, line ranges, and copyable `toc:` addresses. `toc:1.2` selects the second child of the first top-level ATX heading; indices start at 1 and skipped heading levels add no phantom entries. Addresses follow document order and may change when headings move. Line ranges such as `123-456` take precedence; use a `#` prefix for a title that looks like a line range or starts with `toc:`. Setext headings remain unsupported.
 
 The examples in this README are real output from the [FastAPI](https://github.com/fastapi/fastapi) and [Gin](https://github.com/gin-gonic/gin) repositories. Lines marked `...` are cut for length.
 
@@ -351,7 +354,8 @@ Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-pro
 ```bash
 tilth read <path>                 # read file (outline if large)
 tilth read <path> --section 45-89      # exact line range
-tilth read <path> --section "## Foo"   # markdown heading
+tilth read <path> --section "Foo"      # markdown heading (optional ## prefix)
+tilth read <path> --section toc:1.2    # TOC address from ambiguity hints
 tilth read <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages
 tilth <symbol> --expand=5         # inline source for top 5 matches
