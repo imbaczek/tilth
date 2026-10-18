@@ -1604,7 +1604,7 @@ mod tests {
         let all = walk_paths(&scope, None);
         let exts = extensions(&all);
         assert!(exts.contains("rs"), "expected .rs files, got {exts:?}");
-        assert!(!all.is_empty());
+        assert_ne!(all.len(), 0, "no files walked under {}", scope.display());
     }
 
     #[test]
