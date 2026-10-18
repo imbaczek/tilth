@@ -233,11 +233,13 @@ pub(crate) fn definition_weight(kind: &str) -> u16 {
         | "enum_declaration"
         | "type_item"
         | "type_declaration"
+        | "type_spec"
+        | "type_alias"
         | "decorated_definition" => 100,
         "impl_item" | "object_declaration" => 90,
-        "const_item" | "const_declaration" | "static_item" => 80,
+        "const_item" | "const_declaration" | "const_spec" | "static_item" => 80,
         "mod_item" | "namespace_definition" | "property_declaration" => 70,
-        "lexical_declaration" | "variable_declaration" => 40,
+        "lexical_declaration" | "variable_declaration" | "var_spec" => 40,
         "variable_assignment" => 60,
         "export_statement" => 30,
         _ => 50,
@@ -327,6 +329,11 @@ mod tests {
         assert_eq!(definition_weight("interface_declaration"), 100);
         assert_eq!(definition_weight("enum_item"), 100);
         assert_eq!(definition_weight("decorated_definition"), 100);
+        // Go specs rank with their counterparts: types, constants, variables.
+        assert_eq!(definition_weight("type_spec"), 100);
+        assert_eq!(definition_weight("type_alias"), 100);
+        assert_eq!(definition_weight("const_spec"), 80);
+        assert_eq!(definition_weight("var_spec"), 40);
         // 90 — impls / object-like declarations (Rust impl_item, Kotlin object_declaration).
         assert_eq!(definition_weight("impl_item"), 90);
         assert_eq!(definition_weight("object_declaration"), 90);
