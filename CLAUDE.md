@@ -13,7 +13,7 @@ src/
     write.rs           tilth_write overwrite/append primitives — create-only guard, O_NOFOLLOW symlink refusal, atomic parent-dir creation.
     tools/
       mod.rs           Tool dispatch hub — path/scope resolution under the absolute-path discipline (anchor_path, resolve_scope), budget application.
-      definitions.rs   JSON schema definitions for every MCP tool (tilth_search/read/files/deps/grok/diff/write).
+      definitions.rs   JSON schema definitions for every MCP tool (tilth_search/read/list/deps/grok/diff/write).
       search.rs        tool_search — symbol/content/regex/callers dispatch, multi-symbol support, scope-warning integration.
       read.rs          tool_read — smart file reads, batch/section/sections slicing.
       write.rs         tool_write — batch writes in hash/overwrite/append modes; hash mode delegates to edit::apply_batch.
