@@ -1,6 +1,6 @@
 [package]
 name = "tilth"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2021"
 description = "Smart code reading for AI agents. Definitions, callers, deps and function-level diffs from tree-sitter."
 license = "MIT"
