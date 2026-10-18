@@ -261,15 +261,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        serde_json::json!({
-            "name": "tilth_savings",
-            "annotations": { "readOnlyHint": true },
-            "description": "Report tokens tilth saved this session vs naive grep/cat (conservative lower bound). Call ONLY when the user explicitly asks how much tilth saved — never proactively.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {}
-            }
-        }),
     ];
 
     if edit_mode {
@@ -428,6 +419,23 @@ mod tests {
             assert!(
                 names.contains(&"tilth_list"),
                 "tilth_list must remain advertised"
+            );
+        }
+    }
+
+    /// tilth publishes no token-saving figures, so the tool that reported them
+    /// stays out of the tool list in both modes.
+    #[test]
+    fn tilth_savings_is_not_advertised() {
+        for edit_mode in [false, true] {
+            let defs = tool_definitions(edit_mode);
+            let names: Vec<&str> = defs
+                .iter()
+                .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+                .collect();
+            assert!(
+                !names.contains(&"tilth_savings"),
+                "tilth_savings must not be advertised (edit_mode={edit_mode})"
             );
         }
     }
