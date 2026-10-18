@@ -164,7 +164,7 @@ fn format_entry(entry: &OutlineEntry, indent: usize, lang: Lang) -> String {
         OutlineKind::Constant => "const",
         OutlineKind::ImmutableVariable => "val",
         OutlineKind::Variable => {
-            if lang == Lang::Scala {
+            if lang == Lang::Scala || lang == Lang::Go {
                 "var"
             } else {
                 "let"

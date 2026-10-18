@@ -1,8 +1,9 @@
-//! Go language spec. Diverges on: stdlib rule and method-receiver extraction.
+//! Go language spec. Diverges on: stdlib rule, method-receiver extraction and
+//! definition kinds.
 
 use streaming_iterator::StreamingIterator;
 
-use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
+use crate::lang::spec::{LangSpec, StdlibRule, StripFamily, DEFAULT_DEFS};
 
 const CALLEE_QUERY: &str = concat!(
     "(call_expression function: (identifier) @callee)\n",
@@ -65,6 +66,21 @@ const GO_STDLIB_ROOTS: &[&str] = &[
     "iter",
     "unique",
 ];
+
+/// Go definition node kinds. A `type`, `const` or `var` declaration has no
+/// name of its own: each name sits on a spec inside it, and a grouped block
+/// (`const ( ... )`) holds one spec per member. The specs are therefore the
+/// definitions. Function-local declarations sit deeper than the definition
+/// walker descends, so only package-level ones count.
+const GO_DEFINITION_KINDS: &[&str] = &[
+    "function_declaration",
+    "method_declaration",
+    "type_spec",
+    "type_alias",
+    "const_spec",
+    "var_spec",
+];
+
 pub(crate) const SPEC: LangSpec = LangSpec {
     display: "Go",
     extensions: &["go"],
@@ -74,7 +90,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
     sibling_query: Some(SIBLING_QUERY),
     stdlib: StdlibRule::GoRoots(GO_STDLIB_ROOTS),
     manifests: &["go.mod"],
-    definition_kinds: DEFAULT_DEF_KINDS,
+    definition_kinds: GO_DEFINITION_KINDS,
     has_lifetimes: false,
     strip_family: Some(StripFamily::Go),
     extract_receiver: Some(extract_go_receiver_name),
@@ -116,3 +132,20 @@ pub(crate) fn extract_go_receiver_name(
     })
     .flatten()
 }
+
+/// Package-level Go declarations of every kind the outline, symbol search and
+/// grok must see: a grouped `const` block, a single `const`, a `var`, a struct
+/// `type` and a function. Shared by the Go tests in `lang::outline`,
+/// `search::symbol` and `search::grok` so they pin one source.
+#[cfg(test)]
+pub(crate) const GO_DECLARATIONS_FIXTURE: &str = "package main
+
+const (
+    StatusActive   = \"active\"
+    StatusInactive = \"inactive\"
+)
+const Version = \"1.0.0\"
+var GlobalCounter int
+type Server struct{ Addr string }
+func NewServer(addr string) *Server { return &Server{Addr: addr} }
+";

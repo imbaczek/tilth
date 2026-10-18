@@ -2273,4 +2273,39 @@ impl OutlineCache {
             );
         }
     }
+
+    /// Go package-level `type` and grouped `const` declarations resolve by
+    /// name, each to its own spec's line, kind and siblings.
+    #[test]
+    fn grok_resolves_go_type_and_grouped_const() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "main.go",
+            crate::lang::go::GO_DECLARATIONS_FIXTURE,
+        );
+
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        for (name, kind, line) in [
+            ("Server", OutlineKind::Struct, 9),
+            ("StatusActive", OutlineKind::Constant, 4),
+        ] {
+            let result = grok(name, tmp.path(), &bloom, &session, GrokCaps::default())
+                .unwrap_or_else(|e| panic!("grok {name} failed: {e}"));
+            assert_eq!(result.target.name, name);
+            assert_eq!(result.target.kind, kind, "{name} kind");
+            assert_eq!(
+                (result.target.start_line, result.target.end_line),
+                (line, line),
+                "{name} range"
+            );
+            let sibling_names: Vec<&str> =
+                result.siblings.iter().map(|s| s.name.as_str()).collect();
+            assert!(
+                sibling_names.contains(&"NewServer"),
+                "{name}: expected NewServer among siblings, got {sibling_names:?}"
+            );
+        }
+    }
 }

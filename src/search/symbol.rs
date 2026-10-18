@@ -9,6 +9,7 @@ use crate::lang::elixir::is_elixir_definition;
 use crate::lang::spec::{spec, DefinitionOps, DEFAULT_DEFS, DEFAULT_DEF_KINDS};
 use crate::lang::treesitter::{
     extract_definition_name, extract_impl_trait, extract_impl_type, extract_implemented_interfaces,
+    node_text_simple, NodeTextMode,
 };
 
 use crate::error::TilthError;
@@ -340,8 +341,9 @@ fn walk_for_definitions(
 
     // Definition kinds and name/weight ops come from the per-language spec. For
     // a known language these are `spec(lang).definition_kinds` / `.definitions`
-    // (the shared defaults for every language except Elixir, which carries its
-    // own); when `lang` is unknown we fall back to the shared defaults.
+    // (the shared defaults, except where a language such as Elixir or Go
+    // carries its own); when `lang` is unknown we fall back to the shared
+    // defaults.
     let (def_kinds, def_ops): (&[&str], &DefinitionOps) = match lang {
         Some(l) => {
             let s = spec(l);
@@ -352,30 +354,28 @@ fn walk_for_definitions(
 
     if def_kinds.contains(&kind) {
         // Check if this node defines the queried symbol
-        if let Some(name) = (def_ops.extract_name)(node, lines) {
-            if name == query {
-                let line_num = node.start_position().row as u32 + 1;
-                let line_text = lines
-                    .get(node.start_position().row)
-                    .unwrap_or(&"")
-                    .trim_end();
-                defs.push(Match {
-                    path: path.to_path_buf(),
-                    line: line_num,
-                    text: line_text.to_string(),
-                    is_definition: true,
-                    exact: true,
-                    file_lines,
-                    mtime,
-                    def_range: Some((
-                        node.start_position().row as u32 + 1,
-                        node.end_position().row as u32 + 1,
-                    )),
-                    def_name: Some(query.to_string()),
-                    def_weight: (def_ops.weight)(node, lines),
-                    impl_target: None,
-                });
-            }
+        if defines_name(node, lines, query, def_ops) {
+            let line_num = node.start_position().row as u32 + 1;
+            let line_text = lines
+                .get(node.start_position().row)
+                .unwrap_or(&"")
+                .trim_end();
+            defs.push(Match {
+                path: path.to_path_buf(),
+                line: line_num,
+                text: line_text.to_string(),
+                is_definition: true,
+                exact: true,
+                file_lines,
+                mtime,
+                def_range: Some((
+                    node.start_position().row as u32 + 1,
+                    node.end_position().row as u32 + 1,
+                )),
+                def_name: Some(query.to_string()),
+                def_weight: (def_ops.weight)(node, lines),
+                impl_target: None,
+            });
         }
 
         // Impl/interface detection: surface `impl Trait for Type` and
@@ -481,6 +481,21 @@ fn walk_for_definitions(
             depth + 1,
         );
     }
+}
+
+/// Whether definition `node` binds the name `query`. Most definitions bind
+/// one name, which `extract_name` returns. A Go `const` or `var` spec can bind
+/// several (`var a, b int`), each a named child under the `name` field, so
+/// the later names are checked too.
+fn defines_name(node: tree_sitter::Node, lines: &[&str], query: &str, ops: &DefinitionOps) -> bool {
+    if (ops.extract_name)(node, lines).is_some_and(|name| name == query) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    let found = node
+        .children_by_field_name("name", &mut cursor)
+        .any(|n| n.is_named() && node_text_simple(n, lines, NodeTextMode::Full) == query);
+    found
 }
 
 /// Keyword heuristic fallback for files without tree-sitter grammars.
@@ -1361,5 +1376,135 @@ Body to end.
             result_default.total_found, result_full.total_found,
             "total_found must be the same regardless of full flag"
         );
+    }
+
+    /// Search the Go declarations fixture end to end and return every match
+    /// on `line`.
+    fn go_fixture_matches_on_line(query: &str, line: u32) -> Vec<Match> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("main.go"),
+            crate::lang::go::GO_DECLARATIONS_FIXTURE,
+        )
+        .expect("write fixture");
+        let result = search(query, dir.path(), None, None, false).expect("search");
+        result
+            .matches
+            .into_iter()
+            .filter(|m| m.line == line)
+            .collect()
+    }
+
+    #[test]
+    fn go_type_and_grouped_const_are_definitions() {
+        // `type Server struct` (line 9) and `StatusActive` inside the grouped
+        // `const ( ... )` block (line 4) are definitions, each ranged to its
+        // own spec, with no leftover usage match on the same line.
+        for (query, line) in [("Server", 9), ("StatusActive", 4)] {
+            let on_line = go_fixture_matches_on_line(query, line);
+            assert_eq!(
+                on_line.len(),
+                1,
+                "{query}: expected one match on line {line}, got {on_line:?}"
+            );
+            let m = &on_line[0];
+            assert!(
+                m.is_definition,
+                "{query} on line {line} must be a definition"
+            );
+            assert_eq!(m.def_range, Some((line, line)), "{query} def_range");
+        }
+    }
+
+    /// Find Go definitions of `name` in `code` with the tree-sitter walker.
+    fn go_find(code: &str, name: &str) -> Vec<Match> {
+        let ts_lang = crate::lang::outline::outline_language(crate::types::Lang::Go).unwrap();
+        find_defs_treesitter(
+            std::path::Path::new("main.go"),
+            name,
+            &ts_lang,
+            Some(crate::types::Lang::Go),
+            code,
+            code.lines().count() as u32,
+            SystemTime::now(),
+        )
+    }
+
+    #[test]
+    fn go_package_level_declarations_detected() {
+        let code = crate::lang::go::GO_DECLARATIONS_FIXTURE;
+        for (name, line) in [
+            ("StatusInactive", 5),
+            ("Version", 7),
+            ("GlobalCounter", 8),
+            ("NewServer", 10),
+        ] {
+            let defs = go_find(code, name);
+            assert_eq!(
+                defs.len(),
+                1,
+                "{name}: expected one definition, got {defs:?}"
+            );
+            assert_eq!(defs[0].line, line, "{name} definition line");
+        }
+    }
+
+    #[test]
+    fn go_multi_name_specs_define_every_name() {
+        // `var y, z = 1, 2` and `const A, B = 1, 2` bind each name, and a
+        // `type ( ... )` group defines each of its types.
+        let code = "package p
+
+const A, B = 1, 2
+
+var (
+\tx int
+\ty, z = 1, 2
+)
+
+type (
+\tID int
+\tAlias = string
+)
+";
+        for (name, line) in [
+            ("A", 3),
+            ("B", 3),
+            ("x", 6),
+            ("y", 7),
+            ("z", 7),
+            ("ID", 11),
+            ("Alias", 12),
+        ] {
+            let defs = go_find(code, name);
+            assert_eq!(
+                defs.len(),
+                1,
+                "{name}: expected one definition, got {defs:?}"
+            );
+            assert_eq!(defs[0].line, line, "{name} definition line");
+        }
+    }
+
+    #[test]
+    fn go_function_local_declarations_are_not_definitions() {
+        // Only package-level declarations are definitions. A `var`, `const` or
+        // `type` inside a function body is local to that function.
+        let code = "package p
+
+func run() {
+\tvar local = 1
+\tconst limit = 2
+\ttype pair struct{}
+\t_ = local
+}
+";
+        for name in ["local", "limit", "pair"] {
+            assert!(
+                go_find(code, name).is_empty(),
+                "{name} is function-local and must not be a definition"
+            );
+        }
+        assert_eq!(go_find(code, "run").len(), 1, "run is a definition");
     }
 }

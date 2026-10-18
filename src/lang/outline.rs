@@ -84,6 +84,12 @@ pub(crate) fn walk_top_level(
     let mut cursor = root.walk();
 
     for child in root.children(&mut cursor) {
+        if lang == Lang::Go {
+            if let Some(specs) = go_declaration_entries(child, lines) {
+                entries.extend(specs);
+                continue;
+            }
+        }
         if let Some(entry) = node_to_entry(child, lines, lang, 0) {
             entries.push(entry);
         }
@@ -459,6 +465,93 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
         } else {
             Some(trimmed.to_string())
         }
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Go-specific outline helpers
+// ---------------------------------------------------------------------------
+
+/// Split a Go `type`, `const` or `var` declaration into one entry per spec.
+///
+/// The declaration carries no name of its own: each name sits on a spec
+/// inside it. A grouped block (`const ( ... )`) holds one spec per member, so
+/// every spec becomes its own entry with its own line range. `type` and
+/// `const` groups hold their specs directly; `var` groups wrap them in a
+/// `var_spec_list`. Returns `None` for any other node.
+fn go_declaration_entries(node: tree_sitter::Node, lines: &[&str]) -> Option<Vec<OutlineEntry>> {
+    let container = match node.kind() {
+        "type_declaration" | "const_declaration" => node,
+        "var_declaration" => {
+            let mut cursor = node.walk();
+            let list = node
+                .named_children(&mut cursor)
+                .find(|c| c.kind() == "var_spec_list");
+            list.unwrap_or(node)
+        }
+        _ => return None,
+    };
+
+    let mut cursor = container.walk();
+    let grouped = container.children(&mut cursor).any(|c| c.kind() == "(");
+
+    let mut entries = Vec::new();
+    let mut cursor = container.walk();
+    for spec in container.named_children(&mut cursor) {
+        let kind = match spec.kind() {
+            "const_spec" => OutlineKind::Constant,
+            "var_spec" => OutlineKind::Variable,
+            "type_alias" => OutlineKind::TypeAlias,
+            "type_spec" => match spec.child_by_field_name("type").map(|t| t.kind()) {
+                Some("struct_type") => OutlineKind::Struct,
+                Some("interface_type") => OutlineKind::Interface,
+                _ => OutlineKind::TypeAlias,
+            },
+            _ => continue,
+        };
+
+        // A spec may bind several names (`var a, b int`). The blank `_`
+        // binds nothing, so a spec of only blanks is no definition.
+        let mut name_cursor = spec.walk();
+        let names: Vec<String> = spec
+            .children_by_field_name("name", &mut name_cursor)
+            .filter(tree_sitter::Node::is_named)
+            .map(|n| node_text(n, lines))
+            .filter(|n| n != "_")
+            .collect();
+        if names.is_empty() {
+            continue;
+        }
+
+        // In a group, a member's comment sits directly above the member. A
+        // single declaration's comment sits above its keyword.
+        let doc = go_doc(if grouped { spec } else { node }, lines);
+
+        entries.push(OutlineEntry {
+            kind,
+            name: names.join(", "),
+            start_line: spec.start_position().row as u32 + 1,
+            end_line: spec.end_position().row as u32 + 1,
+            signature: None,
+            children: Vec::new(),
+            doc,
+        });
+    }
+
+    Some(entries)
+}
+
+/// The doc comment directly above a Go spec or declaration. A comment that
+/// trails code on its own line documents that code, so it is no doc for the
+/// next member (`A = 1 // note` above `B = 2`).
+fn go_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
+    let prev = node.prev_sibling()?;
+    let start = prev.start_position();
+    let before = lines.get(start.row)?.get(..start.column)?;
+    if before.trim().is_empty() {
+        extract_doc(node, lines)
     } else {
         None
     }
@@ -1144,5 +1237,108 @@ main() {
         // `source\t./lib.sh` (tab separator) must be parsed correctly.
         let result = extract_import_source("source\t./lib/utils.sh", Some(Lang::Bash));
         assert_eq!(result, "./lib/utils.sh");
+    }
+}
+
+#[cfg(test)]
+mod go_outline_tests {
+    use super::get_outline_entries;
+    use crate::lang::go::GO_DECLARATIONS_FIXTURE;
+    use crate::types::{Lang, OutlineKind};
+
+    /// `(name, kind, start_line, end_line)` for each top-level entry.
+    fn summary(src: &str) -> Vec<(String, OutlineKind, u32, u32)> {
+        get_outline_entries(src, Lang::Go)
+            .into_iter()
+            .map(|e| (e.name, e.kind, e.start_line, e.end_line))
+            .collect()
+    }
+
+    #[test]
+    fn go_outline_lists_type_const_and_var_declarations() {
+        // Each member of the grouped `const ( ... )` block is its own entry on
+        // its own line (4 and 5), not one entry for the block on line 3.
+        let expected = vec![
+            ("StatusActive".to_string(), OutlineKind::Constant, 4, 4),
+            ("StatusInactive".to_string(), OutlineKind::Constant, 5, 5),
+            ("Version".to_string(), OutlineKind::Constant, 7, 7),
+            ("GlobalCounter".to_string(), OutlineKind::Variable, 8, 8),
+            ("Server".to_string(), OutlineKind::Struct, 9, 9),
+            ("NewServer".to_string(), OutlineKind::Function, 10, 10),
+        ];
+        assert_eq!(summary(GO_DECLARATIONS_FIXTURE), expected);
+    }
+
+    #[test]
+    fn go_outline_splits_grouped_type_and_var_blocks() {
+        // A `type ( ... )` group holds its specs directly; a `var ( ... )`
+        // group wraps them in a spec list. Both yield one entry per spec. A
+        // spec that binds several names lists them all; a blank `_` binds
+        // nothing, so it is left out. Methods keep working.
+        let src = "package p
+
+type (
+\tID int
+\tAlias = string
+\tHandler interface {
+\t\tServe()
+\t}
+)
+
+var (
+\tx int
+\ty, z = 1, 2
+\t_ = x
+)
+
+func (s *Server) Run() {}
+";
+        let expected = vec![
+            ("ID".to_string(), OutlineKind::TypeAlias, 4, 4),
+            ("Alias".to_string(), OutlineKind::TypeAlias, 5, 5),
+            ("Handler".to_string(), OutlineKind::Interface, 6, 8),
+            ("x".to_string(), OutlineKind::Variable, 12, 12),
+            ("y, z".to_string(), OutlineKind::Variable, 13, 13),
+            ("Run".to_string(), OutlineKind::Function, 17, 17),
+        ];
+        assert_eq!(summary(src), expected);
+    }
+
+    #[test]
+    fn go_outline_attaches_doc_comments_to_specs() {
+        // A grouped spec carries the comment directly above it. A single
+        // declaration carries the comment above its keyword. A comment that
+        // trails a member's line belongs to that member, not the next one.
+        let src = "package p
+
+// Version is the release.
+const Version = \"1\"
+
+const (
+\t// First is documented.
+\tFirst = 1 // trails First
+\tSecond = 2
+)
+";
+        let entries = get_outline_entries(src, Lang::Go);
+        let doc = |name: &str| {
+            entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from outline"))
+                .doc
+                .clone()
+        };
+        assert!(
+            doc("Version").is_some_and(|d| d.contains("Version is the release.")),
+            "Version doc: {:?}",
+            doc("Version")
+        );
+        assert!(
+            doc("First").is_some_and(|d| d.contains("First is documented.")),
+            "First doc: {:?}",
+            doc("First")
+        );
+        assert_eq!(doc("Second"), None, "Second has no comment of its own");
     }
 }
