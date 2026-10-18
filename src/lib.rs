@@ -67,6 +67,48 @@ use classify::classify;
 use error::TilthError;
 use types::QueryType;
 
+/// What a caller that refuses a file-valued scope can offer instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileScopeHint {
+    /// The caller takes a `glob` filter, so it can still reach one file.
+    Glob,
+    /// The caller has no per-file filter; only the directory can be offered.
+    Directory,
+}
+
+/// Refuse a `scope` that names a file. One rule for the MCP tools and the CLI.
+///
+/// Scope only ever narrows a search. A file there used to widen it instead:
+/// the MCP tools fell back to the whole root with a warning, and agents treat
+/// a successful response as authoritative. `raw` is the scope as the caller
+/// wrote it, so the suggested directory stays in the caller's frame (a
+/// relative scope keeps resolving under the same `root`). `resolved` is the
+/// path to inspect. A path that does not exist passes: callers decide how to
+/// treat a missing directory.
+pub fn refuse_file_scope(raw: &Path, resolved: &Path, hint: FileScopeHint) -> Result<(), String> {
+    if !resolved.exists() || resolved.is_dir() {
+        return Ok(());
+    }
+    let dir = match raw.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.display().to_string(),
+        _ => ".".to_string(),
+    };
+    let name = raw.file_name().map_or_else(
+        || raw.display().to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let fix = match hint {
+        FileScopeHint::Glob => format!(
+            "To search within one file, set scope to its directory (\"{dir}\") and glob to its name (\"{name}\")."
+        ),
+        FileScopeHint::Directory => format!("Set scope to its directory (\"{dir}\") instead."),
+    };
+    Err(format!(
+        "scope \"{}\" is a file, and scope must be an existing directory. {fix}",
+        raw.display()
+    ))
+}
+
 /// Holds expanded search dependencies, allocated once.
 /// Avoids scattered `Option<T>` + `unwrap()` throughout dispatch.
 struct ExpandedCtx {
@@ -520,6 +562,27 @@ fn multi_word_concept_search(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Directories and missing paths pass; only an existing file is refused.
+    /// A bare file name suggests "." so the hint never names an empty scope.
+    #[test]
+    fn refuse_file_scope_only_refuses_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("x.py");
+        std::fs::write(&file, "").unwrap();
+        let missing = dir.path().join("nope");
+
+        assert!(refuse_file_scope(dir.path(), dir.path(), FileScopeHint::Glob).is_ok());
+        assert!(refuse_file_scope(&missing, &missing, FileScopeHint::Glob).is_ok());
+
+        let err = refuse_file_scope(Path::new("x.py"), &file, FileScopeHint::Directory)
+            .expect_err("an existing file must be refused");
+        assert_eq!(
+            err,
+            "scope \"x.py\" is a file, and scope must be an existing directory. \
+             Set scope to its directory (\".\") instead."
+        );
+    }
 
     /// 15 files, each carrying one instance of every query shape that reaches
     /// `run_inner` with `expand == 0`, so one fixture covers them all.

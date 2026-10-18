@@ -32,7 +32,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Only use scope to search a specific subdirectory. DO NOT USE scope if you want to search the current working directory (initial search)."
+                        "description": "Existing directory only, never a file. Omit for the whole project. To search one file, set scope to its directory and glob to its name."
                     },
                     "kind": {
                         "type": "string",
@@ -137,7 +137,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory to root the tree at. DO NOT USE scope if you want to list the current working directory."
+                        "description": "Existing directory to root the tree at, never a file. Omit for the whole project."
                     },
                     "budget": {
                         "type": "number",
@@ -164,7 +164,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory to search for dependents. Default: project root."
+                        "description": "Existing directory to search for dependents, never a file. Omit for the whole project."
                     },
                     "budget": {
                         "type": "number",
@@ -191,7 +191,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Subdirectory to narrow the search. Default: project root."
+                        "description": "Existing directory to narrow the search, never a file. Omit for the whole project."
                     },
                     "full": {
                         "type": "boolean",
@@ -421,6 +421,36 @@ mod tests {
                 "tilth_list must remain advertised"
             );
         }
+    }
+
+    /// #195: tools that refuse a file scope say so in the schema; `tilth_diff`
+    /// accepts either and says that instead.
+    #[test]
+    fn scope_descriptions_state_what_scope_accepts() {
+        let defs = tool_definitions(true);
+        let scope_desc = |name: &str| -> String {
+            defs.iter()
+                .find(|t| t.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|t| t.pointer("/inputSchema/properties/scope/description"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("{name} must advertise scope"))
+                .to_string()
+        };
+        for name in ["tilth_search", "tilth_list", "tilth_deps", "tilth_grok"] {
+            let desc = scope_desc(name);
+            assert!(
+                desc.contains("directory") && desc.contains("never a file"),
+                "{name} scope must be directory-only: {desc}"
+            );
+        }
+        assert!(
+            scope_desc("tilth_search").contains("glob"),
+            "tilth_search must point at glob for one file"
+        );
+        assert!(
+            scope_desc("tilth_diff").contains("file or directory"),
+            "tilth_diff scope accepts a file or a directory"
+        );
     }
 
     /// tilth publishes no token-saving figures, so the tool that reported them

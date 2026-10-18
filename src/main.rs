@@ -4,6 +4,7 @@ use std::process;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
+use tilth::FileScopeHint;
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
@@ -197,7 +198,8 @@ fn main() {
                 scope,
                 full,
             } => {
-                let scope = scope.canonicalize().unwrap_or(scope);
+                let scope =
+                    cli_scope(scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
                 match tilth::run_grok(&target, &scope, full) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {
@@ -282,7 +284,8 @@ fn main() {
     // Map mode
     if cli.map {
         let cache = tilth::cache::OutlineCache::new();
-        let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
+        let scope =
+            cli_scope(cli.scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
         let output = tilth::map::generate(&scope, 3, cli.budget, &cache);
         emit_output(&output, is_tty);
         return;
@@ -297,7 +300,13 @@ fn main() {
     };
 
     let cache = tilth::cache::OutlineCache::new();
-    let scope = cli.scope.canonicalize().unwrap_or(cli.scope);
+    // --deps takes no --glob, so only the search modes can offer one.
+    let hint = if cli.deps {
+        FileScopeHint::Directory
+    } else {
+        FileScopeHint::Glob
+    };
+    let scope = cli_scope(cli.scope, hint).unwrap_or_else(|e| usage_exit(&e));
 
     // When piped (not a TTY), force full output — scripts expect raw content.
     // This promotion exists for FilePath queries (return full file instead of
@@ -390,6 +399,20 @@ fn main() {
     };
 
     emit_result(result, &query, cli.json, is_tty);
+}
+
+/// Canonicalize `--scope`, refusing a file the same way the MCP tools do.
+/// A path that does not exist passes through unchanged, as before.
+fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
+    let scope = raw.canonicalize().unwrap_or_else(|_| raw.clone());
+    tilth::refuse_file_scope(&raw, &scope, hint)?;
+    Ok(scope)
+}
+
+/// Report a usage error and exit with the invalid-input code.
+fn usage_exit(msg: &str) -> ! {
+    eprintln!("{msg}");
+    process::exit(3);
 }
 
 fn emit_result(
@@ -555,5 +578,21 @@ mod tests {
         // handling, but cli.full stays false. compute_expand must return 0.
         let cli_full = false; // user did NOT pass --full
         assert_eq!(compute_expand(None, cli_full), 0);
+    }
+
+    /// #195: `--scope <file>` gets the same refusal as the MCP tools. It used
+    /// to walk the lone file and print match headers with no file name.
+    #[test]
+    fn cli_scope_refuses_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.py");
+        std::fs::write(&file, "").unwrap();
+        let err = cli_scope(file, FileScopeHint::Glob).unwrap_err();
+        assert!(
+            err.contains("is a file") && err.contains("glob to its name (\"x.py\")"),
+            "unexpected refusal: {err}"
+        );
+        let ok = cli_scope(dir.path().to_path_buf(), FileScopeHint::Glob).unwrap();
+        assert_eq!(ok, dir.path().canonicalize().unwrap());
     }
 }

@@ -20,7 +20,7 @@ pub(in crate::mcp) fn tool_deps(
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
     let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let (scope, scope_warning) = resolve_scope(args, root, crate::FileScopeHint::Directory)?;
     let budget = args
         .get("budget")
         .and_then(serde_json::Value::as_u64)
@@ -95,6 +95,31 @@ mod tests {
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
+        );
+    }
+
+    /// #195: a file passed as `scope` used to fall back to the whole root.
+    #[test]
+    fn file_scope_with_root_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        let abs = tmp.path().join("src/foo.rs");
+        std::fs::write(&abs, "pub fn foo() {}\n").unwrap();
+        let args = serde_json::json!({
+            "path": abs.to_str().unwrap(),
+            "scope": "src/foo.rs",
+            "root": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_deps(&args, &bloom())
+            .expect_err("a file scope must be refused, not widened to root");
+        assert!(
+            err.contains("scope \"src/foo.rs\" is a file")
+                && err.contains("scope to its directory (\"src\")"),
+            "refusal must name the file and its directory: {err}"
+        );
+        assert!(
+            !err.contains("glob"),
+            "tilth_deps has no glob parameter to suggest: {err}"
         );
     }
 }

@@ -23,7 +23,7 @@ pub(in crate::mcp) fn tool_search(
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let (scope, scope_warning) = resolve_scope(args, root, crate::FileScopeHint::Glob)?;
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -436,6 +436,107 @@ mod tests {
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
+        );
+    }
+
+    /// A checkout with the same symbol in two sibling files, so a search that
+    /// widens past the file an agent named is visible in the output.
+    fn two_file_checkout() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/x.py"), "def needle():\n    pass\n").unwrap();
+        std::fs::write(tmp.path().join("src/y.py"), "def needle():\n    pass\n").unwrap();
+        tmp
+    }
+
+    /// #195: a file passed as `scope` together with an absolute `root` used
+    /// to succeed with a warning and search the whole root. Agents treat a
+    /// successful response as authoritative, so a narrowing argument must
+    /// never widen. The refusal names the file and the call that does work.
+    #[test]
+    fn file_scope_with_root_is_refused_with_glob_hint() {
+        let tmp = two_file_checkout();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "needle",
+            "scope": "src/x.py",
+            "root": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_search(&args, &cache, &session, &bloom)
+            .expect_err("a file scope must be refused, not widened to root");
+        assert!(
+            err.contains("scope \"src/x.py\" is a file"),
+            "refusal must name the file: {err}"
+        );
+        assert!(
+            err.contains("scope to its directory (\"src\")")
+                && err.contains("glob to its name (\"x.py\")"),
+            "refusal must name the working call: {err}"
+        );
+    }
+
+    /// The absolute-file case without `root` already refused, but its message
+    /// blamed the missing root. It must name the real problem and the fix.
+    #[test]
+    fn absolute_file_scope_without_root_names_the_fix() {
+        let tmp = two_file_checkout();
+        let file = tmp.path().join("src/x.py");
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({ "query": "needle", "scope": file.to_str().unwrap() });
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+        let dir = tmp.path().join("src");
+        assert!(
+            err.contains("is a file")
+                && err.contains(&format!("(\"{}\")", dir.display()))
+                && err.contains("glob to its name (\"x.py\")"),
+            "refusal must name the directory and glob fix: {err}"
+        );
+    }
+
+    /// The refusal's advice must actually work: scope at the directory plus
+    /// glob at the name searches that one file and not its sibling.
+    #[test]
+    fn file_scope_hint_narrows_to_the_one_file() {
+        let tmp = two_file_checkout();
+        let out = run_search(&serde_json::json!({
+            "query": "needle",
+            "scope": "src",
+            "glob": "x.py",
+            "root": tmp.path().to_str().unwrap(),
+        }));
+        assert!(
+            out.contains("x.py"),
+            "the named file must be searched: {out}"
+        );
+        assert!(
+            !out.contains("y.py"),
+            "the sibling must stay out of a one-file search: {out}"
+        );
+    }
+
+    /// A scope that does not exist at all (usually a typo) keeps the soft
+    /// fallback: search root and say so. This is deliberate, so it is pinned.
+    #[test]
+    fn missing_dir_scope_with_root_still_falls_back_with_warning() {
+        let tmp = two_file_checkout();
+        let out = run_search(&serde_json::json!({
+            "query": "needle",
+            "scope": "no/such/dir",
+            "root": tmp.path().to_str().unwrap(),
+        }));
+        assert!(
+            out.starts_with(
+                "scope \"no/such/dir\" is not a valid directory, searching the root/checkout directory instead."
+            ),
+            "a missing directory must warn and fall back to root: {out}"
+        );
+        assert!(
+            out.contains("x.py") && out.contains("y.py"),
+            "the fallback must search the whole root: {out}"
         );
     }
 
