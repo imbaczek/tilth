@@ -13,16 +13,15 @@ src/
     write.rs           tilth_write overwrite/append primitives — create-only guard, O_NOFOLLOW symlink refusal, atomic parent-dir creation.
     tools/
       mod.rs           Tool dispatch hub — path/scope resolution under the absolute-path discipline (anchor_path, resolve_scope), budget application.
-      definitions.rs   JSON schema definitions for every MCP tool (tilth_search/read/files/deps/grok/diff/savings/write).
+      definitions.rs   JSON schema definitions for every MCP tool (tilth_search/read/files/deps/grok/diff/write).
       search.rs        tool_search — symbol/content/regex/callers dispatch, multi-symbol support, scope-warning integration.
-      read.rs          tool_read — smart file reads, batch/section/sections slicing, savings tracking.
+      read.rs          tool_read — smart file reads, batch/section/sections slicing.
       write.rs         tool_write — batch writes in hash/overwrite/append modes; hash mode delegates to edit::apply_batch.
       deps.rs          tool_deps — file-level dependency analysis (imports + dependents), bloom-filtered.
       diff.rs          tool_diff — structural diff dispatch (uncommitted/staged/ref/file-pair/patch/log).
       list.rs          tool_list — glob file listing as a directory tree, pattern/patterns batch, scope resolution.
       grok.rs          tool_grok — one-call symbol bundle, default vs full caps.
-      savings.rs       tool_savings — session token-savings summary vs a naive-read baseline.
-      session.rs       tool_session — summary/reset actions for grok dedup + savings state.
+      session.rs       tool_session — summary/reset actions for grok dedup state.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
     mod.rs             Shared language infrastructure: detect_file_type(), package_root().
