@@ -50,9 +50,9 @@ Output per match:
 ## <path>:<start>-<end> [definition|usage|impl]
 <outline context>
 <expanded source block>
-── calls ──
+-- calls --
   <callee>  <path>:<start>-<end>  <signature>
-── siblings ──
+-- siblings --
   <related>  <path>:<start>-<end>  <signature>
 ```
 

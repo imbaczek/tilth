@@ -64,8 +64,10 @@ fn anchor_path(
 /// relative `scope` without an absolute `root` — that is a deliberate but
 /// unresolvable request, since the server cannot see the caller's shell cwd.
 ///
-/// When `scope` is **absent entirely**, this falls back to today's default
-/// behavior (server launch cwd, exactly as on `main`): no refusal, no `root`
+/// When `scope` is **absent entirely** and an absolute `root` is given, the
+/// scope is `root`: it is the caller's checkout, and searching the server's
+/// own cwd instead answered from the wrong tree in worktree setups. Without a
+/// usable `root` the scope is the server launch cwd: no refusal, no `root`
 /// requirement. A bare repo-wide search (no `scope`, no `root`) must keep
 /// working — that is the default flow of every session.
 ///
@@ -113,6 +115,9 @@ fn resolve_scope_at(
     // The default scope IS the server cwd, so it needs no resolution — only
     // an unreadable cwd leaves nothing valid to search.
     if scope_arg.is_none() {
+        if let Some(r) = root.filter(|r| r.is_absolute()) {
+            return Ok((r.to_path_buf(), None));
+        }
         return Ok(match cwd {
             Some(_) => (".".into(), None),
             None => (
@@ -231,13 +236,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_scope_no_arg_ignores_root() {
-        // An omitted scope must default to cwd even when `root` IS supplied —
-        // `root` only matters when the caller explicitly passes something
-        // relative to anchor.
+    fn resolve_scope_no_arg_defaults_to_root_when_given() {
+        // `root` is the caller's checkout. With scope omitted, searching the
+        // server's cwd instead answered from the wrong tree in worktree setups
+        // (0 matches, header "in ."), so an omitted scope means "all of root".
         let args = serde_json::json!({});
         let tmp = tempfile::tempdir().unwrap();
         let (scope, warning) = resolve_scope(&args, Some(tmp.path()), Glob).unwrap();
+        assert_eq!(scope, tmp.path());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_no_arg_relative_root_keeps_cwd() {
+        // A relative root cannot anchor anything (the server cannot see the
+        // caller's cwd), so an omitted scope keeps the default flow.
+        let args = serde_json::json!({});
+        let (scope, warning) =
+            resolve_scope(&args, Some(std::path::Path::new("rel")), Glob).unwrap();
         assert_eq!(scope, PathBuf::from("."));
         assert!(warning.is_none());
     }
