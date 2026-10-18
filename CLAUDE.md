@@ -19,7 +19,7 @@ src/
       write.rs         tool_write — batch writes in hash/overwrite/append modes; hash mode delegates to edit::apply_batch.
       deps.rs          tool_deps — file-level dependency analysis (imports + dependents), bloom-filtered.
       diff.rs          tool_diff — structural diff dispatch (uncommitted/staged/ref/file-pair/patch/log).
-      files.rs         tool_files — glob file listing, pattern/patterns batch, scope resolution.
+      list.rs          tool_list — glob file listing as a directory tree, pattern/patterns batch, scope resolution.
       grok.rs          tool_grok — one-call symbol bundle, default vs full caps.
       savings.rs       tool_savings — session token-savings summary vs a naive-read baseline.
       session.rs       tool_session — summary/reset actions for grok dedup + savings state.
@@ -71,7 +71,7 @@ src/
   session.rs           MCP session state — tracks previously expanded definitions for dedup.
   edit.rs              Hash-anchored editing (tilth_write hash mode). Hashline verification + atomic apply.
   edit_parse_check.rs  Post-edit tree-sitter parse check — diffs pre/post ERROR/MISSING nodes so tilth_write reports only errors the edit introduced.
-  install.rs           `tilth install <host>` — writes MCP config for 22 hosts.
+  install.rs           `tilth install <host>` — writes MCP config for 23 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
   map.rs               Codebase map generation (CLI only, disabled as MCP tool).

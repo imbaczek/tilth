@@ -93,7 +93,7 @@ struct Cli {
 #[derive(clap::Subcommand)]
 enum Command {
     /// Install tilth into an MCP host's config.
-    /// Supported hosts: claude-code, cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex, amp, droid, antigravity, zed, copilot-cli, augment, kiro, kilo-code, cline, roo-code, trae, qwen-code, crush, pi
+    /// Supported hosts: claude-code, cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex, amp, droid, antigravity, antigravity-cli, zed, copilot-cli, augment, kiro, kilo-code, cline, roo-code, trae, qwen-code, crush, pi
     Install {
         /// MCP host to configure.
         host: String,
