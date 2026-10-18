@@ -5,14 +5,31 @@ use crate::types::QueryType;
 /// Classify a query string into a `QueryType` by byte-pattern matching.
 /// No regex engine — `matches!` compiles to a jump table.
 pub fn classify(query: &str, scope: &Path) -> QueryType {
-    // 0. Slash-wrapped regex — /pattern/ → regex content search.
+    // 0. Slash-wrapped regex — /pattern/ or /pattern/flags → regex content search.
     //    Must come before glob check: regex metacharacters ([, {, *) overlap with glob syntax.
-    //    Only if the inner pattern contains regex metacharacters — otherwise /src/ would be
-    //    misclassified as regex instead of a path.
-    if query.len() >= 3 && query.starts_with('/') && query.ends_with('/') {
-        let pattern = &query[1..query.len() - 1];
-        if !pattern.is_empty() && has_regex_metachar(pattern) {
-            return QueryType::Regex(pattern.into());
+    //    Bare /pattern/ counts only if the pattern contains regex metacharacters — otherwise
+    //    /src/ would be misclassified as regex instead of a path. Trailing flags (`/week/i`)
+    //    are a regex by intent, so they need no metacharacter; the flags become an inline
+    //    `(?flags)` group. An existing path whose last component happens to spell flags
+    //    (`/tmp/s`) stays a path.
+    if query.len() >= 3 && query.starts_with('/') {
+        if let Some(cut) = query[1..].rfind('/') {
+            let cut = cut + 1;
+            let pattern = &query[1..cut];
+            let flags = &query[cut + 1..];
+            if !pattern.is_empty() {
+                if flags.is_empty() {
+                    if has_regex_metachar(pattern) {
+                        return QueryType::Regex(pattern.into());
+                    }
+                } else if flags
+                    .bytes()
+                    .all(|b| matches!(b, b'i' | b'm' | b's' | b'x' | b'U'))
+                    && !scope.join(query).try_exists().unwrap_or(false)
+                {
+                    return QueryType::Regex(format!("(?{flags}){pattern}"));
+                }
+            }
         }
     }
 
@@ -242,6 +259,32 @@ mod tests {
             QueryType::Regex(_)
         ));
         assert!(!matches!(classify("/src/", &scope), QueryType::Regex(_)));
+    }
+
+    /// `/pattern/flags` is a regex with inline flags. `/week/i` used to fall
+    /// through to a path lookup and dead-end as "not found".
+    #[test]
+    fn regex_with_trailing_flags() {
+        let scope = PathBuf::from(".");
+        assert!(matches!(
+            classify("/week/i", &scope),
+            QueryType::Regex(p) if p == "(?i)week"
+        ));
+        assert!(matches!(
+            classify("/a.b/im", &scope),
+            QueryType::Regex(p) if p == "(?im)a.b"
+        ));
+        // Letters that are not regex flags are not flags.
+        assert!(!matches!(classify("/week/z", &scope), QueryType::Regex(_)));
+        assert!(!matches!(classify("/usr/bin", &scope), QueryType::Regex(_)));
+        // An existing path whose last component looks like a flag stays a path.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("i")).unwrap();
+        let existing = format!("{}/i", tmp.path().display());
+        assert!(
+            matches!(classify(&existing, &scope), QueryType::FilePath(_)),
+            "an existing path must not become a regex"
+        );
     }
 
     #[test]

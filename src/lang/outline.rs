@@ -453,21 +453,66 @@ fn extract_doc(node: tree_sitter::Node, lines: &[&str]) -> Option<String> {
     let prev = node.prev_sibling()?;
     let kind = prev.kind();
     if kind.contains("comment") || kind.contains("doc") {
-        let text = node_text(prev, lines);
-        let trimmed = text
-            .trim_start_matches("///")
-            .trim_start_matches("//!")
-            .trim_start_matches("/**")
-            .trim_start_matches('#')
-            .trim();
-        if trimmed.is_empty() {
+        let cleaned = clean_comment_text(&node_rows_text(prev, lines));
+        if cleaned.is_empty() {
             None
         } else {
-            Some(trimmed.to_string())
+            Some(cleaned)
         }
     } else {
         None
     }
+}
+
+/// Every line a node spans, joined with newlines. `node_text_simple` returns
+/// only a node's first line, which is right for signatures and wrong for a
+/// block comment that spans several.
+fn node_rows_text(node: tree_sitter::Node, lines: &[&str]) -> String {
+    let (start, end) = (node.start_position(), node.end_position());
+    let last = end.row.min(lines.len().saturating_sub(1));
+    let mut out = String::new();
+    for (row, line) in lines.iter().enumerate().take(last + 1).skip(start.row) {
+        let from = if row == start.row {
+            start.column.min(line.len())
+        } else {
+            0
+        };
+        let to = if row == end.row {
+            end.column.min(line.len())
+        } else {
+            line.len()
+        };
+        if row > start.row {
+            out.push('\n');
+        }
+        out.push_str(&line[from..to]);
+    }
+    out
+}
+
+/// Comment text without its leaders, collapsed to one line. The outline
+/// formatter prints a doc as `// <text>`, so a leader left in place shows up
+/// doubled (`// // text`). Covers `///`, `//!`, `//`, `/* */`, `/** */` with
+/// a `*` margin, and `#`.
+fn clean_comment_text(text: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let l = line
+            .trim()
+            .trim_end_matches("*/")
+            .trim_start_matches("///")
+            .trim_start_matches("//!")
+            .trim_start_matches("/**")
+            .trim_start_matches("/*")
+            .trim_start_matches("//")
+            .trim_start_matches('*')
+            .trim_start_matches('#')
+            .trim();
+        if !l.is_empty() {
+            parts.push(l);
+        }
+    }
+    parts.join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,5 +1385,54 @@ const (
             doc("First")
         );
         assert_eq!(doc("Second"), None, "Second has no comment of its own");
+    }
+}
+
+#[cfg(test)]
+mod doc_comment_tests {
+    use super::get_outline_entries;
+    use crate::types::Lang;
+
+    fn first_doc(src: &str, lang: Lang) -> Option<String> {
+        get_outline_entries(src, lang)
+            .into_iter()
+            .next()
+            .and_then(|e| e.doc)
+    }
+
+    /// A plain `//` comment is a doc comment too. It used to keep its slashes,
+    /// and the outline formatter then added its own, printing `// // text`.
+    #[test]
+    fn doc_strips_plain_line_comment_markers() {
+        assert_eq!(
+            first_doc(
+                "package p\n\n// Serve handles requests.\nfunc Serve() {}\n",
+                Lang::Go
+            ),
+            Some("Serve handles requests.".to_string())
+        );
+        assert_eq!(
+            first_doc("// plain note\nfn f() {}\n", Lang::Rust),
+            Some("plain note".to_string())
+        );
+        assert_eq!(
+            first_doc("/// doc note\nfn f() {}\n", Lang::Rust),
+            Some("doc note".to_string())
+        );
+    }
+
+    /// Block comments lose their delimiters, and a multi-line block collapses
+    /// to one line with the leading `*` of each line removed.
+    #[test]
+    fn doc_strips_block_comment_delimiters() {
+        assert_eq!(
+            first_doc("/* block note */\nint f(void) { return 0; }\n", Lang::C),
+            Some("block note".to_string())
+        );
+        let js = "/**\n * Adds two numbers.\n * @param a first\n */\nfunction add(a, b) { return a + b; }\n";
+        let doc = first_doc(js, Lang::JavaScript).expect("jsdoc");
+        assert!(doc.starts_with("Adds two numbers."), "got: {doc:?}");
+        assert!(!doc.contains('*'), "delimiters must be gone: {doc:?}");
+        assert!(!doc.contains('\n'), "must be one line: {doc:?}");
     }
 }
