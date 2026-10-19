@@ -376,10 +376,13 @@ serde_json::json!({
     }
 
     for tool in &mut tools {
-        tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
-            "type": "boolean",
-            "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting."
-        });
+        let name = tool["name"].as_str().unwrap_or("");
+        if name == "tilth_search" || name == "tilth_list" {
+            tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
+                "type": "boolean",
+                "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting (enabled by default)."
+            });
+        }
     }
 
     tools

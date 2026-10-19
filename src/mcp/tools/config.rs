@@ -30,6 +30,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_actions_and_values_without_changing_config() {
+        let before = tool_config(&serde_json::json!({})).unwrap();
         assert!(tool_config(&serde_json::json!({ "action": "unknown" })).is_err());
         assert!(tool_config(&serde_json::json!({ "action": "set" })).is_err());
         assert!(tool_config(&serde_json::json!({
@@ -37,6 +38,8 @@ mod tests {
             "respect_gitignore": "yes"
         }))
         .is_err());
+        let after = tool_config(&serde_json::json!({})).unwrap();
+        assert_eq!(before, after, "rejected calls must not change config");
     }
 
     #[test]
