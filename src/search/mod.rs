@@ -128,17 +128,9 @@ pub(crate) fn gitignore_config() -> (bool, &'static str) {
     }
 }
 
-pub(crate) fn set_gitignore_config(value: Option<bool>) {
-    let value = match value {
-        Some(false) => GITIGNORE_OVERRIDE_DISABLED,
-        Some(true) => GITIGNORE_OVERRIDE_ENABLED,
-        None => GITIGNORE_OVERRIDE_UNSET,
-    };
-    GITIGNORE_OVERRIDE.store(value, Ordering::Relaxed);
-}
-
 /// Shared walker policy: searches files except known junk directories and
 /// `.tilthignore` entries. Gitignore-style files are honored by default.
+/// Parent `.tilthignore` files apply at every level above the scope.
 /// The scope itself is an explicit traversal root: `--scope src/tmp` searches
 /// that directory even if a parent `.gitignore` excludes `src/tmp/`; ignore
 /// rules still filter entries beneath the scope.

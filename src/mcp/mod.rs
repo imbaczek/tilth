@@ -15,8 +15,8 @@ pub(crate) mod tree;
 pub(crate) mod write;
 
 use tools::{
-    tool_config, tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read,
-    tool_search, tool_session, tool_write,
+    tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read, tool_search,
+    tool_session, tool_write,
 };
 
 /// Read with the same views and validation as `tilth_read`.
@@ -333,15 +333,9 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         None => None,
         Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
     };
-    let gitignore = if tool == "tilth_config" {
-        None
-    } else {
-        gitignore
-    };
     crate::search::with_gitignore_override(gitignore, || {
         let edit_mode = services.edit_mode();
         match tool {
-            "tilth_config" => tool_config(args),
             "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
             "tilth_search" => {
                 tool_search(args, services.cache(), services.session(), services.bloom())
@@ -574,7 +568,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.trim_end().len(),
-            2125,
+            1945,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -600,7 +594,10 @@ mod tests {
         // native-vs-tilth steering for weaker models stays verbatim, and that the
         // per-tool parameter manuals are gone from the always-on instructions field.
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Grep, Read, or Glob."));
-        assert!(SERVER_INSTRUCTIONS.contains("tilth_config(action: \"set\""));
+        assert!(
+            !SERVER_INSTRUCTIONS.contains("tilth_config"),
+            "tilth_config must not appear in the instructions"
+        );
         assert!(SERVER_INSTRUCTIONS
             .contains("To check what changed, use tilth_diff instead of Bash(git diff/git log)."));
         assert!(SERVER_INSTRUCTIONS.contains("DO NOT use Bash(git diff) or Bash(git log --patch)."));

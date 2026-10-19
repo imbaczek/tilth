@@ -178,13 +178,6 @@ impl Mcp {
             .collect::<Vec<_>>()
             .join("\n")
     }
-
-    fn config(&mut self, args: serde_json::Value, respect: bool, source: &str) {
-        let result: serde_json::Value =
-            serde_json::from_str(&self.call("tilth_config", args)).unwrap();
-        assert_eq!(result["respect_gitignore"], respect);
-        assert_eq!(result["source"], source);
-    }
 }
 
 impl Drop for Mcp {
@@ -198,7 +191,6 @@ impl Drop for Mcp {
 fn mcp_default_runtime_call_and_startup_overrides() {
     let root = fixture();
     let mut mcp = Mcp::start(root.path(), None, None);
-    mcp.config(serde_json::json!({}), true, "default");
     for (name, args) in [
         ("tilth_list", serde_json::json!({"patterns":["*.rs"]})),
         (
@@ -217,28 +209,6 @@ fn mcp_default_runtime_call_and_startup_overrides() {
         assert_visibility(&mcp.call(name, bypass), false);
         assert_visibility(&mcp.call(name, args), true);
     }
-    mcp.config(
-        serde_json::json!({"action":"set","respect_gitignore":false}),
-        false,
-        "runtime",
-    );
-    assert_visibility(
-        &mcp.call("tilth_list", serde_json::json!({"patterns":["*.rs"]})),
-        false,
-    );
-    assert_visibility(
-        &mcp.call(
-            "tilth_list",
-            serde_json::json!({"patterns":["*.rs"],"gitignore":true}),
-        ),
-        true,
-    );
-    mcp.config(serde_json::json!({}), false, "runtime");
-    mcp.config(serde_json::json!({"action":"reset"}), true, "default");
-    assert_visibility(
-        &mcp.call("tilth_list", serde_json::json!({"patterns":["*.rs"]})),
-        true,
-    );
     for (env, flag, startup) in [
         ("0", None, false),
         ("false", None, false),
@@ -246,20 +216,23 @@ fn mcp_default_runtime_call_and_startup_overrides() {
         ("0", Some("--respect-gitignore"), true),
     ] {
         let mut mcp = Mcp::start(root.path(), Some(env), flag);
-        mcp.config(serde_json::json!({}), startup, "environment");
         assert_visibility(
             &mcp.call("tilth_list", serde_json::json!({"patterns":["*.rs"]})),
             startup,
         );
-        mcp.config(
-            serde_json::json!({"action":"set","respect_gitignore":!startup}),
-            !startup,
-            "runtime",
+        assert_visibility(
+            &mcp.call(
+                "tilth_list",
+                serde_json::json!({"patterns":["*.rs"],"gitignore":true}),
+            ),
+            true,
         );
-        mcp.config(
-            serde_json::json!({"action":"reset"}),
-            startup,
-            "environment",
+        assert_visibility(
+            &mcp.call(
+                "tilth_list",
+                serde_json::json!({"patterns":["*.rs"],"gitignore":false}),
+            ),
+            false,
         );
     }
 }

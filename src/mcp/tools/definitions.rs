@@ -21,7 +21,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Searches honor .tilthignore, .gitignore, .ignore, and Git excludes by default. Set gitignore=false for one call, tilth_config respect_gitignore=false for this server, or TILTH_RESPECT_GITIGNORE=0 at startup to bypass Git ignore rules.",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Searches honor .tilthignore, .gitignore, .ignore, and Git excludes by default. Set gitignore=false for one call, or use TILTH_RESPECT_GITIGNORE=0 at startup, to bypass Git ignore rules.",
             "inputSchema": {
                 "type": "object",
                 "required": ["query"],
@@ -305,26 +305,6 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-        serde_json::json!({
-            "name": "tilth_config",
-            "annotations": { "readOnlyHint": false, "idempotentHint": true },
-            "description": "Read or update MCP runtime configuration. Gitignore handling is enabled by default and persists for this server process and applies to search, list, map, callers, and other filesystem walks. .tilthignore and built-in junk-directory exclusions always remain active.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": ["get", "set", "reset"],
-                        "default": "get",
-                        "description": "get reports effective configuration; set applies supplied values; reset returns to startup environment/default behavior."
-                    },
-                    "respect_gitignore": {
-                        "type": "boolean",
-                        "description": "For action=set, enable or disable .gitignore, .ignore, and Git exclude rules."
-                    }
-                }
-            }
-        }),
     ];
 
     if edit_mode {
@@ -420,10 +400,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     for tool in &mut tools {
-        tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
-            "type": "boolean",
-            "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting (enabled by default)."
-        });
+        let name = tool["name"].as_str().unwrap_or("");
+        if name == "tilth_search" || name == "tilth_list" {
+            tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
+                "type": "boolean",
+                "description": "For this call, honor .gitignore, .ignore, and Git exclude rules when true; bypass them when false. Omit to use the current server setting (enabled by default)."
+            });
+        }
     }
 
     tools
@@ -544,18 +527,21 @@ mod tests {
     }
 
     #[test]
-    fn tilth_config_exposes_gitignore_runtime_setting() {
+    fn gitignore_param_only_on_search_and_list() {
         for edit_mode in [false, true] {
             let defs = tool_definitions(edit_mode);
-            let config = defs
-                .iter()
-                .find(|tool| tool["name"] == "tilth_config")
-                .expect("tilth_config must be advertised in every MCP mode");
-            assert_eq!(
-                config["inputSchema"]["properties"]["respect_gitignore"]["type"],
-                "boolean"
-            );
-            assert_eq!(config["annotations"]["readOnlyHint"], false);
+            for tool in &defs {
+                let name = tool["name"].as_str().unwrap_or("");
+                let has_gitignore = tool["inputSchema"]["properties"].get("gitignore").is_some();
+                if name == "tilth_search" || name == "tilth_list" {
+                    assert!(has_gitignore, "{name} must expose the gitignore parameter");
+                } else {
+                    assert!(
+                        !has_gitignore,
+                        "{name} must NOT expose the gitignore parameter"
+                    );
+                }
+            }
         }
     }
     #[test]
