@@ -261,7 +261,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                 }
             }
         }),
-serde_json::json!({
+        serde_json::json!({
             "name": "tilth_config",
             "annotations": { "readOnlyHint": false, "idempotentHint": true },
             "description": "Read or update MCP runtime configuration. Gitignore handling persists for this server process and applies to search, list, map, callers, and other filesystem walks. .tilthignore and built-in junk-directory exclusions always remain active.",
@@ -453,7 +453,7 @@ mod tests {
         }
     }
 
-/// #195: tools that refuse a file scope say so in the schema; `tilth_diff`
+    /// #195: tools that refuse a file scope say so in the schema; `tilth_diff`
     /// accepts either and says that instead.
     #[test]
     fn scope_descriptions_state_what_scope_accepts() {

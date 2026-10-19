@@ -15,7 +15,7 @@ pub(crate) mod tree;
 pub(crate) mod write;
 
 use tools::{
-tool_config, tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read,
+    tool_config, tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read,
     tool_search, tool_session, tool_write,
 };
 
@@ -319,7 +319,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
 /// Execute a tool by name with the given arguments. Returns formatted output or error string.
 /// No classifier involved — the caller specifies the tool explicitly.
 fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String, String> {
-let gitignore = match args.get("gitignore") {
+    let gitignore = match args.get("gitignore") {
         None => None,
         Some(value) => Some(value.as_bool().ok_or("gitignore must be a boolean")?),
     };
@@ -333,7 +333,9 @@ let gitignore = match args.get("gitignore") {
         match tool {
             "tilth_config" => tool_config(args),
             "tilth_read" => tool_read(args, services.cache(), services.session(), edit_mode),
-            "tilth_search" => tool_search(args, services.cache(), services.session(), services.bloom()),
+            "tilth_search" => {
+                tool_search(args, services.cache(), services.session(), services.bloom())
+            }
             "tilth_list" => tool_list(args),
             // Dispatch-only alias for one release: mid-session agents hold a
             // pre-upgrade tool list that still names tilth_files. Never advertised
