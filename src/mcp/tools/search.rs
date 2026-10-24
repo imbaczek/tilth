@@ -985,6 +985,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_scope_file_arguments_are_refused_with_glob_hint() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/file.rs"), "fn target() {}\n").unwrap();
+        let args = serde_json::json!({"query":"target", "root":root.path(), "scopes":["src", "src/file.rs"]});
+        let err = tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("scope \"src/file.rs\" is a file") && err.contains("glob"),
+            "{err}"
+        );
+    }
+
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
     /// is unresolvable (the server cannot see the caller's shell cwd) — this
     /// must still refuse.
@@ -998,6 +1017,319 @@ mod tests {
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
+        );
+    }
+
+    /// A checkout with the same symbol in two sibling files, so a search that
+    /// widens past the file an agent named is visible in the output.
+    fn two_file_checkout() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/x.py"), "def needle():\n    pass\n").unwrap();
+        std::fs::write(tmp.path().join("src/y.py"), "def needle():\n    pass\n").unwrap();
+        tmp
+    }
+
+    /// #195: a file passed as `scope` together with an absolute `root` used
+    /// to succeed with a warning and search the whole root. Agents treat a
+    /// successful response as authoritative, so a narrowing argument must
+    /// never widen. The refusal names the file and the call that does work.
+    #[test]
+    fn file_scope_with_root_is_refused_with_glob_hint() {
+        let tmp = two_file_checkout();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({
+            "query": "needle",
+            "scope": "src/x.py",
+            "root": tmp.path().to_str().unwrap(),
+        });
+        let err = tool_search(&args, &cache, &session, &bloom)
+            .expect_err("a file scope must be refused, not widened to root");
+        assert!(
+            err.contains("scope \"src/x.py\" is a file"),
+            "refusal must name the file: {err}"
+        );
+        assert!(
+            err.contains("scope to its directory (\"src\")")
+                && err.contains("glob to its name (\"x.py\")"),
+            "refusal must name the working call: {err}"
+        );
+    }
+
+    /// The absolute-file case without `root` already refused, but its message
+    /// blamed the missing root. It must name the real problem and the fix.
+    #[test]
+    fn absolute_file_scope_without_root_names_the_fix() {
+        let tmp = two_file_checkout();
+        let file = tmp.path().join("src/x.py");
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        let args = serde_json::json!({ "query": "needle", "scope": file.to_str().unwrap() });
+        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+        let dir = tmp.path().join("src");
+        assert!(
+            err.contains("is a file")
+                && err.contains(&format!("(\"{}\")", dir.display()))
+                && err.contains("glob to its name (\"x.py\")"),
+            "refusal must name the directory and glob fix: {err}"
+        );
+    }
+
+    /// The refusal's advice must actually work: scope at the directory plus
+    /// glob at the name searches that one file and not its sibling.
+    #[test]
+    fn file_scope_hint_narrows_to_the_one_file() {
+        let tmp = two_file_checkout();
+        let out = run_search(&serde_json::json!({
+            "query": "needle",
+            "scope": "src",
+            "glob": "x.py",
+            "root": tmp.path().to_str().unwrap(),
+        }));
+        assert!(
+            out.contains("x.py"),
+            "the named file must be searched: {out}"
+        );
+        assert!(
+            !out.contains("y.py"),
+            "the sibling must stay out of a one-file search: {out}"
+        );
+    }
+
+    /// A scope that does not exist at all (usually a typo) keeps the soft
+    /// fallback: search root and say so. This is deliberate, so it is pinned.
+    #[test]
+    fn missing_dir_scope_with_root_still_falls_back_with_warning() {
+        let tmp = two_file_checkout();
+        let out = run_search(&serde_json::json!({
+            "query": "needle",
+            "scope": "no/such/dir",
+            "root": tmp.path().to_str().unwrap(),
+        }));
+        assert!(
+            out.starts_with(
+                "scope \"no/such/dir\" is not a valid directory, searching the root/checkout directory instead."
+            ),
+            "a missing directory must warn and fall back to root: {out}"
+        );
+        assert!(
+            out.contains("x.py") && out.contains("y.py"),
+            "the fallback must search the whole root: {out}"
+        );
+    }
+
+    /// How many of the `n` numbered `<prefix>_NN.rs` fixture files the output
+    /// names. Counting file names instead of a header phrase keeps these
+    /// assertions independent of the header and facet wording.
+    fn files_shown(out: &str, prefix: &str, n: usize) -> usize {
+        (0..n)
+            .filter(|i| out.contains(&format!("{prefix}_{i:02}.rs")))
+            .count()
+    }
+
+    /// Write `n` files named `<prefix>_NN.rs`, one match per file, so a cap
+    /// can be counted by how many of them the output names.
+    fn spread(dir: &std::path::Path, prefix: &str, n: usize, body: impl Fn(usize) -> String) {
+        for i in 0..n {
+            std::fs::write(dir.join(format!("{prefix}_{i:02}.rs")), body(i)).unwrap();
+        }
+    }
+
+    fn run_search(args: &Value) -> String {
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        tool_search(args, &cache, &session, &bloom).unwrap()
+    }
+
+    /// `full` must reach both symbol dispatches. The handler hard-coded
+    /// `false` for every kind, so an agent could never see past the 10-match
+    /// cap that `--full` already lifts on the CLI. The cap is per query, so a
+    /// comma search must widen every section, not share one budget.
+    #[test]
+    fn full_raises_symbol_match_cap_per_query() {
+        let tmp = tempfile::tempdir().unwrap();
+        spread(tmp.path(), "syma", 15, |_| {
+            "pub fn AlphaThing() {}\n".to_string()
+        });
+        spread(tmp.path(), "symb", 15, |_| {
+            "pub fn BetaThing() {}\n".to_string()
+        });
+
+        // Single query.
+        let mut args = serde_json::json!({
+            "query": "AlphaThing",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let capped = run_search(&args);
+        assert_eq!(
+            files_shown(&capped, "syma", 15),
+            10,
+            "default must render exactly the 10-match cap: {capped}"
+        );
+        args["full"] = Value::Bool(true);
+        let widened = run_search(&args);
+        assert!(
+            files_shown(&widened, "syma", 15) > 10,
+            "full must raise the symbol cap past 10: {widened}"
+        );
+
+        // Comma query — a separate dispatch with its own `full` argument.
+        let mut multi = serde_json::json!({
+            "query": "AlphaThing,BetaThing",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let capped_multi = run_search(&multi);
+        assert_eq!(
+            (
+                files_shown(&capped_multi, "syma", 15),
+                files_shown(&capped_multi, "symb", 15)
+            ),
+            (10, 10),
+            "default must cap each comma section at 10: {capped_multi}"
+        );
+        multi["full"] = Value::Bool(true);
+        let widened_multi = run_search(&multi);
+        assert!(
+            files_shown(&widened_multi, "syma", 15) > 10
+                && files_shown(&widened_multi, "symb", 15) > 10,
+            "full must raise the cap in every comma section: {widened_multi}"
+        );
+    }
+
+    /// Same for `kind=content`, which dispatches through
+    /// `search_content_expanded`'s own `full` parameter.
+    #[test]
+    fn full_raises_content_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        spread(tmp.path(), "cnt", 15, |_| {
+            "fn f() { let _ = ScatteredNeedle; }\n".to_string()
+        });
+
+        let mut args = serde_json::json!({
+            "query": "ScatteredNeedle",
+            "kind": "content",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let capped = run_search(&args);
+        assert_eq!(
+            files_shown(&capped, "cnt", 15),
+            10,
+            "default must render exactly the 10-match cap: {capped}"
+        );
+
+        args["full"] = Value::Bool(true);
+        let widened = run_search(&args);
+        assert!(
+            files_shown(&widened, "cnt", 15) > 10,
+            "full must raise the content cap past 10: {widened}"
+        );
+    }
+
+    /// `kind=regex` shares `content::search` with `kind=content` but pins the
+    /// pattern as a regex. The query below matches only under regex
+    /// semantics, so this pins the `is_regex` argument as well as the `full`
+    /// one — the two are adjacent bools at the same call.
+    #[test]
+    fn full_raises_regex_match_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        spread(tmp.path(), "rgx", 15, |_| {
+            "fn f() { let _ = NeedleQ7; }\n".to_string()
+        });
+
+        let mut args = serde_json::json!({
+            "query": "Needle[A-Z][0-9]",
+            "kind": "regex",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+
+        let capped = run_search(&args);
+        assert_eq!(
+            files_shown(&capped, "rgx", 15),
+            10,
+            "default must render exactly the 10-match cap, and only a regex \
+             match reaches 10 at all: {capped}"
+        );
+
+        args["full"] = Value::Bool(true);
+        let widened = run_search(&args);
+        assert!(
+            files_shown(&widened, "rgx", 15) > 10,
+            "full must raise the regex cap past 10: {widened}"
+        );
+    }
+
+    /// Same for both `kind=callers` dispatches, whose cap and walk budget
+    /// both key off `full`. As with symbol search the cap is per target.
+    #[test]
+    fn full_raises_callers_match_cap_per_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("defs.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        spread(tmp.path(), "cala", 15, |i| {
+            format!("fn a_uses_{i:02}() {{ alpha(); }}\n")
+        });
+        spread(tmp.path(), "calb", 15, |i| {
+            format!("fn b_uses_{i:02}() {{ beta(); }}\n")
+        });
+
+        // Single target.
+        let mut args = serde_json::json!({
+            "query": "alpha",
+            "kind": "callers",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let capped = run_search(&args);
+        assert_eq!(
+            files_shown(&capped, "cala", 15),
+            10,
+            "default must render exactly the 10-call-site cap: {capped}"
+        );
+        args["full"] = Value::Bool(true);
+        let widened = run_search(&args);
+        assert!(
+            files_shown(&widened, "cala", 15) > 10,
+            "full must raise the callers cap past 10: {widened}"
+        );
+
+        // Comma query — a separate dispatch with its own `full` argument.
+        let mut multi = serde_json::json!({
+            "query": "alpha,beta",
+            "kind": "callers",
+            "scope": tmp.path().to_str().unwrap(),
+        });
+        let capped_multi = run_search(&multi);
+        assert_eq!(
+            (
+                files_shown(&capped_multi, "cala", 15),
+                files_shown(&capped_multi, "calb", 15)
+            ),
+            (10, 10),
+            "default must cap each target bucket at 10: {capped_multi}"
+        );
+        multi["full"] = Value::Bool(true);
+        let widened_multi = run_search(&multi);
+        assert!(
+            files_shown(&widened_multi, "cala", 15) > 10
+                && files_shown(&widened_multi, "calb", 15) > 10,
+            "full must raise the cap in every target bucket: {widened_multi}"
+        );
+    }
+
+    /// The schema must advertise `full`, or no agent can reach the widened cap.
+    #[test]
+    fn tilth_search_schema_advertises_full() {
+        let search = crate::mcp::tools::tool_definitions(false)
+            .into_iter()
+            .find(|t| t.get("name").and_then(Value::as_str) == Some("tilth_search"))
+            .expect("tilth_search definition");
+        assert_eq!(
+            search.pointer("/inputSchema/properties/full/type"),
+            Some(&Value::from("boolean")),
+            "tilth_search must advertise a boolean `full`: {search}"
         );
     }
 }

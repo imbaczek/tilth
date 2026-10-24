@@ -4,6 +4,7 @@ use std::process;
 
 use clap::{CommandFactory, Parser};
 use clap_complete::Shell;
+use tilth::FileScopeHint;
 
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
@@ -195,7 +196,7 @@ enum Command {
         options: SearchOptions,
     },
     /// Install tilth into an MCP host's config.
-    /// Supported hosts: claude-code, cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex, amp, droid, antigravity, zed, copilot-cli, augment, kiro, kilo-code, cline, roo-code, trae, qwen-code, crush, pi
+    /// Supported hosts: claude-code, cursor, windsurf, vscode, claude-desktop, opencode, gemini, codex, amp, droid, antigravity, antigravity-cli, zed, copilot-cli, augment, kiro, kilo-code, cline, roo-code, trae, qwen-code, crush, pi
     Install {
         /// MCP host to configure.
         host: String,
@@ -379,7 +380,8 @@ fn main() {
                 full,
                 budget,
             } => {
-                let scope = scope.canonicalize().unwrap_or(scope);
+                let scope =
+                    cli_scope(scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
                 match tilth::run_grok(&target, &scope, full) {
                     Ok(output) => emit_output(
                         &apply_optional_budget(output, budget.or(cli.search.budget)),
@@ -450,9 +452,8 @@ fn main() {
             None
         } else if cli.search.scope.len() == 1 {
             Some(
-                cli.search.scope[0]
-                    .canonicalize()
-                    .unwrap_or_else(|_| cli.search.scope[0].clone()),
+                cli_scope(cli.search.scope[0].clone(), FileScopeHint::Directory)
+                    .unwrap_or_else(|e| usage_exit(&e)),
             )
         } else {
             tilth::diagnostic!("mcp mode accepts only one --scope");
@@ -471,6 +472,10 @@ fn main() {
     if cli.search.map {
         let cache = tilth::cache::OutlineCache::new();
         let scopes = resolve_scopes(&cli.search.scope);
+        for scope in &scopes {
+            tilth::refuse_file_scope(scope, scope, FileScopeHint::Directory)
+                .unwrap_or_else(|e| usage_exit(&e));
+        }
         let output = run_for_scopes(&scopes, |scope| {
             std::fs::metadata(scope)
                 .map_err(|source| tilth::error::scope_io_error(scope, source))?;
@@ -491,6 +496,14 @@ fn main() {
 
     let cache = tilth::cache::OutlineCache::new();
     let scopes = resolve_scopes(&cli.search.scope);
+    let hint = if cli.search.deps {
+        FileScopeHint::Directory
+    } else {
+        FileScopeHint::Glob
+    };
+    for scope in &scopes {
+        tilth::refuse_file_scope(scope, scope, hint).unwrap_or_else(|e| usage_exit(&e));
+    }
 
     // Output destination only controls paging. File views and search expansion
     // are selected by explicit flags, so captured agent calls keep smart views.
@@ -660,6 +673,20 @@ fn apply_optional_budget(output: String, budget: Option<u64>) -> String {
         Some(budget) => tilth::apply_output_budget(&output, budget),
         None => output,
     }
+}
+
+/// Canonicalize `--scope`, refusing a file the same way the MCP tools do.
+/// A path that does not exist passes through unchanged, as before.
+fn cli_scope(raw: PathBuf, hint: FileScopeHint) -> Result<PathBuf, String> {
+    let scope = raw.canonicalize().unwrap_or_else(|_| raw.clone());
+    tilth::refuse_file_scope(&raw, &scope, hint)?;
+    Ok(scope)
+}
+
+/// Report a usage error and exit with the invalid-input code.
+fn usage_exit(msg: &str) -> ! {
+    eprintln!("{msg}");
+    process::exit(3);
 }
 
 fn emit_result(
@@ -1018,5 +1045,21 @@ mod tests {
             }
             other => panic!("expected scoped failures, got {other}"),
         }
+    }
+
+    /// #195: `--scope <file>` gets the same refusal as the MCP tools. It used
+    /// to walk the lone file and print match headers with no file name.
+    #[test]
+    fn cli_scope_refuses_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("x.py");
+        std::fs::write(&file, "").unwrap();
+        let err = cli_scope(file, FileScopeHint::Glob).unwrap_err();
+        assert!(
+            err.contains("is a file") && err.contains("glob to its name (\"x.py\")"),
+            "unexpected refusal: {err}"
+        );
+        let ok = cli_scope(dir.path().to_path_buf(), FileScopeHint::Glob).unwrap();
+        assert_eq!(ok, dir.path().canonicalize().unwrap());
     }
 }

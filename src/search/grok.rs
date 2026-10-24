@@ -306,7 +306,13 @@ fn enrich_from_outline(
     let target = match entry {
         Some(e) => {
             let mut target = target_from_entry(e, path, other_def_count);
-            if e.name != split_qualified(&name) {
+            let go_binding = lang == Lang::Go
+                && matches!(e.kind, OutlineKind::Variable | OutlineKind::Constant)
+                && e.name.split(',').any(|binding| binding.trim() == name);
+            if go_binding {
+                target.name.clone_from(&name);
+            }
+            if e.name != split_qualified(&name) && !go_binding {
                 target.resolution_note = Some(format!(
                     "definition `{name}` is missing from the outline; showing enclosing {} `{}`",
                     kind_label(e.kind),
@@ -1610,10 +1616,6 @@ fn body_with_dedup(
         "// [{line_count}-line body shown earlier — {}:{}]",
         target.path.display(),
         target.start_line
-    );
-    session.record_savings(
-        crate::types::estimate_tokens(full.len() as u64),
-        crate::types::estimate_tokens(preview.len() as u64),
     );
     preview
 }
@@ -4211,75 +4213,6 @@ pub fn outer(x: u32) -> u32 {
         );
     }
 
-    // ── SAVINGS tests ───────────────────────────────────────────
-
-    /// First grok of a large body: no degradation, savings zero.
-    /// Second grok of the same body: degraded to preview, savings > 0.
-    #[test]
-    fn grok_degradation_records_savings() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_fixture(tmp.path(), "src/lib.rs", &long_body_fixture("savings_fn"));
-        let bloom = BloomFilterCache::default();
-        let session = crate::session::Session::default();
-
-        // First grok — full body, no degradation, no savings from body_with_dedup.
-        let _ = grok(
-            "savings_fn",
-            tmp.path(),
-            &bloom,
-            &session,
-            GrokCaps::default(),
-        )
-        .unwrap();
-        let (baseline_after_first, saved_after_first) = session.savings();
-        assert_eq!(
-            baseline_after_first, 0,
-            "first grok (full body, no degradation) must not record savings, got baseline={baseline_after_first}"
-        );
-        assert_eq!(
-            saved_after_first, 0,
-            "first grok must record no savings, got saved={saved_after_first}"
-        );
-
-        // Second grok — body_with_dedup degrades to preview.
-        let r2 = grok(
-            "savings_fn",
-            tmp.path(),
-            &bloom,
-            &session,
-            GrokCaps::default(),
-        )
-        .unwrap();
-        assert!(
-            r2.body.contains("shown earlier"),
-            "precondition: second grok must degrade"
-        );
-        let (baseline_after_second, saved_after_second) = session.savings();
-        assert!(
-            baseline_after_second > 0,
-            "degradation must record a non-zero baseline, got {baseline_after_second}"
-        );
-        assert!(
-            saved_after_second > 0,
-            "degradation must record tokens saved, got {saved_after_second}"
-        );
-    }
-
-    /// A short body (at or below `BODY_DEGRADE_THRESHOLD`) never degrades,
-    /// so savings remain zero across repeated calls.
-    #[test]
-    fn grok_short_body_degradation_records_no_savings() {
-        let tmp = tempfile::tempdir().unwrap();
-        write_fixture(tmp.path(), "src/lib.rs", "pub fn tiny() { 1 }\n");
-        let bloom = BloomFilterCache::default();
-        let session = crate::session::Session::default();
-
-        let _ = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
-        let _ = grok("tiny", tmp.path(), &bloom, &session, GrokCaps::default()).unwrap();
-        let (baseline, saved) = session.savings();
-        assert_eq!(baseline, 0, "sub-threshold body must not record savings");
-        assert_eq!(saved, 0, "sub-threshold body must not record savings");
-    }
     #[test]
     fn type_method_regression_real_impl_block() {
         // Regression for commit 2f7c448 (fix #61): `Type::method` qualified targets
@@ -4320,6 +4253,54 @@ impl OutlineCache {
             assert_eq!(
                 target.other_def_count, 0,
                 "exactly one `get_or_parse` definition in the fixture"
+            );
+        }
+    }
+
+    /// Go package-level `type` and grouped `const` declarations resolve by
+    /// name, each to its own spec's line, kind and siblings.
+    #[test]
+    fn go_multi_name_binding_resolves_without_enclosing_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bindings.go");
+        std::fs::write(&path, "package p\nvar y, z = 1, 2\nconst A, B = 3, 4\n").unwrap();
+        for (name, line) in [("y", 2), ("z", 2), ("A", 3), ("B", 3)] {
+            let (target, _, _) =
+                enrich_from_outline(path.clone(), line, name.to_string(), 0).unwrap();
+            assert_eq!(target.name, name);
+            assert_eq!(target.resolution_note, None);
+        }
+    }
+
+    #[test]
+    fn grok_resolves_go_type_and_grouped_const() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_fixture(
+            tmp.path(),
+            "main.go",
+            crate::lang::go::GO_DECLARATIONS_FIXTURE,
+        );
+
+        let bloom = BloomFilterCache::default();
+        let session = crate::session::Session::default();
+        for (name, kind, line) in [
+            ("Server", OutlineKind::Struct, 9),
+            ("StatusActive", OutlineKind::Constant, 4),
+        ] {
+            let result = grok(name, tmp.path(), &bloom, &session, GrokCaps::default())
+                .unwrap_or_else(|e| panic!("grok {name} failed: {e}"));
+            assert_eq!(result.target.name, name);
+            assert_eq!(result.target.kind, kind, "{name} kind");
+            assert_eq!(
+                (result.target.start_line, result.target.end_line),
+                (line, line),
+                "{name} range"
+            );
+            let sibling_names: Vec<&str> =
+                result.siblings.iter().map(|s| s.name.as_str()).collect();
+            assert!(
+                sibling_names.contains(&"NewServer"),
+                "{name}: expected NewServer among siblings, got {sibling_names:?}"
             );
         }
     }

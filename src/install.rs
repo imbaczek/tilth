@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 //   amp:            ~/.config/amp/settings.json                (user scope)
 //   droid:          ~/.factory/mcp.json                        (user scope)
 //   antigravity:    ~/.gemini/antigravity/mcp_config.json      (user scope)
+//   antigravity-cli: ~/.gemini/config/mcp_config.json          (user scope; agy also reads .agents/mcp_config.json per project)
 //   zed:            ~/.config/zed/settings.json                (user scope)
 //   copilot-cli:    ~/.copilot/mcp-config.json                 (user scope)
 //   augment:        ~/.augment/settings.json                   (user scope)
@@ -40,6 +41,7 @@ const SUPPORTED_HOSTS: &[&str] = &[
     "amp",
     "droid",
     "antigravity",
+    "antigravity-cli",
     "zed",
     "copilot-cli",
     "augment",
@@ -391,6 +393,16 @@ fn resolve_host(host: &str) -> Result<HostInfo, String> {
 
         // Factory Droid user scope: ~/.factory/mcp.json → mcpServers
         // Verified from official docs: https://docs.factory.ai/cli/configuration/mcp
+        // Antigravity CLI (agy) user scope: ~/.gemini/config/mcp_config.json → mcpServers.
+        // The IDE keeps its own file under ~/.gemini/antigravity/ (the "antigravity" host);
+        // the CLI reads the shared config dir, and a per-project .agents/mcp_config.json.
+        "antigravity-cli" => Ok(HostInfo {
+            path: home.join(".gemini/config/mcp_config.json"),
+            format: ConfigFormat::Json {
+                servers_key: "mcpServers",
+            },
+            note: Some("User scope — available in all projects."),
+        }),
         "droid" => Ok(HostInfo {
             path: home.join(".factory/mcp.json"),
             format: ConfigFormat::Json {
@@ -692,6 +704,23 @@ mod tests {
             out.contains("command = \"new\""),
             "new section not written: {out:?}"
         );
+    }
+
+    #[test]
+    fn antigravity_cli_resolve_host() {
+        let info = resolve_host("antigravity-cli").expect("antigravity-cli should resolve");
+        assert!(
+            info.path.ends_with(".gemini/config/mcp_config.json"),
+            "path should end with .gemini/config/mcp_config.json, got: {}",
+            info.path.display()
+        );
+        match info.format {
+            ConfigFormat::Json { servers_key } => assert_eq!(servers_key, "mcpServers"),
+            ConfigFormat::JsonLocal { .. } => {
+                panic!("antigravity-cli should use Json format, not JsonLocal")
+            }
+            ConfigFormat::Toml => panic!("antigravity-cli should use JSON format, not TOML"),
+        }
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub(crate) mod write;
 
 use tools::{
     tool_config, tool_definitions, tool_deps, tool_diff, tool_grok, tool_list, tool_read,
-    tool_savings, tool_search, tool_session, tool_write,
+    tool_search, tool_session, tool_write,
 };
 
 /// Read with the same views and validation as `tilth_read`.
@@ -95,9 +95,7 @@ pub fn run(edit_mode: bool, scope: Option<&Path>) -> io::Result<()> {
     // Resolve the project root and chdir to it.
     // Priority: explicit --scope > MCP roots (handled later) > package_root(cwd) > cwd
     if let Some(s) = scope {
-        if s.is_dir() {
-            let _ = std::env::set_current_dir(s);
-        }
+        std::env::set_current_dir(s)?;
     } else {
         let cwd = std::env::current_dir().unwrap_or_default();
         if let Some(root) = crate::lang::package_root(&cwd) {
@@ -363,7 +361,6 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
             "tilth_diff" => tool_diff(args),
             "tilth_session" => tool_session(args, services.session()),
-            "tilth_savings" => tool_savings(args, services.session()),
             "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),
             _ => Err(format!("unknown tool: {tool}")),
         }
@@ -677,5 +674,24 @@ mod tests {
             !canonical.contains("note: tilth_files"),
             "canonical tilth_list must not carry the rename note: {canonical}"
         );
+    }
+
+    // -- dispatch_tool: removed tools ----------------------------------------
+
+    /// The token-accounting tool was removed outright, with no alias: a call by
+    /// its old name gets the generic unknown-tool error. Absence from
+    /// tools/list is pinned by `tilth_savings_is_not_advertised`.
+    #[test]
+    fn tilth_savings_is_not_dispatched() {
+        let args = serde_json::json!({});
+        for edit_mode in [false, true] {
+            let services = Services::new(edit_mode);
+            let err = dispatch_tool("tilth_savings", &args, &services)
+                .expect_err("tilth_savings must not dispatch");
+            assert!(
+                err.contains("unknown tool"),
+                "expected unknown-tool error (edit_mode={edit_mode}): {err}"
+            );
+        }
     }
 }

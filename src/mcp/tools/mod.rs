@@ -5,7 +5,6 @@ mod diff;
 mod grok;
 mod list;
 mod read;
-mod savings;
 mod search;
 mod session;
 mod write;
@@ -17,7 +16,6 @@ pub(super) use diff::tool_diff;
 pub(super) use grok::tool_grok;
 pub(super) use list::tool_list;
 pub(super) use read::{read_with_navigation, tool_read};
-pub(super) use savings::tool_savings;
 pub(super) use search::tool_search;
 pub(super) use session::tool_session;
 pub(super) use write::tool_write;
@@ -68,12 +66,19 @@ fn anchor_path(
 /// relative `scope` without an absolute `root` — that is a deliberate but
 /// unresolvable request, since the server cannot see the caller's shell cwd.
 ///
-/// When `scope` is **absent entirely**, this falls back to today's default
-/// behavior (server launch cwd, exactly as on `main`): no refusal, no `root`
+/// When `scope` is **absent entirely** and an absolute `root` is given, the
+/// scope is `root`: it is the caller's checkout, and searching the server's
+/// own cwd instead answered from the wrong tree in worktree setups. Without a
+/// usable `root` the scope is the server launch cwd: no refusal, no `root`
 /// requirement. A bare repo-wide search (no `scope`, no `root`) must keep
 /// working — that is the default flow of every session.
 ///
-/// When the anchored path does not resolve to an existing directory:
+/// When the anchored path names a file, return `Err` naming the fix
+/// ([`crate::refuse_file_scope`]); `hint` says what the calling tool can offer
+/// instead. A file never falls back to `root`: that widened a narrowing
+/// argument to the whole checkout.
+///
+/// When the anchored path does not exist:
 /// - If an absolute `root` is available, fall back to `root` with a soft warning
 ///   (the caller's checkout exists; the scope subdir simply does not).
 /// - If no absolute `root` is available, return `Err` — there is no safe anchor
@@ -83,9 +88,10 @@ fn anchor_path(
 pub(super) fn resolve_scope(
     args: &Value,
     root: Option<&std::path::Path>,
+    hint: crate::FileScopeHint,
 ) -> Result<(PathBuf, Option<String>), String> {
     let cwd = std::env::current_dir().ok();
-    resolve_scope_at(args, root, cwd.as_deref())
+    resolve_scope_at(args, root, cwd.as_deref(), hint)
 }
 
 /// [`resolve_scope`] against an explicit cwd snapshot.
@@ -100,6 +106,7 @@ fn resolve_scope_at(
     args: &Value,
     root: Option<&std::path::Path>,
     cwd: Option<&std::path::Path>,
+    hint: crate::FileScopeHint,
 ) -> Result<(PathBuf, Option<String>), String> {
     let scope_arg = args.get("scope").and_then(|v| v.as_str());
     let raw_str = scope_arg.unwrap_or(".");
@@ -110,6 +117,10 @@ fn resolve_scope_at(
     // The default scope IS the server cwd, so it needs no resolution — only
     // an unreadable cwd leaves nothing valid to search.
     if scope_arg.is_none() {
+        if let Some(r) = root.filter(|r| r.is_absolute()) {
+            crate::refuse_file_scope(r, r, hint)?;
+            return Ok((r.to_path_buf(), None));
+        }
         return Ok(match cwd {
             Some(_) => (".".into(), None),
             None => (
@@ -123,6 +134,7 @@ fn resolve_scope_at(
 
     let anchored = anchor_path(&raw, root, "scope")?;
     let resolved = anchored.canonicalize().unwrap_or(anchored);
+    crate::refuse_file_scope(&raw, &resolved, hint)?;
     if !resolved.is_dir() {
         let hints = crate::scope_suggestions::suggestion_suffix(&resolved);
         // A missing-dir fallback to "." (server cwd) is the exact worktree hazard
@@ -154,7 +166,7 @@ pub(super) fn resolve_scopes(
     }
 
     let Some(scopes_value) = args.get("scopes") else {
-        let (scope, warning) = resolve_scope(args, root)?;
+        let (scope, warning) = resolve_scope(args, root, crate::FileScopeHint::Glob)?;
         return Ok((vec![scope], warning));
     };
 
@@ -171,7 +183,13 @@ pub(super) fn resolve_scopes(
             .as_str()
             .ok_or("\"scopes\" must be an array of strings")?;
         let anchored = anchor_path(std::path::Path::new(raw), root, "scope")?;
-        resolved.push(anchored.canonicalize().unwrap_or(anchored));
+        let canonical = anchored.canonicalize().unwrap_or(anchored);
+        crate::refuse_file_scope(
+            std::path::Path::new(raw),
+            &canonical,
+            crate::FileScopeHint::Glob,
+        )?;
+        resolved.push(canonical);
     }
     Ok((resolved, None))
 }
@@ -197,6 +215,7 @@ pub(super) fn apply_budget(output: &str, budget: Option<u64>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileScopeHint::Glob;
 
     /// Regression: the no-scope branch read the process cwd twice —
     /// `canonicalize(".")` and then `current_dir()` — and compared the two. A
@@ -211,7 +230,7 @@ mod tests {
     fn resolve_scope_uses_a_single_cwd_snapshot() {
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({});
-        let (scope, warning) = resolve_scope_at(&args, None, Some(tmp.path())).unwrap();
+        let (scope, warning) = resolve_scope_at(&args, None, Some(tmp.path()), Glob).unwrap();
         assert_eq!(scope, PathBuf::from("."));
         assert!(warning.is_none());
     }
@@ -221,7 +240,7 @@ mod tests {
     #[test]
     fn resolve_scope_no_arg_warns_when_cwd_is_unreadable() {
         let args = serde_json::json!({});
-        let (scope, warning) = resolve_scope_at(&args, None, None).unwrap();
+        let (scope, warning) = resolve_scope_at(&args, None, None, Glob).unwrap();
         assert_eq!(scope, PathBuf::from("."));
         assert!(
             warning.is_some_and(|w| w.contains("not a valid directory")),
@@ -233,7 +252,7 @@ mod tests {
     fn resolve_scope_explicit_absolute_arg() {
         let tmp = tempfile::tempdir().unwrap();
         let args = serde_json::json!({ "scope": tmp.path().to_str().unwrap() });
-        let (scope, warning) = resolve_scope(&args, None).unwrap();
+        let (scope, warning) = resolve_scope(&args, None, Glob).unwrap();
         assert_eq!(scope, tmp.path().canonicalize().unwrap());
         assert!(warning.is_none());
     }
@@ -246,19 +265,37 @@ mod tests {
         // as on main) — refusing here would break the default flow of every
         // session (e.g. a bare tilth_search/tilth_files call with no scope).
         let args = serde_json::json!({});
-        let (scope, warning) = resolve_scope(&args, None).unwrap();
+        let (scope, warning) = resolve_scope(&args, None, Glob).unwrap();
         assert_eq!(scope, PathBuf::from("."));
         assert!(warning.is_none());
     }
 
     #[test]
-    fn resolve_scope_no_arg_ignores_root() {
-        // An omitted scope must default to cwd even when `root` IS supplied —
-        // `root` only matters when the caller explicitly passes something
-        // relative to anchor.
+    fn omitted_scope_refuses_file_valued_root() {
+        let root = tempfile::NamedTempFile::new().unwrap();
+        let err = resolve_scope(&serde_json::json!({}), Some(root.path()), Glob).unwrap_err();
+        assert!(err.contains("is a file") && err.contains("glob"), "{err}");
+    }
+
+    #[test]
+    fn resolve_scope_no_arg_defaults_to_root_when_given() {
+        // `root` is the caller's checkout. With scope omitted, searching the
+        // server's cwd instead answered from the wrong tree in worktree setups
+        // (0 matches, header "in ."), so an omitted scope means "all of root".
         let args = serde_json::json!({});
         let tmp = tempfile::tempdir().unwrap();
-        let (scope, warning) = resolve_scope(&args, Some(tmp.path())).unwrap();
+        let (scope, warning) = resolve_scope(&args, Some(tmp.path()), Glob).unwrap();
+        assert_eq!(scope, tmp.path());
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn resolve_scope_no_arg_relative_root_keeps_cwd() {
+        // A relative root cannot anchor anything (the server cannot see the
+        // caller's cwd), so an omitted scope keeps the default flow.
+        let args = serde_json::json!({});
+        let (scope, warning) =
+            resolve_scope(&args, Some(std::path::Path::new("rel")), Glob).unwrap();
         assert_eq!(scope, PathBuf::from("."));
         assert!(warning.is_none());
     }
@@ -267,7 +304,7 @@ mod tests {
     fn resolve_scope_relative_arg_no_root_errors() {
         // A relative scope with no root is unresolvable (same hazard as omitted).
         let args = serde_json::json!({ "scope": "src" });
-        let err = resolve_scope(&args, None).unwrap_err();
+        let err = resolve_scope(&args, None, Glob).unwrap_err();
         assert!(err.contains("relative scope"), "got: {err}");
     }
 
@@ -275,7 +312,8 @@ mod tests {
     fn resolve_scope_relative_arg_relative_root_errors() {
         // A relative root reintroduces the cwd hazard, so it must be refused.
         let args = serde_json::json!({ "scope": "src" });
-        let err = resolve_scope(&args, Some(std::path::Path::new("relative/root"))).unwrap_err();
+        let err =
+            resolve_scope(&args, Some(std::path::Path::new("relative/root")), Glob).unwrap_err();
         assert!(
             err.contains("root") && err.contains("relative"),
             "relative root must be refused: {err}"
@@ -291,7 +329,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let (scope, warning) = resolve_scope(&args, Some(root)).unwrap();
+        let (scope, warning) = resolve_scope(&args, Some(root), Glob).unwrap();
         assert_eq!(scope, root, "fallback must be root, not server cwd");
         assert!(
             warning.is_some() && warning.unwrap().contains("not a valid directory"),
@@ -304,7 +342,7 @@ mod tests {
         // WHY: with no root there is no safe fallback — falling back to server cwd
         // is the worktree wrong-checkout hazard this PR closes. Must be a hard error.
         let args = serde_json::json!({ "scope": "/nonexistent/directory/zzz" });
-        let err = resolve_scope(&args, None).unwrap_err();
+        let err = resolve_scope(&args, None, Glob).unwrap_err();
         assert!(
             err.contains("/nonexistent/directory/zzz") && err.contains("not a valid directory"),
             "error must name the missing scope: {err}"
@@ -389,7 +427,7 @@ mod tests {
         let sub = root.join("sub");
         std::fs::create_dir(&sub).unwrap();
         let args = serde_json::json!({ "scope": "sub" });
-        let (scope, warning) = resolve_scope(&args, Some(root)).unwrap();
+        let (scope, warning) = resolve_scope(&args, Some(root), Glob).unwrap();
         assert_eq!(scope, sub.canonicalize().unwrap());
         assert!(warning.is_none());
     }

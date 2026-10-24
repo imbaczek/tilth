@@ -114,7 +114,7 @@ pub(crate) struct DefinitionOps {
     pub weight: fn(tree_sitter::Node, &[&str]) -> u16,
 }
 
-/// Shared default definition kinds — used by every language except Elixir.
+/// Shared default definition kinds — used by every language except Elixir and Go.
 pub(crate) const DEFAULT_DEF_KINDS: &[&str] = DEFINITION_KINDS;
 
 /// Default weight adapter: weight is keyed on the node kind, so the node's
@@ -314,15 +314,16 @@ mod tests {
     }
 
     #[test]
-    fn elixir_is_the_only_definition_override() {
+    fn only_elixir_and_go_override_definition_kinds() {
         // The refactor's shared-default-plus-override design: every spec points at
-        // DEFAULT_DEF_KINDS except Elixir, whose definitions are `call` nodes.
+        // DEFAULT_DEF_KINDS except Elixir, whose definitions are `call` nodes, and
+        // Go, whose `type`/`const`/`var` names live on specs inside a declaration.
         for &lang in mod_all_langs_for_test() {
             let uses_default = spec(lang).definition_kinds == DEFAULT_DEF_KINDS;
             assert_eq!(
                 uses_default,
-                !matches!(lang, Lang::Elixir),
-                "{lang:?} definition_kinds override mismatch — only Elixir diverges"
+                !matches!(lang, Lang::Elixir | Lang::Go),
+                "{lang:?} definition_kinds override mismatch — only Elixir and Go diverge"
             );
         }
     }

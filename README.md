@@ -281,6 +281,7 @@ tilth install codex            # ~/.codex/config.toml
 tilth install amp              # ~/.config/amp/settings.json
 tilth install droid            # ~/.factory/mcp.json
 tilth install antigravity      # ~/.gemini/antigravity/mcp_config.json
+tilth install antigravity-cli  # ~/.gemini/config/mcp_config.json
 tilth install zed              # ~/.config/zed/settings.json
 tilth install copilot-cli      # ~/.copilot/mcp-config.json
 tilth install augment          # ~/.augment/settings.json

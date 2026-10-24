@@ -188,7 +188,7 @@ fn file_outline_budget_preserves_navigation_and_method_docs() {
     let roomy = run("1000");
     assert!(roomy.contains("Actual method documentation"), "{roomy}");
     assert!(
-        !roomy.contains("section name") && !roomy.contains("another section"),
+        roomy.contains("section name") && roomy.contains("another section"),
         "{roomy}"
     );
     let compact = run("100");
@@ -879,4 +879,21 @@ fn qualified_grok_ignores_unrelated_candidates_above_the_target_read_cap() {
         .unwrap();
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("too large"));
+}
+
+#[test]
+fn mcp_startup_rejects_invalid_explicit_scopes() {
+    let root = tempfile::tempdir().unwrap();
+    let file = root.path().join("file.rs");
+    fs::write(&file, "fn target() {}\n").unwrap();
+    for scope in [file, root.path().join("missing")] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tilth"))
+            .args(["--mcp", "--scope"])
+            .arg(&scope)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "accepted {}", scope.display());
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.is_empty());
+    }
 }

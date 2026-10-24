@@ -16,7 +16,7 @@ pub(in crate::mcp) fn tool_list(args: &Value) -> Result<String, String> {
         .get("root")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
-    let (scope, scope_warning) = resolve_scope(args, root)?;
+    let (scope, scope_warning) = resolve_scope(args, root, crate::FileScopeHint::Directory)?;
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
     let page = crate::listing::Page::from_args(args)?;
 
@@ -211,6 +211,27 @@ mod tests {
         assert!(
             err.contains("relative scope") && err.contains("root"),
             "explicit relative scope without root must refuse: {err}"
+        );
+    }
+
+    /// #195: a file passed as `scope` used to fall back to the whole root.
+    #[test]
+    fn tool_list_file_scope_with_root_is_refused() {
+        let project = scratch_project();
+        let args = serde_json::json!({
+            "patterns": ["*.rs"],
+            "scope": "src/main.rs",
+            "root": project.path().to_str().unwrap(),
+        });
+        let err = tool_list(&args).expect_err("a file scope must be refused, not widened to root");
+        assert!(
+            err.contains("scope \"src/main.rs\" is a file")
+                && err.contains("scope to its directory (\"src\")"),
+            "refusal must name the file and its directory: {err}"
+        );
+        assert!(
+            !err.contains("glob"),
+            "tilth_list has no glob parameter to suggest: {err}"
         );
     }
 
