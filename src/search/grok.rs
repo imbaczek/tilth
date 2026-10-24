@@ -2,6 +2,10 @@
 //! dance into one structured response. A1 ships target resolution; A2 assembles
 //! callees/callers/siblings/tests; A3 will format.
 
+#[path = "grok_paging.rs"]
+mod paging;
+pub(crate) use paging::{section_page, Section};
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
@@ -81,8 +85,17 @@ fn resolve_with_source_at_root(
     scope: &Path,
     root: Option<&Path>,
 ) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+    resolve_source_mode(spec, scope, root, false)
+}
+
+fn resolve_source_mode(
+    spec: &str,
+    scope: &Path,
+    root: Option<&Path>,
+    exact_owner: bool,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     match parse_target_spec(spec) {
-        TargetSpec::Symbol(name) => resolve_by_name(&name, scope),
+        TargetSpec::Symbol(name) => resolve_by_name(&name, scope, exact_owner),
         TargetSpec::PathLine { path, line } => {
             let path = if path.is_absolute() {
                 path
@@ -105,11 +118,15 @@ fn resolve_with_source_at_root(
     }
 }
 
-fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, Lang), TilthError> {
+fn resolve_by_name(
+    name: &str,
+    scope: &Path,
+    exact_owner: bool,
+) -> Result<(ResolvedTarget, String, Lang), TilthError> {
     let bare = split_qualified(name);
     if bare != name && !bare.is_empty() {
         let prefix = name[..name.len() - bare.len() - 1].trim_end_matches(':');
-        if let Some(resolved) = resolve_qualified_method(prefix, bare, scope)? {
+        if let Some(resolved) = resolve_qualified_method(prefix, bare, scope, exact_owner)? {
             return Ok(resolved);
         }
         // Keep qualified method precedence in mixed-language checkouts. A Lisp
@@ -136,6 +153,7 @@ fn resolve_qualified_method(
     owner: &str,
     method: &str,
     scope: &Path,
+    exact_owner: bool,
 ) -> Result<Option<(ResolvedTarget, String, Lang)>, TilthError> {
     let (mut definitions, _, _) = super::symbol::find_definitions(method, scope, None, usize::MAX)?;
     super::rank::sort(&mut definitions, method, scope, None);
@@ -155,7 +173,14 @@ fn resolve_qualified_method(
         let Ok(content) = fs::read_to_string(&definition.path) else {
             continue;
         };
-        let entries = get_qualified_entries(&content, lang, owner, method);
+        let entries = if exact_owner {
+            crate::lang::outline::qualified_declarations(&content, lang, owner, Some(method), true)
+                .into_iter()
+                .map(|(entry, _)| entry)
+                .collect()
+        } else {
+            get_qualified_entries(&content, lang, owner, method)
+        };
         count += entries.len();
         if selected.is_none() {
             if let Some(entry) = entries.first() {
@@ -581,41 +606,83 @@ pub(crate) fn grok_with_root(
     caps: GrokCaps,
     root: Option<&Path>,
 ) -> Result<GrokResult, TilthError> {
-    let (target, content, lang) = resolve_with_source_at_root(target_spec, scope, root)?;
+    grok_collect(target_spec, scope, bloom, session, caps, root, None)
+}
+
+fn grok_collect(
+    target_spec: &str,
+    scope: &Path,
+    bloom: &BloomFilterCache,
+    session: &crate::session::Session,
+    caps: GrokCaps,
+    root: Option<&Path>,
+    section: Option<Section>,
+) -> Result<GrokResult, TilthError> {
+    let (target, content, lang) = if section.is_some() {
+        resolve_source_mode(target_spec, scope, root, true)?
+    } else {
+        resolve_with_source_at_root(target_spec, scope, root)?
+    };
     let entries = get_outline_entries(&content, lang);
+    let section_owner = section
+        .filter(|_| lang != Lang::CommonLisp)
+        .and_then(|_| paging::qualified_owner(target_spec));
 
-    // --- Callees -----------------------------------------------------------
-    let callee_names =
-        extract_callee_names(&content, lang, Some((target.start_line, target.end_line)));
-    let resolved = resolve_callees(&callee_names, &target.path, &content, bloom);
-
-    let resolved_names: HashSet<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
-    let externals: Vec<String> = callee_names
-        .iter()
-        .filter(|n| !resolved_names.contains(n.as_str()))
-        .cloned()
-        .collect();
-
-    // The target's path may differ from canonical form (symlinks, `../` segments).
-    // The walker hands us canonical absolute paths in match/callee results; we
-    // canonicalize once so the self-reference filter below can compare cleanly.
-    // Fallback to raw target.path is harmless — comparisons will simply never
-    // match, and recursion will surface in the callers section (still correct,
-    // just unfiltered).
     let canonical_target = target
         .path
         .canonicalize()
         .unwrap_or_else(|_| target.path.clone());
+    let (resolved, externals) = if section.is_none() || section == Some(Section::Callees) {
+        // --- Callees -----------------------------------------------------------
+        let span = section_owner.as_deref().and_then(|owner| {
+            crate::lang::outline::qualified_declarations(
+                &content,
+                lang,
+                owner,
+                Some(&target.name),
+                true,
+            )
+            .into_iter()
+            .find(|(entry, _)| {
+                entry.start_line == target.start_line && entry.signature == target.signature
+            })
+            .map(|(_, span)| span)
+        });
+        let callee_names = if let Some(span) = span {
+            super::callees::extract_callee_names_in_span(&content, lang, &span)
+        } else {
+            extract_callee_names(&content, lang, Some((target.start_line, target.end_line)))
+        };
+        let resolved = resolve_callees(&callee_names, &target.path, &content, bloom);
 
-    // Drop self-references: a recursive call shows up as a "callee" because the
-    // tree-sitter query matches every call expression, including those pointing
-    // back at the target itself. Keep callers (where recursion is meaningful)
-    // and filter callees (where recursion is just noise about the target's own
-    // identifier appearing in its body).
-    let resolved: Vec<ResolvedCallee> = resolved
-        .into_iter()
-        .filter(|c| !is_self_definition(c, &canonical_target, &target))
-        .collect();
+        let resolved_names: HashSet<&str> = resolved.iter().map(|c| c.name.as_str()).collect();
+        let externals: Vec<String> = callee_names
+            .iter()
+            .filter(|n| !resolved_names.contains(n.as_str()))
+            .cloned()
+            .collect();
+
+        // The target's path may differ from canonical form (symlinks, `../` segments).
+        // The walker hands us canonical absolute paths in match/callee results; we
+        // canonicalize once so the self-reference filter below can compare cleanly.
+        // Fallback to raw target.path is harmless — comparisons will simply never
+        // match, and recursion will surface in the callers section (still correct,
+        // just unfiltered).
+
+        // Drop self-references: a recursive call shows up as a "callee" because the
+        // tree-sitter query matches every call expression, including those pointing
+        // back at the target itself. Keep callers (where recursion is meaningful)
+        // and filter callees (where recursion is just noise about the target's own
+        // identifier appearing in its body).
+        let resolved: Vec<ResolvedCallee> = resolved
+            .into_iter()
+            .filter(|c| !is_self_definition(c, &canonical_target, &target))
+            .collect();
+
+        (resolved, externals)
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     let total_callees_internal = resolved.len();
     let total_callees_external = externals.len();
@@ -630,77 +697,102 @@ pub(crate) fn grok_with_root(
     };
 
     // --- Callers + tests (one walk, partitioned by is_test_file) ----------
-    let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
-    let ts_owner = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
-        enclosing_class_name(&entries, target.start_line)
-    } else {
-        None
-    };
-    let ts_importers = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
-        Some(if ts_owner.is_some() {
-            super::deps::find_transitive_importers(&canonical_target, scope)?
+    let (mut prod_callers, mut test_callers): (Vec<_>, Vec<_>) = if section.is_none()
+        || matches!(section, Some(Section::Callers | Section::Tests))
+    {
+        let symbols: HashSet<String> = std::iter::once(target.name.clone()).collect();
+        let ts_owner = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+            section_owner
+                .as_deref()
+                .map(split_qualified)
+                .or_else(|| enclosing_class_name(&entries, target.start_line))
         } else {
-            super::deps::find_importers(&canonical_target, scope)?
-        })
-    } else {
-        None
-    };
-    let raw_callers = if let Some(importers) = &ts_importers {
-        let mut candidates = importers.clone();
-        candidates.insert(canonical_target.clone());
-        super::callers::find_callers_in_files(&candidates, scope, &symbols)
-    } else {
-        // Collect before filtering, partitioning and sorting. A raw-match or
-        // file-size cap can hide real callers and make the totals misleading.
-        find_callers_batch_with_size_limit(&symbols, scope, bloom, None, usize::MAX, u64::MAX)?.0
-    };
-    let mut ts_aliases: HashMap<PathBuf, HashSet<String>> = HashMap::new();
-    if let Some(owner) = ts_owner {
-        let mut resolver =
-            TsExportResolver::new(&canonical_target, owner, &content, lang, &target.name);
-        let receivers: Vec<String> = raw_callers
-            .iter()
-            .filter_map(|(_, c)| c.receiver.clone())
-            .collect();
-        for (_, caller) in &raw_callers {
-            ts_aliases.entry(caller.path.clone()).or_insert_with(|| {
-                ts_owner_aliases(
-                    &caller.path,
-                    &caller.content,
-                    &target.name,
-                    &mut resolver,
-                    &receivers,
-                )
-            });
-        }
-    }
-
-    let prod_and_test: Vec<CallerMatch> = raw_callers
-        .into_iter()
-        .map(|(_, m)| m)
-        .filter(|m| {
-            ts_importers
-                .as_ref()
-                .is_none_or(|importers| m.path == canonical_target || importers.contains(&m.path))
-        })
-        .filter(|m| {
-            ts_owner.is_none_or(|_| {
-                ts_aliases
-                    .get(&m.path)
-                    .is_some_and(|aliases| ts_receiver_matches(m, &target, aliases))
+            None
+        };
+        let ts_importers = if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+            Some(if ts_owner.is_some() {
+                super::deps::find_transitive_importers(&canonical_target, scope)?
+            } else {
+                super::deps::find_importers(&canonical_target, scope)?
             })
-        })
-        .filter(|m| !is_recursive_call_site(m, &canonical_target, &target))
-        .collect();
+        } else {
+            None
+        };
+        let raw_callers = if let Some(importers) = &ts_importers {
+            let mut candidates = importers.clone();
+            candidates.insert(canonical_target.clone());
+            super::callers::find_callers_in_files(&candidates, scope, &symbols)
+        } else {
+            // Collect before filtering, partitioning and sorting. A raw-match or
+            // file-size cap can hide real callers and make the totals misleading.
+            find_callers_batch_with_size_limit(&symbols, scope, bloom, None, usize::MAX, u64::MAX)?
+                .0
+        };
+        let mut ts_aliases: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+        if let Some(owner) = ts_owner {
+            let mut resolver =
+                TsExportResolver::new(&canonical_target, owner, &content, lang, &target.name);
+            let receivers: Vec<String> = raw_callers
+                .iter()
+                .filter_map(|(_, c)| c.receiver.clone())
+                .collect();
+            for (_, caller) in &raw_callers {
+                ts_aliases.entry(caller.path.clone()).or_insert_with(|| {
+                    ts_owner_aliases(
+                        &caller.path,
+                        &caller.content,
+                        &target.name,
+                        &mut resolver,
+                        &receivers,
+                    )
+                });
+            }
+        }
 
-    let (prod_callers, test_callers): (Vec<_>, Vec<_>) = prod_and_test
-        .into_iter()
-        .partition(|m| !is_test_file(&m.path) && !m.in_test);
+        let prod_and_test: Vec<CallerMatch> = raw_callers
+            .into_iter()
+            .map(|(_, m)| m)
+            .filter(|m| {
+                ts_importers.as_ref().is_none_or(|importers| {
+                    m.path == canonical_target || importers.contains(&m.path)
+                })
+            })
+            .filter(|m| {
+                ts_owner.is_none_or(|_| {
+                    ts_aliases
+                        .get(&m.path)
+                        .is_some_and(|aliases| ts_receiver_matches(m, &target, aliases))
+                })
+            })
+            .filter(|m| !is_recursive_call_site(m, &canonical_target, &target))
+            .collect();
+
+        prod_and_test
+            .into_iter()
+            .partition::<Vec<_>, _>(|m| !is_test_file(&m.path) && !m.in_test)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    // The shared walk is necessary to classify sites, but retain only the requested partition.
+    if section == Some(Section::Callers) {
+        test_callers.clear();
+    }
+    if section == Some(Section::Tests) {
+        prod_callers.clear();
+    }
     let total_callers = prod_callers.len();
     let total_tests = test_callers.len();
 
     // --- Siblings ----------------------------------------------------------
-    let siblings_all = collect_siblings(&entries, &target);
+    let siblings_all = if section.is_none() || section == Some(Section::Siblings) {
+        if section.is_some() {
+            paging::section_siblings(&entries, &target, section_owner.as_deref(), &content, lang)
+        } else {
+            collect_siblings(&entries, &target)
+        }
+    } else {
+        Vec::new()
+    };
     let total_siblings = siblings_all.len();
 
     // --- Apply caps --------------------------------------------------------
@@ -738,7 +830,11 @@ pub(crate) fn grok_with_root(
     // Slice the body only once the fallible work above has succeeded: the
     // slice claims the session's dedup slot for this target, and a claim made
     // before a `?` would mark a body that the caller never received.
-    let body = body_with_dedup(&target, &content, session, caps.max_body_lines);
+    let body = if section.is_none() {
+        body_with_dedup(&target, &content, session, caps.max_body_lines)
+    } else {
+        String::new()
+    };
 
     // Record this expansion so a same-session repeat-grok of the same target
     // degrades to a preview rather than re-inlining the full body. Bodies at
@@ -746,8 +842,10 @@ pub(crate) fn grok_with_root(
     // `body_with_dedup`, so this is what marks them for `tilth_search`'s own
     // dedup. Silently skipped on metadata failure — the next call will just
     // re-inline normally.
-    if let Ok(mtime) = std::fs::metadata(&target.path).and_then(|md| md.modified()) {
-        session.record_expand(&target.path, target.start_line, mtime);
+    if section.is_none() {
+        if let Ok(mtime) = std::fs::metadata(&target.path).and_then(|md| md.modified()) {
+            session.record_expand(&target.path, target.start_line, mtime);
+        }
     }
 
     // --- Thin-wrapper auto-expansion --------------------------------------
@@ -757,7 +855,8 @@ pub(crate) fn grok_with_root(
     // callee's body and attach it to the result for the formatter to render.
     // Measure the true definition span, not `body` — `body` may be a dedup-degraded
     // preview on a re-grok, which would otherwise make a large function look thin.
-    let delegate_body = if target.start_line > 0
+    let delegate_body = if section.is_none()
+        && target.start_line > 0
         && (target.end_line.saturating_sub(target.start_line) as usize + 1)
             <= WRAPPER_MAX_BODY_LINES
         && total_callees_internal == 1
@@ -3304,7 +3403,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("tainted.rs");
         fs::write(&path, b"fn alpha() {}\n\x00\x01\x02").unwrap();
-        let err = resolve_by_name("alpha", tmp.path()).unwrap_err();
+        let err = resolve_by_name("alpha", tmp.path(), false).unwrap_err();
         match err {
             TilthError::InvalidQuery { query, .. } => assert_eq!(query, "alpha"),
             other => panic!("expected InvalidQuery, got {other}"),

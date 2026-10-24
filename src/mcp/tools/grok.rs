@@ -12,6 +12,25 @@ pub(in crate::mcp) fn tool_grok(
     bloom: &Arc<BloomFilterCache>,
     session: &Session,
 ) -> Result<String, String> {
+    let page = crate::listing::Page::optional(args)?;
+    let section = args
+        .get("section")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "section must be a string".to_string())
+                .and_then(crate::search::grok::Section::parse)
+        })
+        .transpose()?;
+    if section.is_none() && page.is_some() {
+        return Err(
+            "Grok offset/limit require a section: callers, callees, siblings, or tests".into(),
+        );
+    }
+    let budget = args
+        .get("budget")
+        .map(|value| value.as_u64().ok_or("budget must be a nonnegative integer"))
+        .transpose()?;
     let target = args
         .get("target")
         .and_then(|v| v.as_str())
@@ -22,6 +41,23 @@ pub(in crate::mcp) fn tool_grok(
         .map(std::path::Path::new);
     let (scope, scope_warning) = resolve_scope(args, root, crate::FileScopeHint::Directory)?;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+    if let Some(section) = section {
+        let page = page.unwrap_or(crate::listing::Page::new(0, crate::listing::DEFAULT_LIMIT)?);
+        // Include scope warnings in the final budget so navigation never survives a hidden page.
+        return crate::search::grok::section_page(
+            target,
+            &scope,
+            bloom,
+            session,
+            root,
+            section,
+            page,
+            budget,
+            true,
+            scope_warning.as_deref().unwrap_or(""),
+        )
+        .map_err(|error| error.to_string());
+    }
     let caps = if full {
         crate::search::grok::GrokCaps::full()
     } else {
@@ -32,7 +68,10 @@ pub(in crate::mcp) fn tool_grok(
         .map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
     output.push_str(&crate::search::grok::format_grok(&result, &scope));
-    Ok(output)
+    Ok(match budget {
+        Some(budget) => crate::budget::apply(&output, budget),
+        None => output,
+    })
 }
 
 #[cfg(test)]

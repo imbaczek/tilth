@@ -35,6 +35,23 @@ pub fn extract_callee_names(
     lang: Lang,
     def_range: Option<(u32, u32)>,
 ) -> Vec<String> {
+    extract_callee_names_inner(content, lang, def_range, None)
+}
+
+pub(super) fn extract_callee_names_in_span(
+    content: &str,
+    lang: Lang,
+    span: &std::ops::Range<usize>,
+) -> Vec<String> {
+    extract_callee_names_inner(content, lang, None, Some(span))
+}
+
+fn extract_callee_names_inner(
+    content: &str,
+    lang: Lang,
+    def_range: Option<(u32, u32)>,
+    span: Option<&std::ops::Range<usize>>,
+) -> Vec<String> {
     let Some(ts_lang) = outline_language(lang) else {
         return Vec::new();
     };
@@ -71,6 +88,11 @@ pub fn extract_callee_names(
                     continue;
                 }
 
+                if span.is_some_and(|range| {
+                    cap.node.start_byte() < range.start || cap.node.end_byte() > range.end
+                }) {
+                    continue;
+                }
                 // 1-indexed line number of the capture
                 let line = cap.node.start_position().row as u32 + 1;
 

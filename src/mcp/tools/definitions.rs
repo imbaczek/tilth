@@ -237,10 +237,27 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Existing directory to narrow the search, never a file. Omit for the whole project."
                     },
+                    "section": {
+                        "type":"string",
+                        "enum":["callers","callees","siblings","tests"],
+                        "description":"Return only this relationship section plus compact target context, without expanding or recording source bodies. Omit for the existing overview."
+                    },
+                    "offset": {
+                        "type":"integer","minimum":0,"default":0,
+                        "description":"Skip N individual records in the selected section (zero-based). Requires section. Keep target/root/scope and source unchanged between pages."
+                    },
+                    "limit": {
+                        "type":"integer","minimum":1,"default":50,
+                        "description":"Records per selected-section page (default 50), after full collection/filtering/sorting. Requires section. Overrides overview/full caps. If budget truncates, retry the same offset with a smaller limit or a larger budget."
+                    },
+                    "budget": {
+                        "type":"integer","minimum":0,
+                        "description":"Maximum output tokens; section pages default to the standard response budget."
+                    },
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Widen caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8)."
+                        "description": "Widen overview caps: 50 callers, 30 callees, 30 siblings, 30 tests (default 5/5/8/8). Section pages collect all records regardless of full; their limit defaults to 50."
                     },
                     "root": {
                         "type": "string",

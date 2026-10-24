@@ -397,6 +397,52 @@ pub fn run_grok(target_spec: &str, scope: &Path, full: bool) -> Result<String, T
     Ok(search::grok::format_grok(&result, scope))
 }
 
+/// Retrieve a single Grok relationship section without expanding any source bodies.
+pub fn run_grok_paginated(
+    target: &str,
+    scope: &Path,
+    full: bool,
+    section: Option<&str>,
+    page: Option<(usize, Option<usize>)>,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let invalid = |reason| TilthError::InvalidQuery {
+        query: target.into(),
+        reason,
+    };
+    let page = page
+        .map(listing::Page::from_tuple)
+        .transpose()
+        .map_err(invalid)?;
+    let Some(section) = section else {
+        if page.is_some() {
+            return Err(invalid(
+                "Grok offset/limit require a section: callers, callees, siblings, or tests".into(),
+            ));
+        }
+        let output = run_grok(target, scope, full)?;
+        return Ok(match budget {
+            Some(budget) => crate::budget::apply(&output, budget),
+            None => output,
+        });
+    };
+    let section = search::grok::Section::parse(section).map_err(invalid)?;
+    let page = page.unwrap_or(listing::Page::new(0, listing::DEFAULT_LIMIT).map_err(invalid)?);
+    let root = std::env::current_dir().ok();
+    search::grok::section_page(
+        target,
+        scope,
+        &index::bloom::BloomFilterCache::new(),
+        &session::Session::new(),
+        root.as_deref(),
+        section,
+        page,
+        budget,
+        false,
+        "",
+    )
+}
+
 fn run_inner(
     query: &str,
     scope: &Path,

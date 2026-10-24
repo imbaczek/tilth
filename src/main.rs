@@ -271,9 +271,19 @@ enum Command {
         #[arg(long)]
         budget: Option<u64>,
 
-        /// Widen output caps (more callers, callees, siblings, tests).
+        /// Widen overview caps; explicit section pages always collect the complete section.
         #[arg(long)]
         full: bool,
+
+        /// Return only this relationship section; source bodies are not expanded.
+        #[arg(long,value_parser=["callers","callees","siblings","tests"])]
+        section: Option<String>,
+        /// Skip N individual records in the selected section (zero-based).
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Records per section page (default 50). Requires --section.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroUsize>,
     },
 }
 
@@ -385,14 +395,26 @@ fn main() {
                 scope,
                 full,
                 budget,
+                section,
+                offset,
+                limit,
             } => {
                 let scope =
                     cli_scope(scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
-                match tilth::run_grok(&target, &scope, full) {
-                    Ok(output) => emit_output(
-                        &apply_optional_budget(output, budget.or(cli.search.budget)),
-                        io::stdout().is_terminal(),
-                    ),
+                let section = section.or(cli.search.section);
+                let offset = offset.or(cli.search.offset);
+                let limit = limit.or(cli.search.limit);
+                let page = (offset.is_some() || limit.is_some())
+                    .then_some((offset.unwrap_or(0), limit.map(std::num::NonZeroUsize::get)));
+                match tilth::run_grok_paginated(
+                    &target,
+                    &scope,
+                    full || cli.search.full,
+                    section.as_deref(),
+                    page,
+                    budget.or(cli.search.budget),
+                ) {
+                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {
                         tilth::diagnostic!("grok error: {e}");
                         process::exit(e.exit_code());

@@ -219,7 +219,15 @@ tilth grok get_typed_signature --scope fastapi --budget 2000
 
 If supplied in both positions, the value after `grok` takes precedence.
 
-In MCP mode, use the `tilth_grok` tool.
+Use `--section callers`, `callees`, `siblings`, or `tests` to retrieve just one relationship list, without expanding the target or delegate bodies:
+
+```bash
+tilth grok get_typed_signature --scope fastapi --section callers --offset 50 --limit 25
+```
+
+Section pages default to 50 individual records. Offsets are zero-based, and `--offset`/`--limit` require `--section`. Internal and external callees share one list; siblings follow source order. `--full` still widens the overview but does not cap a selected section. Keep the target selector, scope, and source unchanged between pages; use the file reader's `--section` option for source bodies.
+
+In MCP mode, use `tilth_grok` with the same `section`, `offset`, `limit`, and optional `budget` fields. Continuation arguments preserve qualified target selectors, including methods that share a source line.
 
 ### Session memory
 

@@ -1345,6 +1345,20 @@ pub(crate) fn get_qualified_entries(
     owner: &str,
     name: &str,
 ) -> Vec<OutlineEntry> {
+    qualified_declarations(content, lang, owner, Some(name), false)
+        .into_iter()
+        .map(|(entry, _)| entry)
+        .collect()
+}
+
+/// Qualified declaration identities with exact byte spans for same-line members.
+pub(crate) fn qualified_declarations(
+    content: &str,
+    lang: Lang,
+    owner: &str,
+    name: Option<&str>,
+    exact_owner: bool,
+) -> Vec<(OutlineEntry, std::ops::Range<usize>)> {
     let Some(grammar) = outline_language(lang) else {
         return Vec::new();
     };
@@ -1361,12 +1375,13 @@ pub(crate) fn get_qualified_entries(
     loop {
         let node = cursor.node();
         if node.kind() != "export_statement"
-            && (crate::lang::spec::spec(lang).definitions.extract_name)(node, &lines).as_deref()
-                == Some(name)
+            && (crate::lang::spec::spec(lang).definitions.extract_name)(node, &lines)
+                .is_some_and(|found| name.is_none_or(|name| name == found))
             && declaration_owner_matches(node, &lines, lang, owner)
+            && (!exact_owner || declaration_owner_path_matches(node, &lines, lang, owner))
         {
             if let Some(entry) = node_to_entry(node, &lines, lang, 0) {
-                entries.push(entry);
+                entries.push((entry, node.byte_range()));
             }
         }
         if cursor.goto_first_child() {
@@ -1380,6 +1395,72 @@ pub(crate) fn get_qualified_entries(
                 return entries;
             }
         }
+    }
+}
+
+fn declaration_owner_path_matches(
+    node: tree_sitter::Node,
+    lines: &[&str],
+    lang: Lang,
+    owner: &str,
+) -> bool {
+    let expected: Vec<_> = owner
+        .split([':', '.'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    if expected.len() <= 1 {
+        return true;
+    }
+    let mut names = Vec::new();
+    let mut current = node.parent();
+    while let Some(container) = current {
+        let name = match container.kind() {
+            "impl_item" => find_child_text(container, "type", lines)
+                .map(|name| name.split('<').next().unwrap_or(&name).trim().to_string()),
+            "class_declaration"
+            | "abstract_class_declaration"
+            | "class_definition"
+            | "class"
+            | "struct_item"
+            | "struct_declaration"
+            | "interface_declaration"
+            | "trait_item"
+            | "trait_declaration"
+            | "trait_definition"
+            | "protocol_declaration"
+            | "object_declaration"
+            | "object_definition"
+            | "mod_item"
+            | "module"
+            | "namespace_declaration"
+            | "namespace_definition"
+            | "file_scoped_namespace_declaration"
+            | "internal_module" => find_child_text(container, "name", lines)
+                .or_else(|| find_child_text(container, "identifier", lines)),
+            _ if lang == Lang::Elixir
+                && crate::lang::elixir::is_elixir_definition(container, lines) =>
+            {
+                crate::lang::elixir::extract_elixir_definition_name(container, lines)
+            }
+            _ => None,
+        };
+        if let Some(name) = name {
+            names.push(name);
+        }
+        current = container.parent();
+    }
+    let actual: Vec<_> = names
+        .iter()
+        .rev()
+        .flat_map(|name| name.split([':', '.']).filter(|part| !part.is_empty()))
+        .collect();
+    // Qualifiers can start with semantic modules/packages absent from this
+    // file's AST (e.g. api::Type in api.rs). Compare the available owner suffix,
+    // while still distinguishing full nested owners such as Left.Inner/Right.Inner.
+    if actual.len() < expected.len() {
+        expected.ends_with(&actual)
+    } else {
+        actual.ends_with(&expected)
     }
 }
 

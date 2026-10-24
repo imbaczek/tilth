@@ -536,7 +536,7 @@ impl Drop for Mcp {
 }
 
 #[test]
-fn mcp_read_deps_and_diff_expose_and_apply_pages_without_changing_grok() {
+fn mcp_read_deps_and_diff_expose_and_apply_pages() {
     let root = tempfile::tempdir().unwrap();
     let path = patch(root.path(), 3, 4);
     fs::write(
@@ -566,7 +566,11 @@ fn mcp_read_deps_and_diff_expose_and_apply_pages_without_changing_grok() {
         .iter()
         .find(|tool| tool["name"] == "tilth_grok")
         .unwrap();
-    assert!(grok["inputSchema"]["properties"].get("offset").is_none());
+    assert_eq!(grok["inputSchema"]["properties"]["offset"]["minimum"], 0);
+    assert_eq!(
+        grok["inputSchema"]["properties"]["section"]["enum"],
+        json!(["callers", "callees", "siblings", "tests"])
+    );
     for mode in ["auto", "signature", "full", "stripped"] {
         let output = client.tool(
             "tilth_read",
