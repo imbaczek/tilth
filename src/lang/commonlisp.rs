@@ -452,6 +452,48 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn commonlisp_repeated_bar_comments_hide_definitions() {
+        for comment in [
+            "#|| (defun hidden () nil) ||#",
+            "#|||\n(defun hidden () nil)\n|||#",
+            "#||#",
+        ] {
+            let source = format!("{comment}\n(defun visible () t)\n");
+            let entries = get_outline_entries(&source, Lang::CommonLisp);
+            assert_eq!(
+                entries
+                    .iter()
+                    .map(|entry| entry.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["visible"],
+                "{source}"
+            );
+            assert!(crate::lang::commonlisp::usage_lines(&source, "hidden").is_empty());
+        }
+    }
+
+    #[test]
+    fn commonlisp_pending_loop_fixes_preserve_surrounding_definitions() {
+        let source = "(defun named-consumer (xs)\n (loop named #:outer for x in xs when x collect x end collect 0))\n(defun quantified (xs)\n (loop for x in xs always (predicate x))\n (loop for x in xs never (predicate x))\n (loop for x in xs thereis (predicate x)))\n(defun after-loops () t)\n";
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&LANGUAGE.into()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        assert!(
+            !tree.root_node().has_error(),
+            "{}",
+            tree.root_node().to_sexp()
+        );
+        let entries = get_outline_entries(source, Lang::CommonLisp);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["named-consumer", "quantified", "after-loops"]
+        );
+    }
+
+    #[test]
     fn commonlisp_definitions_and_docstrings() {
         let source = r#"(in-package :demo)
 (defun hello-world (name &optional (x "a  b")) "Greets NAME." (format nil "~a" name))
@@ -642,6 +684,7 @@ mod tests {
         let mut simple_forms = 0usize;
         let mut found_simple_forms = 0usize;
         let mut missed = Vec::new();
+        let mut report = std::collections::BTreeMap::new();
         for file in ignore::WalkBuilder::new(root.join("src")).build() {
             let file = file.unwrap();
             if !file.file_type().is_some_and(|kind| kind.is_file())
@@ -656,6 +699,17 @@ mod tests {
             let entries = outline(tree.root_node(), &lines);
             files += 1;
             definitions += entries.len();
+            report.insert(
+                file.path()
+                    .strip_prefix(&root)
+                    .unwrap()
+                    .display()
+                    .to_string(),
+                entries
+                    .iter()
+                    .map(|entry| (entry.name.clone(), entry.start_line, entry.end_line))
+                    .collect::<Vec<_>>(),
+            );
             for entry in &entries {
                 assert!(
                     entry.start_line <= entry.end_line && entry.end_line as usize <= lines.len(),
@@ -681,6 +735,9 @@ mod tests {
         eprintln!("SBCL: {files} Lisp files; {definitions} definitions; {parser_errors} files with grammar errors; {found_simple_forms}/{simple_forms} column-zero DEFUN/DEFMACRO forms indexed");
         for miss in missed {
             eprintln!("audit miss: {miss}");
+        }
+        if let Some(path) = std::env::var_os("TILTH_COMMONLISP_AUDIT_REPORT") {
+            serde_json::to_writer(std::fs::File::create(path).unwrap(), &report).unwrap();
         }
         assert!(files > 100 && definitions > 1000);
         assert!(

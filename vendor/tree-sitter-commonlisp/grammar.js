@@ -122,36 +122,40 @@ function optSeq(...args) {
     return optional(seq(...args))
 }
 
-// Share reader forms while keeping nested lambda-list forms as data.
+
+
+// Lambda lists are data: their nested lists must not be parsed as DEFUN or LOOP.
 function form($, list) {
-    return seq(optional('#'), choice(
-        $.num_lit,
-        $.fancy_literal,
-        $.vec_lit,
-        $.kwd_lit,
-        alias(seq(field('open', '#'), optional(/\d+[aA]/), list), $.vec_lit),
-        $.str_lit,
-        $.self_referential_reader_macro,
-        $.char_lit,
-        $.nil_lit,
-        $.path_lit,
-        $.sym_lit,
-        alias('lambda', $.sym_lit),
-        alias('loop', $.sym_lit),
-        $.package_lit,
-        list,
-        $.set_lit,
-        $.read_cond_lit,
-        $.splicing_read_cond_lit,
-        $.var_quoting_lit,
-        $.quoting_lit,
-        $.syn_quoting_lit,
-        $.unquote_splicing_lit,
-        $.unquoting_lit,
-        $.include_reader_macro,
-        $.complex_num_lit,
-        ".",
-    ));
+    return seq(optional('#'),
+                choice(
+                    $.num_lit,
+                    $.fancy_literal,
+                    $.vec_lit,
+                    $.kwd_lit,
+                    // No idea why this is necessary...It is never used but triggers some background magic
+                    alias(seq(field('open', '#'), optional(/\d+[aA]/), list), $.vec_lit),
+                    $.str_lit,
+                    $.self_referential_reader_macro,
+                    $.char_lit,
+                    $.nil_lit,
+                    $.path_lit,
+                    $.sym_lit,
+                    alias('lambda', $.sym_lit),
+                    alias('loop', $.sym_lit),
+                    $.package_lit,
+                    list,
+                    $.set_lit,
+                    $.read_cond_lit,
+                    $.splicing_read_cond_lit,
+                    $.var_quoting_lit,
+                    $.quoting_lit,
+                    $.syn_quoting_lit,
+                    $.unquote_splicing_lit,
+                    $.unquoting_lit,
+                    $.include_reader_macro,
+                    $.complex_num_lit,
+                    ".",
+                ));
 }
 
 module.exports = grammar(clojure, {
@@ -180,7 +184,7 @@ module.exports = grammar(clojure, {
 
 
     rules: {
-        block_comment: _ => token(seq('#|', repeat(choice(/[^|]/, /\|[^#]/)), '|#')),
+        block_comment: _ => token(seq('#|', /[^|]*\|+([^#|][^|]*\|+)*/, '#')),
 
         fancy_literal: _ => token(seq('|', repeat(/[^|]/), '|')),
 
@@ -285,11 +289,12 @@ module.exports = grammar(clojure, {
             repeat1($._for_part)), loopSymbol('and')),
         with_clause: $ => seq(loopSymbol('with'), repeat($._gap), choice($._form, seq($._form, repeat($._gap), field('type', $._form))), repeat($._gap), optSeq(loopSymbol("="), repeat($._gap)), optSeq($._form, repeat($._gap))),
         do_clause: $ => prec.left(seq(loopSymbol('do'), repeat1(prec.left(seq(repeat($._gap), $._form, repeat($._gap)))))),
-        while_clause: $ => prec.left(seq(choice(loopSymbol('while'), loopSymbol('until')), repeat($._gap), $._form)),
+        while_clause: $ => prec.left(seq(choice(loopSymbol('while'), loopSymbol('until'), loopSymbol('always'), loopSymbol('thereis'), loopSymbol('never')), repeat($._gap), $._form)),
         repeat_clause: $ => prec.left(seq(loopSymbol('repeat'), repeat($._gap), $._form)),
-        condition_clause: $ => prec.left(choice(seq(choice(loopSymbol('when'), loopSymbol('if'), loopSymbol('unless'), loopSymbol('always'), loopSymbol('thereis'), loopSymbol('never')), repeat($._gap), $._form), loopSymbol("else"))),
+        condition_clause: $ => prec.left(choice(seq(choice(loopSymbol('when'), loopSymbol('if'), loopSymbol('unless')), repeat($._gap), $._form), loopSymbol("else"), loopSymbol("end"))),
         accumulation_clause: $ => seq($.accumulation_verb, repeat($._gap), $._form, optional(seq(repeat($._gap), loopSymbol('into'), repeat($._gap), $._form))),
         termination_clause: $ => prec.left(seq(choice(loopSymbol('finally'), loopSymbol('return'), loopSymbol('initially')), repeat($._gap), $._form)),
+        loop_named_clause: $ => seq(loopSymbol('named'), repeat($._gap), optional('#'), choice($.sym_lit, $.package_lit, $.fancy_literal, $.kwd_lit, $.nil_lit)),
 
 
         loop_clause: $ =>
@@ -311,7 +316,11 @@ module.exports = grammar(clojure, {
                 seq(field('open', "("),
                     optional($._gap),
                     clSymbol('loop'),
-                    repeat(choice($.loop_clause, $._gap)),
+                    repeat($._gap),
+                    optional(seq(
+                        choice($.loop_named_clause, $.loop_clause),
+                        repeat(choice($.loop_clause, $._gap)),
+                    )),
                     field('close', ")"))),
 
         defun_keyword: _ => prec(10, clSymbol(choice('defun', 'defmacro', 'defgeneric', 'defmethod'))),
