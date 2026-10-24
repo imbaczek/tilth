@@ -33,7 +33,7 @@ pub(in crate::mcp) fn tool_search(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(2) as usize;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
-    let ignored_page =
+    let page_requested =
         kind != "callers" && (args.get("offset").is_some() || args.get("limit").is_some());
     let offset = caller_page_argument(args, "offset", 0, 0)?;
     let limit = caller_page_argument(args, "limit", if full { 100 } else { 10 }, 1)?;
@@ -60,12 +60,23 @@ pub(in crate::mcp) fn tool_search(
         .map_err(|e| e.to_string())?;
         let mut result = scope_warning.unwrap_or_default();
         result.push_str(&output);
-        let result = if ignored_page {
+        let result = if page_requested {
             crate::with_ignored_paging_notice(result)
         } else {
             result
         };
         return Ok(apply_budget(&result, budget));
+    }
+
+    if page_requested && matches!(kind, "symbol" | "content" | "regex") {
+        let page = crate::listing::Page::new(offset, limit)?;
+        let output = crate::search::paging::search(
+            query, kind, &scopes, context, glob, page, cache, session, bloom, expand, budget, true,
+        )
+        .map_err(|e| e.to_string())?;
+        let result = format!("{}{output}", scope_warning.unwrap_or_default());
+        // A scope warning can itself make a previously complete page exceed budget.
+        return Ok(crate::search::paging::apply_final_budget(&result, budget));
     }
 
     let output = match kind {
@@ -206,7 +217,7 @@ pub(in crate::mcp) fn tool_search(
         return Ok(crate::budget::apply(&caller_mcp_navigation(&safe), budget));
     }
     result.push_str(&output);
-    let result = if ignored_page {
+    let result = if page_requested {
         crate::with_ignored_paging_notice(result)
     } else {
         result
@@ -365,8 +376,8 @@ mod tests {
                 let mut args = serde_json::json!({"query":"hot","kind":kind,"scope":root.path()});
                 args[name] = 1.into();
                 let output = tool_search(&args, &cache, &session, &bloom).unwrap();
-                assert!(output.contains("offset and limit ignored"), "{output}");
-                assert!(!output.contains("Next page:"), "{output}");
+                assert!(output.contains("Showing matches"), "{output}");
+                assert!(!output.contains("offset and limit ignored"), "{output}");
             }
         }
     }
@@ -1361,7 +1372,7 @@ mod tolerant_paging_tests {
             let output = tool_search(
                 &serde_json::json!({
                     "root":root.path(), "query":"hot", "kind":kind,
-                    "offset":999_999, "limit":1, "budget":200
+                    "offset":0, "limit":1, "budget":200
                 }),
                 &cache,
                 &session,
@@ -1369,7 +1380,7 @@ mod tolerant_paging_tests {
             )
             .unwrap();
             assert!(
-                output.contains("offset and limit ignored") && output.contains("code.rs"),
+                output.contains("Showing matches 1-1 of 1") && output.contains("code.rs"),
                 "{output}"
             );
             assert!(output.len() <= 200 * 4 + 1, "{output}");
@@ -1390,6 +1401,174 @@ mod tolerant_paging_tests {
         assert!(
             output.contains("offset and limit ignored") && output.contains("body"),
             "{output}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ranked_pagination_tests {
+    use super::*;
+
+    fn run(root: &std::path::Path, extra: Value) -> String {
+        let mut args = serde_json::json!({"root":root,"query":"needle","expand":0,"budget":20000});
+        let Value::Object(extra) = extra else {
+            panic!("test arguments must be an object")
+        };
+        args.as_object_mut().unwrap().extend(extra);
+        tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn all_kinds_cover_ranked_union_beyond_old_caps_without_overlap() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("nested")).unwrap();
+        for i in (0..137).rev() {
+            std::fs::write(
+                root.path().join("nested").join(format!("unit{i:03}.rs")),
+                "pub fn needle() {}\n",
+            )
+            .unwrap();
+        }
+        for kind in ["symbol", "content", "regex"] {
+            let mut pages = Vec::new();
+            for offset in (0..137).step_by(17) {
+                let output = run(
+                    root.path(),
+                    serde_json::json!({"kind":kind,"scopes":[".","nested"],"offset":offset,"limit":17}),
+                );
+                assert!(output.contains("of 137"), "{output}");
+                if offset + 17 < 137 {
+                    assert!(
+                        output.contains(&format!(r#""offset":{}"#, offset + 17)),
+                        "{output}"
+                    );
+                    assert!(!output.contains("--offset"), "{output}");
+                    assert!(output.contains(&format!(r#""kind":"{kind}""#)), "{output}");
+                } else {
+                    assert!(output.contains("End of listing."), "{output}");
+                }
+                assert!(!output.contains("ignored"), "{output}");
+                pages.push(output);
+            }
+            let joined = pages.join("\n");
+            for i in 0..137 {
+                assert_eq!(
+                    joined.matches(&format!("unit{i:03}.rs:")).count(),
+                    1,
+                    "{kind}: unit{i:03}"
+                );
+            }
+            let beyond = run(
+                root.path(),
+                serde_json::json!({"kind":kind,"offset":usize::MAX,"limit":1}),
+            );
+            assert!(
+                beyond.contains("Showing matches 0 of 137") && !beyond.contains("unit000.rs:"),
+                "{beyond}"
+            );
+            let repeat = run(
+                root.path(),
+                serde_json::json!({"kind":kind,"scopes":["nested","."],"offset":17,"limit":17}),
+            );
+            for i in 0..137 {
+                let label = format!("unit{i:03}.rs:");
+                assert_eq!(
+                    repeat.contains(&label),
+                    pages[1].contains(&label),
+                    "{kind}: {label}"
+                );
+            }
+            let tight = run(
+                root.path(),
+                serde_json::json!({"kind":kind,"offset":0,"limit":137,"budget":150}),
+            );
+            assert!(
+                !tight.contains("Next page:") && !tight.contains("End of listing."),
+                "{tight}"
+            );
+            assert!(
+                tight.contains("retry the same offset with a smaller limit"),
+                "{tight}"
+            );
+            let full_default = run(
+                root.path(),
+                serde_json::json!({"kind":kind,"full":true,"offset":0}),
+            );
+            assert!(
+                full_default.contains("Showing matches 1-100 of 137"),
+                "{full_default}"
+            );
+            let default = run(root.path(), serde_json::json!({"kind":kind,"offset":0}));
+            assert!(default.contains("Showing matches 1-10 of 137"), "{default}");
+            let explicit = run(
+                root.path(),
+                serde_json::json!({"kind":kind,"full":true,"offset":0,"limit":120}),
+            );
+            assert!(
+                explicit.contains("Showing matches 1-120 of 137"),
+                "{explicit}"
+            );
+        }
+    }
+
+    #[test]
+    fn multi_target_pages_and_partial_scope_errors_keep_navigation_safe() {
+        let root = tempfile::tempdir().unwrap();
+        for i in 0..12 {
+            std::fs::write(
+                root.path().join(format!("unit{i:03}.rs")),
+                "pub fn needle() {}\npub fn other() {}\n",
+            )
+            .unwrap();
+        }
+        let output = run(
+            root.path(),
+            serde_json::json!({"query":"needle,other","offset":5,"limit":3}),
+        );
+        assert_eq!(
+            output.matches("Showing matches 6-8 of 12").count(),
+            2,
+            "{output}"
+        );
+        assert!(
+            output.contains(r#""query":"needle""#) && output.contains(r#""query":"other""#),
+            "{output}"
+        );
+        let partial = run(
+            root.path(),
+            serde_json::json!({"scopes":[".","missing"],"offset":2,"limit":3}),
+        );
+        assert!(
+            partial.contains("## Scope errors") && partial.contains("missing"),
+            "{partial}"
+        );
+        assert!(partial.contains("at least 12 matches"), "{partial}");
+        assert!(partial.contains("Pagination is incomplete"), "{partial}");
+        assert!(
+            !partial.contains("Next page:") && !partial.contains("End of listing."),
+            "{partial}"
+        );
+        let last_partial = run(
+            root.path(),
+            serde_json::json!({"scopes":[".","missing"],"offset":10,"limit":3}),
+        );
+        assert!(
+            !last_partial.contains("Next page:") && !last_partial.contains("End of listing."),
+            "{last_partial}"
+        );
+        let tight = run(
+            root.path(),
+            serde_json::json!({"query":"needle,other","offset":0,"limit":12,"budget":150}),
+        );
+        assert!(
+            !tight.contains("Next page:") && !tight.contains("End of listing."),
+            "{tight}"
         );
     }
 }

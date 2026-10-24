@@ -246,7 +246,7 @@ pub fn with_ignored_paging_notice(mut output: String) -> String {
     output
 }
 
-/// Run queries with optional directory or automatic Markdown outline pagination.
+/// Run queries with optional ranked search, directory or Markdown outline pagination.
 /// Other views accept valid paging arguments and report that they are ignored.
 pub fn run_expanded_scopes_with_listing(
     query: &str,
@@ -488,8 +488,63 @@ fn run_inner_scopes(
             }
         })?;
     }
-    let ignored_search_page =
-        listing_page.is_some() && !matches!(query_type, QueryType::FilePath(_));
+    let ignored_glob_page = listing_page.is_some() && matches!(query_type, QueryType::Glob(_));
+    if let Some((offset, limit)) =
+        listing_page.filter(|_| !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_)))
+    {
+        let parts: Vec<_> = query
+            .split(',')
+            .map(str::trim)
+            .filter(|part| !part.is_empty())
+            .collect();
+        let all_identifiers = parts.iter().all(|part| classify::is_identifier(part));
+        if parts.len() > 5 && all_identifiers {
+            return Err(TilthError::InvalidQuery {
+                query: query.into(),
+                reason: "multi-symbol search supports 2-5 symbols".into(),
+            });
+        }
+        let multi_symbol = query.contains(',') && (2..=5).contains(&parts.len()) && all_identifiers;
+        let (text, kind) = if multi_symbol {
+            (query, "symbol")
+        } else {
+            match &query_type {
+                QueryType::Symbol(text) => (text.as_str(), "symbol"),
+                QueryType::Content(text) => (text.as_str(), "content"),
+                QueryType::Regex(text) => (text.as_str(), "regex"),
+                QueryType::Concept(text) => (text.as_str(), "concept"),
+                QueryType::Fallthrough(text) => (text.as_str(), "fallthrough"),
+                _ => unreachable!("search query"),
+            }
+        };
+        let page = listing::Page::new(offset, limit.unwrap_or(if cli_full { 100 } else { 10 }))
+            .map_err(|reason| TilthError::InvalidQuery {
+                query: query.into(),
+                reason,
+            })?;
+        // Keep the CLI's existing expansion floor for comma-separated symbols.
+        let expand = if multi_symbol && expand == 0 {
+            2
+        } else {
+            expand
+        };
+        let session = session::Session::new();
+        let bloom = index::bloom::BloomFilterCache::new();
+        return search::paging::search(
+            text,
+            kind,
+            scopes,
+            None,
+            glob,
+            page,
+            cache,
+            &session,
+            &bloom,
+            expand,
+            budget_tokens,
+            false,
+        );
+    }
     let use_expanded =
         expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
 
@@ -528,11 +583,6 @@ fn run_inner_scopes(
                 cli_full,
                 budget_tokens,
             )?;
-            let output = if ignored_search_page {
-                with_ignored_paging_notice(output)
-            } else {
-                output
-            };
             return match budget_tokens {
                 Some(budget) => Ok(budget::apply(&output, budget)),
                 None => Ok(output),
@@ -623,7 +673,7 @@ fn run_inner_scopes(
             let mut failures = Vec::new();
             for scope in scopes {
                 match search::search_glob(&pattern, scope).map(|output| {
-                    if ignored_search_page {
+                    if ignored_glob_page {
                         with_ignored_paging_notice(output)
                     } else {
                         output
@@ -658,11 +708,6 @@ fn run_inner_scopes(
         _ => run_query_basic(&query_type, scopes, cache, glob, cli_full)?,
     };
 
-    let output = if ignored_search_page {
-        with_ignored_paging_notice(output)
-    } else {
-        output
-    };
     // Expanded search already fits to budget; this preserves the no-op fast path.
     match budget_tokens {
         Some(budget) => Ok(budget::apply(&output, budget)),

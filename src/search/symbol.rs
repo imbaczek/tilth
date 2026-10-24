@@ -161,6 +161,27 @@ pub(super) fn search_collected(
         )
     };
 
+    search_with_thresholds(query, scope, context, glob, def_threshold, usage_threshold)
+}
+
+/// Paging must inspect every eligible file so ranking stays stable across pages.
+pub(super) fn search_complete(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+) -> Result<SearchResult, TilthError> {
+    search_with_thresholds(query, scope, context, glob, usize::MAX, usize::MAX)
+}
+
+fn search_with_thresholds(
+    query: &str,
+    scope: &Path,
+    context: Option<&Path>,
+    glob: Option<&str>,
+    def_threshold: usize,
+    usage_threshold: usize,
+) -> Result<SearchResult, TilthError> {
     // Compile regex once, share across both arms
     let word_pattern = format!(r"\b{}\b", regex_syntax::escape(query));
     let matcher = RegexMatcher::new(&word_pattern).map_err(|e| TilthError::InvalidQuery {

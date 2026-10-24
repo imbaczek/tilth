@@ -43,7 +43,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "enum": ["symbol", "content", "regex", "callers"],
                         "default": "symbol",
-                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find ranked call sites, with offset/limit pagination per target."
+                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find ranked call sites. Every kind supports offset/limit pagination per target."
                     },
                     "expand": {
                         "type": "number",
@@ -53,18 +53,18 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "full": {
                         "type": "boolean",
                         "default": false,
-                        "description": "Widen the match cap from 10 to 100 per query, for every kind. For callers, an explicit limit overrides this default page size. Costs tokens — use it when 10 matches cannot answer the question."
+                        "description": "Widen the match cap from 10 to 100 per query, for every kind. An explicit limit overrides this default page size. Costs tokens — use it when 10 matches cannot answer the question."
                     },
                     "offset": {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Skip N ranked call sites per target (zero-based). Applied for kind: callers; accepted but ignored for other kinds with a notice. Keep query, scope, context and filters unchanged between pages."
+                        "description": "Skip N ranked matches per target (zero-based), after combining scopes and deduplicating. Applies to every search kind. Keep query, scope, context and filters unchanged between pages."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Call sites per page per target. Applied for kind: callers; accepted but ignored for other kinds with a notice. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
+                        "description": "Ranked matches per page per target. Applies to every search kind. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
                     },
                     "context": {
                         "type": "string",
@@ -416,7 +416,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 mod tests {
     use super::*;
     #[test]
-    fn search_schema_exposes_caller_pagination() {
+    fn search_schema_exposes_pagination_for_every_search_kind() {
         let tools = tool_definitions(false);
         let search = tools
             .iter()
@@ -429,7 +429,7 @@ mod tests {
             assert!(properties[name]["description"]
                 .as_str()
                 .unwrap()
-                .contains("callers"));
+                .contains("every search kind"));
         }
     }
 

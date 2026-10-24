@@ -92,12 +92,12 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Skip N directory entries, automatic Markdown headings, or ranked call sites per scope (0-based).
+    /// Skip N ranked search matches, directory entries, or automatic Markdown headings (0-based).
     /// Accepted but ignored on other views (with a notice).
     #[arg(long)]
     offset: Option<usize>,
 
-    /// Entries per directory/Markdown page (default 50), or call sites per scope (10/100).
+    /// Entries per directory/Markdown page (default 50), or ranked search matches per target (10/100).
     /// Output remains subject to --budget. Accepted but ignored on other views (with a notice).
     #[arg(long)]
     limit: Option<std::num::NonZeroUsize>,

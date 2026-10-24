@@ -57,7 +57,7 @@ pub(super) fn search_collected(
 /// The display cap and the per-file collection bound are the same number in
 /// production. They are separate parameters so a test can raise one without
 /// the other and show that the bound leaves the displayed set untouched.
-fn search_capped(
+pub(super) fn search_capped(
     pattern: &str,
     scope: &Path,
     is_regex: bool,

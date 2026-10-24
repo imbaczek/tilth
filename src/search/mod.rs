@@ -8,6 +8,7 @@ pub mod facets;
 pub mod glob;
 pub mod grok;
 pub mod merge;
+pub(crate) mod paging;
 pub mod rank;
 pub mod siblings;
 pub mod strip;

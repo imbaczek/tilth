@@ -195,10 +195,6 @@ fn paging_options_are_accepted_on_other_views_with_a_notice() {
         vec!["read", "entry000.txt"],
         vec!["read", "code.rs", "--mode", "signature"],
         vec!["read", "code.rs", "--mode", "stripped"],
-        vec!["unknown_symbol"],
-        vec!["hot"],
-        vec!["hot,cold"],
-        vec!["/hot/"],
         vec!["*.txt"],
         vec![".", "--map"],
         vec!["code.rs", "--deps"],
@@ -227,7 +223,7 @@ fn paging_options_are_accepted_on_other_views_with_a_notice() {
         2,
         "{output}"
     );
-    let output = success(root.path(), &["hot", "--limit", "2", "--budget", "80"]);
+    let output = success(root.path(), &["*.txt", "--limit", "2", "--budget", "80"]);
     assert!(output.contains("offset and limit ignored"), "{output}");
     assert!(output.len() <= 80 * 4 + 1, "{output}");
 }

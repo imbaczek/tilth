@@ -59,6 +59,35 @@ fn combine_scoped_results<F>(
     full: bool,
     context: Option<&Path>,
     _glob: Option<&str>,
+    search: F,
+) -> Result<SearchResult, TilthError>
+where
+    F: FnMut(&Path) -> Result<SearchResult, TilthError>,
+{
+    combine_scoped_results_with_cap(scopes, if full { 100 } else { 10 }, context, search)
+}
+
+/// Collect a stable ranked prefix, merging physical identities before paging.
+pub(super) fn page_raw_scopes(
+    query: &str,
+    kind: &str,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    prefix: usize,
+) -> Result<SearchResult, TilthError> {
+    combine_scoped_results_with_cap(scopes, prefix, context, |scope| match kind {
+        "symbol" => symbol::search_complete(query, scope, context, glob),
+        "content" => content::search_capped(query, scope, false, context, glob, prefix, prefix),
+        "regex" => content::search_capped(query, scope, true, context, glob, prefix, prefix),
+        _ => unreachable!("validated search page kind"),
+    })
+}
+
+fn combine_scoped_results_with_cap<F>(
+    scopes: &[PathBuf],
+    max_matches: usize,
+    context: Option<&Path>,
     mut search: F,
 ) -> Result<SearchResult, TilthError>
 where
@@ -222,7 +251,6 @@ where
         totals
     };
 
-    let max_matches = if full { 100 } else { 10 };
     merged.truncate(max_matches);
 
     Ok(SearchResult {
