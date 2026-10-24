@@ -114,7 +114,7 @@ pub(crate) struct DefinitionOps {
     pub weight: fn(tree_sitter::Node, &[&str]) -> u16,
 }
 
-/// Shared default definition kinds — used by every language except Elixir and Go.
+/// Shared default definition kinds — used by languages without custom definition forms.
 pub(crate) const DEFAULT_DEF_KINDS: &[&str] = DEFINITION_KINDS;
 
 /// Default weight adapter: weight is keyed on the node kind, so the node's
@@ -151,6 +151,7 @@ pub(crate) fn spec(lang: Lang) -> &'static LangSpec {
         Lang::Kotlin => &lang::kotlin::SPEC,
         Lang::CSharp => &lang::csharp::SPEC,
         Lang::Elixir => &lang::elixir::SPEC,
+        Lang::CommonLisp => &lang::commonlisp::SPEC,
         Lang::Dockerfile => &lang::dockerfile::SPEC,
         Lang::Make => &lang::make::SPEC,
         Lang::Bash => &lang::bash::SPEC,
@@ -314,16 +315,17 @@ mod tests {
     }
 
     #[test]
-    fn only_elixir_and_go_override_definition_kinds() {
+    fn languages_with_custom_definition_kinds() {
         // The refactor's shared-default-plus-override design: every spec points at
         // DEFAULT_DEF_KINDS except Elixir, whose definitions are `call` nodes, and
-        // Go, whose `type`/`const`/`var` names live on specs inside a declaration.
+        // Go, whose `type`/`const`/`var` names live on specs inside a declaration,
+        // and Common Lisp, whose definitions are list forms.
         for &lang in mod_all_langs_for_test() {
             let uses_default = spec(lang).definition_kinds == DEFAULT_DEF_KINDS;
             assert_eq!(
                 uses_default,
-                !matches!(lang, Lang::Elixir | Lang::Go),
-                "{lang:?} definition_kinds override mismatch — only Elixir and Go diverge"
+                !matches!(lang, Lang::Elixir | Lang::Go | Lang::CommonLisp),
+                "{lang:?} definition_kinds override mismatch — Elixir, Go, and Common Lisp diverge"
             );
         }
     }

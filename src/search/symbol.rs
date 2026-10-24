@@ -320,8 +320,11 @@ pub(super) fn find_definitions(
                 return ignore::WalkState::Continue;
             };
 
-            // Fast byte check via memchr::memmem (SIMD) — skip files without the symbol
-            if memchr::memmem::find(content.as_bytes(), needle).is_none() {
+            let file_type = detect_file_type(path);
+            // Lisp reader case folding and escapes make a byte-exact prefilter unsafe.
+            if file_type != FileType::Code(crate::types::Lang::CommonLisp)
+                && memchr::memmem::find(content.as_bytes(), needle).is_none()
+            {
                 return ignore::WalkState::Continue;
             }
 
@@ -346,7 +349,6 @@ pub(super) fn find_definitions(
             let (file_lines, mtime) = file_metadata(path);
 
             // Try tree-sitter structural detection
-            let file_type = detect_file_type(path);
             let lang = match file_type {
                 FileType::Code(l) => Some(l),
                 _ => None,
@@ -440,6 +442,28 @@ fn find_defs_treesitter(
     let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
     let mut defs = Vec::new();
+    if lang == Some(crate::types::Lang::CommonLisp) {
+        return crate::lang::commonlisp::outline(root, &lines)
+            .into_iter()
+            .filter(|entry| crate::lang::commonlisp::names_equal(&entry.name, query))
+            .map(|entry| Match {
+                path: path.to_path_buf(),
+                line: entry.start_line,
+                text: lines
+                    .get(entry.start_line as usize - 1)
+                    .unwrap_or(&"")
+                    .to_string(),
+                is_definition: true,
+                exact: true,
+                file_lines,
+                mtime,
+                def_range: Some((entry.start_line, entry.end_line)),
+                def_name: Some(entry.name),
+                def_weight: 100,
+                impl_target: None,
+            })
+            .collect();
+    }
 
     walk_for_definitions(
         root, query, path, &lines, file_lines, mtime, &mut defs, lang,
@@ -749,28 +773,51 @@ fn find_usages(
             let (file_lines, mtime) = file_metadata(path);
 
             let mut file_matches = Vec::new();
-            let mut searcher = Searcher::new();
+            if detect_file_type(path) == FileType::Code(crate::types::Lang::CommonLisp) {
+                if let Ok(source) = std::str::from_utf8(&bytes) {
+                    let lines: Vec<_> = source.lines().collect();
+                    file_matches.extend(
+                        crate::lang::commonlisp::usage_lines(source, query)
+                            .into_iter()
+                            .map(|row| Match {
+                                path: path.to_path_buf(),
+                                line: row as u32 + 1,
+                                text: lines.get(row).unwrap_or(&"").trim_end().to_string(),
+                                is_definition: false,
+                                exact: true,
+                                file_lines,
+                                mtime,
+                                def_range: None,
+                                def_name: None,
+                                def_weight: 0,
+                                impl_target: None,
+                            }),
+                    );
+                }
+            } else {
+                let mut searcher = Searcher::new();
 
-            let _ = searcher.search_slice(
-                matcher,
-                &bytes,
-                UTF8(|line_num, line| {
-                    file_matches.push(Match {
-                        path: path.to_path_buf(),
-                        line: line_num as u32,
-                        text: line.trim_end().to_string(),
-                        is_definition: false,
-                        exact: line.contains(query),
-                        file_lines,
-                        mtime,
-                        def_range: None,
-                        def_name: None,
-                        def_weight: 0,
-                        impl_target: None,
-                    });
-                    Ok(true)
-                }),
-            );
+                let _ = searcher.search_slice(
+                    matcher,
+                    &bytes,
+                    UTF8(|line_num, line| {
+                        file_matches.push(Match {
+                            path: path.to_path_buf(),
+                            line: line_num as u32,
+                            text: line.trim_end().to_string(),
+                            is_definition: false,
+                            exact: line.contains(query),
+                            file_lines,
+                            mtime,
+                            def_range: None,
+                            def_name: None,
+                            def_weight: 0,
+                            impl_target: None,
+                        });
+                        Ok(true)
+                    }),
+                );
+            }
 
             if !file_matches.is_empty() {
                 found_count.fetch_add(file_matches.len(), Ordering::Relaxed);

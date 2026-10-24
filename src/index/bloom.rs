@@ -50,6 +50,11 @@ impl BloomFilterCache {
     /// `false` if it is DEFINITELY absent.
     #[must_use]
     pub fn contains(&self, path: &Path, mtime: SystemTime, content: &str, symbol: &str) -> bool {
+        // Lisp quote prefixes, escaped names and punctuation are not modeled by
+        // the approximate lexer. Never prune Lisp files with a negative result.
+        if code_lang(path) == Some(Lang::CommonLisp) {
+            return true;
+        }
         // Fast path: check existing cached entry
         if let Some(entry) = self.filters.get(path) {
             let (ref filter, cached_mtime) = *entry;

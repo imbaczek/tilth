@@ -83,6 +83,7 @@ mod tests {
             ("kotlin", tree_sitter_kotlin_ng::LANGUAGE.into()),
             ("elixir", tree_sitter_elixir::LANGUAGE.into()),
             ("bash", tree_sitter_bash::LANGUAGE.into()),
+            ("commonlisp", crate::lang::commonlisp::LANGUAGE.into()),
         ];
         let mut seen = std::collections::HashMap::new();
         for (name, lang) in &grammars {
