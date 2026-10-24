@@ -57,6 +57,59 @@ pub struct Dependent {
 /// Phase 1: Extract exported symbols from the outline.
 /// Phase 2: Forward dependencies — what this file uses.
 /// Phase 3: Reverse dependencies — what uses this file.
+/// Page dependencies in deterministic section/path order, with full caller detail per file.
+pub(crate) fn format_deps_page(
+    result: &DepsResult,
+    scope: &Path,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> String {
+    let header = format!(
+        "# Deps: {} — {} local, {} external, {} dependents",
+        crate::format::rel(&result.target, scope),
+        result.uses_local.len(),
+        result.uses_external.len(),
+        result.total_dependents
+    );
+    let mut entries = Vec::new();
+    let mut local: Vec<_> = result.uses_local.iter().collect();
+    local.sort_by_key(|dep| &dep.path);
+    for dep in local {
+        entries.push(format_uses_local(std::slice::from_ref(dep), scope, true));
+    }
+    let mut external = result.uses_external.clone();
+    external.sort();
+    for dep in external {
+        entries.push(format_uses_external(&[dep]));
+    }
+    let mut used: Vec<_> = result.used_by.iter().collect();
+    used.sort_by(|a, b| (a.is_test, &a.path).cmp(&(b.is_test, &b.path)));
+    for dep in used {
+        entries.push(format_used_by(
+            &[dep],
+            scope,
+            if dep.is_test {
+                "## Used by (tests)"
+            } else {
+                "## Used by"
+            },
+        ));
+    }
+    let output = page.render(&header, &entries, "dependency records", mcp);
+    if result.dependents_complete {
+        output
+    } else {
+        let output = output
+            .lines()
+            .filter(|line| {
+                !line.starts_with("> Next page:") && !line.starts_with("> End of listing.")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("{output}\n\n> Dependency analysis is incomplete; counts are lower bounds and continuation is unavailable.")
+    }
+}
+
 #[cfg(test)]
 pub fn analyze_deps(
     path: &Path,

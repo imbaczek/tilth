@@ -1,5 +1,7 @@
 pub mod imports;
 pub mod outline;
+mod paging;
+pub(crate) use paging::read_file_page;
 
 use std::fmt::Write;
 use std::fs;
@@ -424,6 +426,23 @@ fn closest_headings(sections: &[HeadingSection], query: &str, top_n: usize) -> V
         .take(top_n)
         .map(|(_, section)| section.describe())
         .collect()
+}
+
+/// Page source lines within selected ranges, preserving original line/hash addresses.
+pub(crate) fn read_ranges_page(
+    path: &Path,
+    ranges: &[&str],
+    edit_mode: bool,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> Result<String, TilthError> {
+    let (blocks, bytes, lines) = collect_blocks(path, ranges, edit_mode)?;
+    let header = format::file_header(path, bytes, lines, ViewMode::Section);
+    let entries: Vec<_> = blocks
+        .iter()
+        .flat_map(|block| block.text.lines().map(str::to_owned))
+        .collect();
+    Ok(page.render(&header, &entries, "selected lines", mcp))
 }
 
 #[cfg(test)]

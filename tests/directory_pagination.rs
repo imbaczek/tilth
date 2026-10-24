@@ -186,7 +186,7 @@ fn empty_listing_and_extreme_offset_have_clear_terminal_pages() {
 }
 
 #[test]
-fn paging_options_are_accepted_on_other_views_with_a_notice() {
+fn paging_options_are_applied_across_views() {
     let root = fixture();
     fs::write(root.path().join("code.rs"), "pub fn hot() {}\n").unwrap();
     for prefix in [
@@ -207,11 +207,8 @@ fn paging_options_are_accepted_on_other_views_with_a_notice() {
             let mut args = prefix.clone();
             args.extend(page);
             let output = success(root.path(), &args);
-            assert!(
-                output.contains("offset and limit ignored"),
-                "{args:?}: {output}"
-            );
-            assert!(!output.contains("Next page:"), "{args:?}: {output}");
+            assert!(output.contains("Showing"), "{args:?}: {output}");
+            assert!(!output.contains("ignored"), "{args:?}: {output}");
         }
     }
     let output = success(
@@ -224,12 +221,12 @@ fn paging_options_are_accepted_on_other_views_with_a_notice() {
         "{output}"
     );
     let output = success(root.path(), &["*.txt", "--limit", "2", "--budget", "80"]);
-    assert!(output.contains("offset and limit ignored"), "{output}");
+    assert!(output.contains("Showing"), "{output}");
     assert!(output.len() <= 80 * 4 + 1, "{output}");
 }
 
 #[test]
-fn ignored_paging_notice_fits_deps_budget() {
+fn dependency_page_retry_notice_fits_budget() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("code.rs"), "pub fn hot() {}\n").unwrap();
     for i in 0..30 {
@@ -245,6 +242,9 @@ fn ignored_paging_notice_fits_deps_budget() {
             "code.rs", "--deps", "--offset", "0", "--limit", "1", "--budget", "80",
         ],
     );
-    assert!(output.contains("offset and limit ignored"), "{output}");
+    assert!(
+        output.contains("retry the same offset with a smaller limit"),
+        "{output}"
+    );
     assert!(output.len() <= 80 * 4 + 1, "{output}");
 }

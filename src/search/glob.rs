@@ -23,6 +23,14 @@ pub struct GlobResult {
 /// Glob search using `ignore::WalkBuilder` (parallel via `super::walker`,
 /// with the same `.tilthignore` and default-on gitignore policy).
 pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
+    search_with_page(pattern, scope, None)
+}
+
+pub(super) fn search_with_page(
+    pattern: &str,
+    scope: &Path,
+    page: Option<crate::listing::Page>,
+) -> Result<GlobResult, TilthError> {
     let glob = Glob::new(pattern).map_err(|e| TilthError::InvalidQuery {
         query: pattern.to_string(),
         reason: e.to_string(),
@@ -85,7 +93,12 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
     // WalkParallel visits files in nondeterministic order; sort before capping
     // so the selected subset is stable. Previews are computed only for survivors.
     matched.sort();
-    matched.truncate(MAX_FILES);
+    if let Some(page) = page {
+        let (start, end) = page.bounds(total);
+        matched = matched.into_iter().skip(start).take(end - start).collect();
+    } else {
+        matched.truncate(MAX_FILES);
+    }
     let files: Vec<GlobFileEntry> = matched
         .into_iter()
         .map(|path| {
@@ -94,7 +107,7 @@ pub fn search(pattern: &str, scope: &Path) -> Result<GlobResult, TilthError> {
         })
         .collect();
 
-    let available_extensions: Vec<String> = if files.is_empty() {
+    let available_extensions: Vec<String> = if total == 0 {
         let mut exts: Vec<String> = extensions.into_iter().collect();
         exts.sort();
         exts.truncate(10);

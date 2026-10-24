@@ -13,11 +13,52 @@ use crate::types::{estimate_tokens, FileType};
 /// Non-code files show name + token estimate.
 #[must_use]
 pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &OutlineCache) -> String {
+    generate_inner(scope, depth, budget, cache, None)
+}
+
+/// Page files by relative path, rebuilding tree context and rollups for this page.
+pub fn generate_paginated(
+    scope: &Path,
+    depth: usize,
+    budget: Option<u64>,
+    cache: &OutlineCache,
+    value: (usize, Option<usize>),
+) -> Result<String, String> {
+    let page = crate::listing::Page::from_tuple(value)?;
+    Ok(generate_inner(scope, depth, budget, cache, Some(page)))
+}
+
+fn generate_inner(
+    scope: &Path,
+    depth: usize,
+    budget: Option<u64>,
+    cache: &OutlineCache,
+    page: Option<crate::listing::Page>,
+) -> String {
     let mut tree: BTreeMap<PathBuf, Vec<FileEntry>> = BTreeMap::new();
 
     let walker = base_walk_builder(scope).max_depth(Some(depth + 1)).build();
 
-    for entry in walker.flatten() {
+    let mut files: Vec<_> = walker
+        .flatten()
+        .filter(|entry| entry.file_type().is_some_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            entry
+                .path()
+                .strip_prefix(scope)
+                .unwrap_or(entry.path())
+                .components()
+                .count()
+                .saturating_sub(1)
+                <= depth
+        })
+        .collect();
+    let total = files.len();
+    if page.is_some() {
+        files.sort_by(|a, b| a.path().cmp(b.path()));
+    }
+    let (start, end) = page.map_or((0, total), |page| page.bounds(total));
+    for entry in files.into_iter().skip(start).take(end - start) {
         if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
@@ -80,9 +121,20 @@ pub fn generate(scope: &Path, depth: usize, budget: Option<u64>, cache: &Outline
     }
 
     let mut out = format!("# Map: {} (depth {})\n", scope.display(), depth);
+    if let Some(page) = page {
+        let _ = write!(
+            out,
+            "\n{}\n> Tree counts and token rollups cover this page only.\n\n",
+            page.summary(total, "files")
+        );
+    }
     let totals = compute_dir_totals(&tree);
     format_tree(&tree, &totals, Path::new(""), 0, &mut out);
 
+    if let Some(page) = page {
+        page.append_navigation(&mut out, total, false);
+        return crate::listing::finish(&out, budget);
+    }
     match budget {
         Some(b) => crate::budget::apply(&out, b),
         None => out,

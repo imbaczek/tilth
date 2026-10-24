@@ -408,9 +408,48 @@ pub fn diff(
     scope: Option<&str>,
     search: Option<&str>,
     blast: bool,
-    _expand: usize,
+    expand: usize,
     budget: Option<u64>,
 ) -> Result<String, String> {
+    diff_inner(
+        source, repo, scope, search, blast, expand, budget, None, false,
+    )
+}
+
+/// Page files, symbol/hunk blocks, or commits according to the selected diff view.
+pub fn diff_paginated(
+    source: &DiffSource,
+    repo: Option<&Path>,
+    scope: Option<&str>,
+    search: Option<&str>,
+    blast: bool,
+    expand: usize,
+    budget: Option<u64>,
+    value: Option<(usize, Option<usize>)>,
+    mcp: bool,
+) -> Result<String, String> {
+    let page = value.map(crate::listing::Page::from_tuple).transpose()?;
+    diff_inner(
+        source, repo, scope, search, blast, expand, budget, page, mcp,
+    )
+}
+
+fn diff_inner(
+    source: &DiffSource,
+    repo: Option<&Path>,
+    scope: Option<&str>,
+    search: Option<&str>,
+    blast: bool,
+    _expand: usize,
+    requested_budget: Option<u64>,
+    page: Option<crate::listing::Page>,
+    mcp: bool,
+) -> Result<String, String> {
+    let budget = if page.is_some() {
+        None
+    } else {
+        requested_budget
+    };
     // Git emits repository-relative paths even when invoked in a subdirectory.
     // Anchor both blob and working-tree reads to the same repository root.
     let git_root = if matches!(
@@ -461,7 +500,7 @@ pub fn diff(
     let scope = normalized_scope.as_deref();
     // Log mode has its own pipeline.
     if let DiffSource::Log(range) = source {
-        return diff_log(range, repo, scope, budget);
+        return diff_log(range, repo, scope, requested_budget, page, mcp);
     }
 
     let raw = run_git_diff_scoped(source, repo, scope)?;
@@ -473,7 +512,14 @@ pub fn diff(
                 return Err(format!("file '{path}' not found in diff"));
             }
         }
-        return Ok("No changes.".to_string());
+        return Ok(if let Some(page) = page {
+            crate::listing::finish(
+                &page.render("# Diff: no changes", &[], "files", mcp),
+                requested_budget,
+            )
+        } else {
+            "No changes.".to_string()
+        });
     }
 
     // 1. Parse raw unified diff.
@@ -499,7 +545,14 @@ pub fn diff(
         });
     }
     if file_diffs.is_empty() {
-        return Ok("No changes.".to_string());
+        return Ok(if let Some(page) = page {
+            crate::listing::finish(
+                &page.render("# Diff: no changes", &[], "files", mcp),
+                requested_budget,
+            )
+        } else {
+            "No changes.".to_string()
+        });
     }
 
     // 2. Build structural overlays in parallel — each FileDiff is independent
@@ -535,7 +588,19 @@ pub fn diff(
     if let Some(term) = search {
         filter_by_search(&mut overlays, term);
         if overlays.is_empty() {
-            return Ok(format!("No changes matching '{term}'."));
+            return Ok(if let Some(page) = page {
+                crate::listing::finish(
+                    &page.render(
+                        &format!("# Diff: no changes matching '{term}'"),
+                        &[],
+                        "files",
+                        mcp,
+                    ),
+                    requested_budget,
+                )
+            } else {
+                format!("No changes matching '{term}'.")
+            });
         }
     }
 
@@ -560,9 +625,19 @@ pub fn diff(
     // 8. Format based on scope.
     let label = source_label(source);
     let mut output = match scope {
-        None => format::format_overview(&overlays, &file_meta, &warnings, &label, budget),
+        None => {
+            if let Some(page) = page {
+                format::format_overview_page(&overlays, &file_meta, &warnings, &label, page, mcp)
+            } else {
+                format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+            }
+        }
         Some(_) if directory_scope.is_some() => {
-            format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+            if let Some(page) = page {
+                format::format_overview_page(&overlays, &file_meta, &warnings, &label, page, mcp)
+            } else {
+                format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+            }
         }
         Some(s) if s.contains(':') => {
             // file:function scope
@@ -579,7 +654,13 @@ pub fn diff(
                                 .is_some_and(|old| old.to_string_lossy().ends_with(file_part))
                     })
             }) {
-                Some(o) => format::format_function_detail(o, fn_name),
+                Some(o) => {
+                    if let Some(page) = page {
+                        format::format_function_page(o, fn_name, page, mcp)
+                    } else {
+                        format::format_function_detail(o, fn_name)
+                    }
+                }
                 None => return Err(format!("file '{file_part}' not found in diff")),
             }
         }
@@ -596,9 +677,21 @@ pub fn diff(
                                 .is_some_and(|old| old.to_string_lossy().ends_with(file))
                     })
             }) {
-                Some(o) => format::format_file_detail(o, budget),
+                Some(o) => {
+                    if let Some(page) = page {
+                        format::format_file_page(o, page, mcp)
+                    } else {
+                        format::format_file_detail(o, budget)
+                    }
+                }
                 None if file == "." || overlays.iter().any(|o| o.path.starts_with(file)) => {
-                    format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+                    if let Some(page) = page {
+                        format::format_overview_page(
+                            &overlays, &file_meta, &warnings, &label, page, mcp,
+                        )
+                    } else {
+                        format::format_overview(&overlays, &file_meta, &warnings, &label, budget)
+                    }
                 }
                 None => return Err(format!("file '{file}' not found in diff")),
             }
@@ -637,6 +730,13 @@ pub fn diff(
         }
     }
 
+    if page.is_some() {
+        let (navigation, body): (Vec<_>, Vec<_>) = output.lines().partition(|line| {
+            line.starts_with("> Next page:") || line.starts_with("> End of listing.")
+        });
+        output = format!("{}\n{}", body.join("\n"), navigation.join("\n"));
+        output = crate::listing::finish(&output, requested_budget);
+    }
     Ok(output)
 }
 
@@ -950,6 +1050,8 @@ fn diff_log(
     repo: Option<&Path>,
     scope: Option<&str>,
     budget: Option<u64>,
+    page: Option<crate::listing::Page>,
+    mcp: bool,
 ) -> Result<String, String> {
     // Get commit list.
     let mut cmd = Command::new("git");
@@ -1041,10 +1143,15 @@ fn diff_log(
         summaries.retain(|s| !s.overlays.is_empty());
     }
 
+    if let Some(page) = page {
+        return Ok(crate::listing::finish(
+            &format::format_log_page(&summaries, range, page, mcp),
+            budget,
+        ));
+    }
     if summaries.is_empty() {
         return Ok("No commits found.".to_string());
     }
-
     Ok(format::format_log(&summaries, range, budget))
 }
 

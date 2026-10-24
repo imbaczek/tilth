@@ -488,7 +488,7 @@ fn run_inner_scopes(
             }
         })?;
     }
-    let ignored_glob_page = listing_page.is_some() && matches!(query_type, QueryType::Glob(_));
+
     if let Some((offset, limit)) =
         listing_page.filter(|_| !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_)))
     {
@@ -592,6 +592,10 @@ fn run_inner_scopes(
 
     let output = match query_type {
         QueryType::FilePath(_) => {
+            let is_paged_listing = listing_page.is_some()
+                || classifications
+                    .iter()
+                    .any(|kind| matches!(kind,QueryType::FilePath(path) if path.is_dir()));
             let mut outputs = Vec::new();
             let mut failures = Vec::new();
             for (scope_index, (scope, scoped_query_type)) in
@@ -626,35 +630,29 @@ fn run_inner_scopes(
                                 })?;
                         read::list_directory(&path, page, false)
                     }
-                } else if let Some((offset, limit)) = listing_page.filter(|_| {
-                    section.is_none()
-                        && !full
-                        && matches!(
-                            crate::lang::detect_file_type(&path),
-                            crate::types::FileType::Markdown
-                        )
-                }) {
-                    let page = listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT))
-                        .map_err(|reason| TilthError::InvalidQuery {
+                } else if let Some(value) = listing_page {
+                    let page = listing::Page::from_tuple(value).map_err(|reason| {
+                        TilthError::InvalidQuery {
                             query: query.into(),
                             reason,
-                        })?;
-                    read::read_markdown_outline_page(&path, page, false)
+                        }
+                    })?;
+                    if let Some(section) = section {
+                        read::read_ranges_page(&path, &[section], false, page, false)
+                    } else {
+                        read::read_file_page(&path, full, cache, false, page, false)
+                    }
                 } else {
-                    read_file_query(&path, scope, section, full, cache, budget_tokens).map(
-                        |output| {
-                            if listing_page.is_some() {
-                                with_ignored_paging_notice(output)
-                            } else {
-                                output
-                            }
-                        },
-                    )
+                    read_file_query(&path, scope, section, full, cache, budget_tokens)
                 };
                 match read {
                     Ok(output) => {
                         if multi_scope {
-                            let output = apply_budget(output, budget_tokens);
+                            let output = if is_paged_listing {
+                                output
+                            } else {
+                                apply_budget(output, budget_tokens)
+                            };
                             outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
                         } else {
                             outputs.push(output);
@@ -666,22 +664,45 @@ fn run_inner_scopes(
                     }),
                 }
             }
-            return finish_scoped_operations(query, &outputs, failures, budget_tokens);
+            let output = finish_scoped_operations(
+                query,
+                &outputs,
+                failures,
+                if is_paged_listing {
+                    None
+                } else {
+                    budget_tokens
+                },
+            )?;
+            return Ok(if is_paged_listing {
+                listing::finish(&output, budget_tokens)
+            } else {
+                output
+            });
         }
         QueryType::Glob(pattern) => {
             let mut outputs = Vec::new();
             let mut failures = Vec::new();
             for scope in scopes {
-                match search::search_glob(&pattern, scope).map(|output| {
-                    if ignored_glob_page {
-                        with_ignored_paging_notice(output)
-                    } else {
-                        output
-                    }
-                }) {
+                let result = if let Some(value) = listing_page {
+                    let page = listing::Page::from_tuple(value).map_err(|reason| {
+                        TilthError::InvalidQuery {
+                            query: query.into(),
+                            reason,
+                        }
+                    })?;
+                    search::search_glob_page(&pattern, scope, page)
+                } else {
+                    search::search_glob(&pattern, scope)
+                };
+                match result {
                     Ok(output) => {
                         if multi_scope {
-                            let output = apply_budget(output, budget_tokens);
+                            let output = if listing_page.is_some() {
+                                output
+                            } else {
+                                apply_budget(output, budget_tokens)
+                            };
                             outputs.push(format!("# Scope: {}\n\n{output}", scope.display()));
                         } else {
                             outputs.push(output);
@@ -693,7 +714,21 @@ fn run_inner_scopes(
                     }),
                 }
             }
-            return finish_scoped_operations(query, &outputs, failures, budget_tokens);
+            let output = finish_scoped_operations(
+                query,
+                &outputs,
+                failures,
+                if listing_page.is_some() {
+                    None
+                } else {
+                    budget_tokens
+                },
+            )?;
+            return Ok(if listing_page.is_some() {
+                listing::finish(&output, budget_tokens)
+            } else {
+                output
+            });
         }
         _ if use_expanded => {
             let ctx = ExpandedCtx {
@@ -1043,6 +1078,39 @@ fn finish_concept_no_hit(
     } else {
         format_raw_result_for_scopes(result, scopes, cache)
     }
+}
+
+/// Analyze all dependencies before selecting a page of complete dependency records.
+pub fn run_deps_paginated(
+    path: &Path,
+    scope: &Path,
+    budget: Option<u64>,
+    full: bool,
+    page: Option<(usize, Option<usize>)>,
+) -> Result<String, TilthError> {
+    let Some(value) = page else {
+        return run_deps_with_options(path, scope, budget, full);
+    };
+    let page = listing::Page::from_tuple(value).map_err(|reason| TilthError::InvalidQuery {
+        query: path.display().to_string(),
+        reason,
+    })?;
+    let result = search::deps::analyze_deps_with_options(
+        path,
+        scope,
+        &index::bloom::BloomFilterCache::new(),
+        true,
+    )?;
+    Ok(listing::finish(
+        &search::deps::format_deps_page(&result, scope, page, false),
+        budget,
+    ))
+}
+
+/// Apply a final output budget to an assembled set of independently paged scopes.
+#[must_use]
+pub fn finish_paged_output(output: &str, budget: Option<u64>) -> String {
+    listing::finish(output, budget)
 }
 
 #[cfg(test)]

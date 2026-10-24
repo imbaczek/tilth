@@ -92,13 +92,12 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Skip N ranked search matches, directory entries, or automatic Markdown headings (0-based).
-    /// Accepted but ignored on other views (with a notice).
+    /// Skip N entries in the selected view (zero-based): search matches, files, declarations, or lines.
     #[arg(long)]
     offset: Option<usize>,
 
-    /// Entries per directory/Markdown page (default 50), or ranked search matches per target (10/100).
-    /// Output remains subject to --budget. Accepted but ignored on other views (with a notice).
+    /// Entries per page (default 50; search defaults to 10/100). Unit depends on the view.
+    /// Output remains subject to --budget.
     #[arg(long)]
     limit: Option<std::num::NonZeroUsize>,
 
@@ -177,12 +176,11 @@ enum Command {
         /// Maximum output tokens; also accepted before read.
         #[arg(long)]
         budget: Option<u64>,
-        /// Skip N directory entries or automatic Markdown headings per path (zero-based).
-        /// Accepted but ignored on other views (with a notice); explicit content modes take precedence.
+        /// Skip N declarations in auto/code or signature mode, headings in auto/Markdown,
+        /// source lines in full mode, or retained lines in stripped mode (zero-based, per path).
         #[arg(long)]
         offset: Option<usize>,
-        /// Directory entries or automatic Markdown headings per page, per path (default 50).
-        /// Accepted but ignored on other views (with a notice); explicit content modes take precedence.
+        /// Entries per page per path (default 50); selected sections page their source lines.
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
         /// Emit hash anchors; also accepted before read.
@@ -247,6 +245,13 @@ enum Command {
         /// Max tokens in response.
         #[arg(long, default_value_t = 10000)]
         budget: u64,
+
+        /// Skip N files (overview), symbols/hunks (file detail), or commits (log), zero-based.
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Entries per diff page (default 50). Keep the source and working tree unchanged between pages.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroUsize>,
     },
     /// Show the project fingerprint (what MCP init would inject).
     Overview,
@@ -405,6 +410,8 @@ fn main() {
                 blast,
                 expand,
                 budget,
+                offset,
+                limit,
             } => {
                 let a_str = a.as_ref().map(|p| p.to_string_lossy().into_owned());
                 let b_str = b.as_ref().map(|p| p.to_string_lossy().into_owned());
@@ -423,7 +430,7 @@ fn main() {
                     }
                 };
                 let budget_opt = if budget == 0 { None } else { Some(budget) };
-                match tilth::diff::diff(
+                match tilth::diff::diff_paginated(
                     &diff_source,
                     None, // repo: the CLI already runs in the caller's checkout
                     scope.as_deref(),
@@ -431,6 +438,17 @@ fn main() {
                     blast,
                     expand,
                     budget_opt,
+                    if offset.or(cli.search.offset).is_some()
+                        || limit.or(cli.search.limit).is_some()
+                    {
+                        Some((
+                            offset.or(cli.search.offset).unwrap_or(0),
+                            limit.or(cli.search.limit).map(std::num::NonZeroUsize::get),
+                        ))
+                    } else {
+                        None
+                    },
+                    false,
                 ) {
                     Ok(output) => emit_output(&output, io::stdout().is_terminal()),
                     Err(e) => {
@@ -480,10 +498,27 @@ fn main() {
         let output = run_for_scopes(&scopes, |scope| {
             std::fs::metadata(scope)
                 .map_err(|source| tilth::error::scope_io_error(scope, source))?;
-            Ok(tilth::map::generate(scope, 3, cli.search.budget, &cache))
+            if cli.search.offset.is_some() || cli.search.limit.is_some() {
+                tilth::map::generate_paginated(
+                    scope,
+                    3,
+                    cli.search.budget,
+                    &cache,
+                    (
+                        cli.search.offset.unwrap_or(0),
+                        cli.search.limit.map(std::num::NonZeroUsize::get),
+                    ),
+                )
+                .map_err(|reason| tilth::error::TilthError::InvalidQuery {
+                    query: scope.display().to_string(),
+                    reason,
+                })
+            } else {
+                Ok(tilth::map::generate(scope, 3, cli.search.budget, &cache))
+            }
         });
         let output = if cli.search.offset.is_some() || cli.search.limit.is_some() {
-            tilth::with_ignored_paging_notice(output)
+            tilth::finish_paged_output(&output, cli.search.budget)
         } else {
             output
         };
@@ -541,26 +576,31 @@ fn main() {
 
     // Deps mode
     if cli.search.deps {
-        let result = run_query_for_scopes(&scopes, &query, cli.search.budget, |scope| {
-            std::fs::metadata(scope)
-                .map_err(|source| tilth::error::scope_io_error(scope, source))?;
-            let path = resolve_query_path(&query, scope);
-            let ignored_page = cli.search.offset.is_some() || cli.search.limit.is_some();
-            let deps_budget = if ignored_page {
+        let result = run_query_for_scopes(
+            &scopes,
+            &query,
+            if cli.search.offset.is_some() || cli.search.limit.is_some() {
                 None
             } else {
                 cli.search.budget
-            };
-            tilth::run_deps_with_options(&path, scope, deps_budget, cli.search.full).map(|output| {
-                if ignored_page {
-                    apply_optional_budget(
-                        tilth::with_ignored_paging_notice(output),
-                        cli.search.budget,
-                    )
-                } else {
-                    output
-                }
-            })
+            },
+            |scope| {
+                std::fs::metadata(scope)
+                    .map_err(|source| tilth::error::scope_io_error(scope, source))?;
+                let path = resolve_query_path(&query, scope);
+                let page = (cli.search.offset.is_some() || cli.search.limit.is_some()).then_some((
+                    cli.search.offset.unwrap_or(0),
+                    cli.search.limit.map(std::num::NonZeroUsize::get),
+                ));
+                tilth::run_deps_paginated(&path, scope, cli.search.budget, cli.search.full, page)
+            },
+        );
+        let result = result.map(|output| {
+            if cli.search.offset.is_some() || cli.search.limit.is_some() {
+                tilth::finish_paged_output(&output, cli.search.budget)
+            } else {
+                output
+            }
         });
         emit_result(result, &query, cli.search.json, is_tty);
         return;

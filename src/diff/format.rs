@@ -177,44 +177,7 @@ pub(crate) fn format_file_detail(overlay: &FileOverlay, budget: Option<u64>) -> 
         .collect();
 
     for change in &overlay.symbol_changes {
-        let line = change.line;
-        let end_line = symbol_end_line(change);
-
-        if matches!(change.change, ChangeType::Unchanged) {
-            if !hunk_map.contains_key(super::symbol_key(change).as_str()) {
-                continue;
-            }
-            let _ = writeln!(
-                out,
-                "\n## [ ] {} (L{line}-{end_line}, unchanged)",
-                change.name
-            );
-            continue;
-        }
-
-        let marker = format_marker(&change.change, &change.match_confidence);
-        let label = change_type_label(&change.change);
-
-        let _ = writeln!(
-            out,
-            "\n## {marker} {} — {label} (L{line}-{end_line})",
-            change.name
-        );
-
-        // Signature before/after.
-        if matches!(change.change, ChangeType::SignatureChanged) {
-            if let Some(old_sig) = &change.old_sig {
-                let _ = writeln!(out, "  BEFORE: {old_sig}");
-            }
-            if let Some(new_sig) = &change.new_sig {
-                let _ = writeln!(out, "  AFTER:  {new_sig}");
-            }
-        }
-
-        // Diff lines attributed to this symbol.
-        if let Some(lines) = hunk_map.get(super::symbol_key(change).as_str()) {
-            write_diff_lines(&mut out, lines, line);
-        }
+        out.push_str(&format_symbol_detail(change, &hunk_map));
     }
 
     for (name, lines) in &overlay.attributed_hunks {
@@ -557,6 +520,229 @@ fn format_age(secs: i64) -> String {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+fn format_symbol_detail(
+    change: &SymbolChange,
+    hunk_map: &std::collections::HashMap<&str, &Vec<DiffLine>>,
+) -> String {
+    let mut out = String::new();
+    let line = change.line;
+    let end_line = symbol_end_line(change);
+
+    if matches!(change.change, ChangeType::Unchanged) {
+        if !hunk_map.contains_key(super::symbol_key(change).as_str()) {
+            return out;
+        }
+        let _ = writeln!(
+            out,
+            "\n## [ ] {} (L{line}-{end_line}, unchanged)",
+            change.name
+        );
+        return out;
+    }
+
+    let marker = format_marker(&change.change, &change.match_confidence);
+    let label = change_type_label(&change.change);
+
+    let _ = writeln!(
+        out,
+        "\n## {marker} {} — {label} (L{line}-{end_line})",
+        change.name
+    );
+
+    // Signature before/after.
+    if matches!(change.change, ChangeType::SignatureChanged) {
+        if let Some(old_sig) = &change.old_sig {
+            let _ = writeln!(out, "  BEFORE: {old_sig}");
+        }
+        if let Some(new_sig) = &change.new_sig {
+            let _ = writeln!(out, "  AFTER:  {new_sig}");
+        }
+    }
+
+    // Diff lines attributed to this symbol.
+    if let Some(lines) = hunk_map.get(super::symbol_key(change).as_str()) {
+        write_diff_lines(&mut out, lines, line);
+    }
+    out
+}
+
+pub(super) fn format_overview_page(
+    overlays: &[FileOverlay],
+    meta: &[(&Path, bool, bool)],
+    warnings: &[String],
+    label: &str,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> String {
+    let modified = overlays
+        .iter()
+        .flat_map(|overlay| &overlay.symbol_changes)
+        .filter(|change| {
+            matches!(
+                change.change,
+                ChangeType::BodyChanged | ChangeType::SignatureChanged
+            )
+        })
+        .count();
+    let added = overlays
+        .iter()
+        .flat_map(|overlay| &overlay.symbol_changes)
+        .filter(|change| matches!(change.change, ChangeType::Added))
+        .count();
+    let mut header = format!(
+        "# Diff: {label} — {} files, {modified} modified, {added} added",
+        overlays.len()
+    );
+    for warning in warnings {
+        let _ = write!(header, "\n⚠ {warning}");
+    }
+    let (start, end) = page.bounds(overlays.len());
+    let mut indices: Vec<_> = (0..overlays.len()).collect();
+    indices.sort_by_key(|&i| &overlays[i].path);
+    let entries: Vec<_> = indices
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .map(|i| {
+            let text = format_overview(
+                std::slice::from_ref(&overlays[i]),
+                &[meta[i]],
+                &[],
+                label,
+                None,
+            );
+            text.split_once('\n')
+                .map_or(String::new(), |(_, body)| body.trim().into())
+        })
+        .collect();
+    page.render_selected(&header, &entries, overlays.len(), "files", mcp)
+}
+
+pub(super) fn format_file_page(
+    overlay: &FileOverlay,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> String {
+    enum Entry<'a> {
+        Symbol(&'a SymbolChange),
+        Hunk(&'a str, &'a [DiffLine]),
+    }
+    impl Entry<'_> {
+        fn position(&self) -> (u32, &str) {
+            match self {
+                Self::Symbol(change) => (change.line, &change.name),
+                Self::Hunk(name, lines) => (
+                    lines.iter().filter_map(|line| line.line).min().unwrap_or(0),
+                    name,
+                ),
+            }
+        }
+    }
+    let (ins, del) = count_insertions_deletions(overlay);
+    let touched = overlay
+        .symbol_changes
+        .iter()
+        .filter(|change| !matches!(change.change, ChangeType::Unchanged))
+        .count();
+    let header = format!(
+        "# Diff: {} — {touched} symbols touched, +{ins}/−{del} lines",
+        overlay.path.display()
+    );
+    let hunks: std::collections::HashMap<_, _> = overlay
+        .attributed_hunks
+        .iter()
+        .map(|(name, lines)| (name.as_str(), lines))
+        .collect();
+    let mut changes: Vec<_> = overlay
+        .symbol_changes
+        .iter()
+        .filter(|change| {
+            !matches!(change.change, ChangeType::Unchanged)
+                || hunks.contains_key(super::symbol_key(change).as_str())
+        })
+        .collect();
+    changes.sort_by(|a, b| (a.line, &a.name).cmp(&(b.line, &b.name)));
+    let mut orphan: Vec<_> = overlay
+        .attributed_hunks
+        .iter()
+        .filter(|(name, _)| {
+            !overlay
+                .symbol_changes
+                .iter()
+                .any(|change| &super::symbol_key(change) == name)
+        })
+        .collect();
+    orphan.sort_by_key(|(name, _)| name);
+    let mut rows: Vec<_> = changes
+        .into_iter()
+        .map(Entry::Symbol)
+        .chain(
+            orphan
+                .into_iter()
+                .map(|(name, lines)| Entry::Hunk(name, lines)),
+        )
+        .collect();
+    rows.sort_by(|a, b| a.position().cmp(&b.position()));
+    let (start, end) = page.bounds(rows.len());
+    let entries: Vec<_> = rows[start..end]
+        .iter()
+        .map(|entry| match entry {
+            Entry::Symbol(change) => format_symbol_detail(change, &hunks).trim().to_string(),
+            Entry::Hunk(name, lines) => {
+                let mut entry = format!("## {name}\n");
+                write_diff_lines(&mut entry, lines, 1);
+                entry
+            }
+        })
+        .collect();
+    page.render_selected(&header, &entries, rows.len(), "symbol/hunk blocks", mcp)
+}
+
+pub(super) fn format_function_page(
+    overlay: &FileOverlay,
+    name: &str,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> String {
+    let text = format_function_detail(overlay, name);
+    let (header, body) = text.split_once('\n').unwrap_or((&text, ""));
+    let entries = if body.is_empty() {
+        Vec::new()
+    } else {
+        vec![body.into()]
+    };
+    page.render(header, &entries, "symbols", mcp)
+}
+
+pub(super) fn format_log_page(
+    summaries: &[CommitSummary],
+    range: &str,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> String {
+    let files: usize = summaries.iter().map(|summary| summary.overlays.len()).sum();
+    let functions = summaries
+        .iter()
+        .flat_map(|summary| &summary.overlays)
+        .flat_map(|overlay| &overlay.symbol_changes)
+        .filter(|change| !matches!(change.change, ChangeType::Unchanged))
+        .count();
+    let header = format!(
+        "# Log: {range} — {} commits, {files} files, {functions} functions touched",
+        summaries.len()
+    );
+    let (start, end) = page.bounds(summaries.len());
+    let entries: Vec<_> = summaries[start..end]
+        .iter()
+        .map(|summary| {
+            let text = format_log(std::slice::from_ref(summary), range, None);
+            text.split_once('\n')
+                .map_or(String::new(), |(_, body)| body.trim().into())
+        })
+        .collect();
+    page.render_selected(&header, &entries, summaries.len(), "commits", mcp)
+}
 
 #[cfg(test)]
 mod tests {

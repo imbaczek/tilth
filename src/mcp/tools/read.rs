@@ -53,6 +53,15 @@ pub(in crate::mcp) fn read_with_navigation(
     let force_full = full_flag || mode_str == "full";
     let force_signature = mode_str == "signature";
     let force_stripped = mode_str == "stripped";
+    let page_mode = if force_signature {
+        "signature"
+    } else if force_stripped {
+        "stripped"
+    } else if force_full {
+        "full"
+    } else {
+        "auto"
+    };
 
     let paginated = args.get("offset").is_some() || args.get("limit").is_some();
     let page = crate::listing::Page::from_args(args)?;
@@ -93,15 +102,6 @@ pub(in crate::mcp) fn read_with_navigation(
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
-            let markdown_page = paginated
-                && !force_full
-                && !force_signature
-                && !force_stripped
-                && matches!(
-                    crate::lang::detect_file_type(&path),
-                    crate::types::FileType::Markdown
-                );
-            let paging_applied = path.is_dir() || markdown_page;
             let read = if path.is_dir() {
                 if force_signature || force_stripped {
                     Err(TilthError::InvalidQuery {
@@ -111,8 +111,8 @@ pub(in crate::mcp) fn read_with_navigation(
                 } else {
                     crate::read::list_directory(&path, page, mcp_navigation)
                 }
-            } else if markdown_page {
-                crate::read::read_markdown_outline_page(&path, page, mcp_navigation)
+            } else if paginated {
+                read_page_view(&path, page_mode, cache, edit_mode, page, mcp_navigation)
             } else if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
             } else if force_stripped {
@@ -123,16 +123,16 @@ pub(in crate::mcp) fn read_with_navigation(
                 )
             };
             match read {
-                Ok(output) => results.push(if paginated && !paging_applied {
-                    crate::with_ignored_paging_notice(output)
-                } else {
-                    output
-                }),
+                Ok(output) => results.push(output),
                 Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
             }
         }
         let combined = results.join("\n\n");
-        return Ok(apply_budget(&combined, budget));
+        return Ok(if paginated {
+            crate::listing::finish(&combined, budget)
+        } else {
+            apply_budget(&combined, budget)
+        });
     }
 
     // Single file read
@@ -167,23 +167,13 @@ pub(in crate::mcp) fn read_with_navigation(
         session.record_read(&path);
         let output =
             crate::read::list_directory(&path, page, mcp_navigation).map_err(|e| e.to_string())?;
-        return Ok(apply_budget(&output, budget));
+        return Ok(crate::listing::finish(&output, budget));
     }
-    if paginated
-        && section.is_none()
-        && sections_arr.is_none()
-        && !force_full
-        && !force_signature
-        && !force_stripped
-        && matches!(
-            crate::lang::detect_file_type(&path),
-            crate::types::FileType::Markdown
-        )
-    {
+    if paginated && section.is_none() && sections_arr.is_none() {
         session.record_read(&path);
-        let output = crate::read::read_markdown_outline_page(&path, page, mcp_navigation)
+        let output = read_page_view(&path, page_mode, cache, edit_mode, page, mcp_navigation)
             .map_err(|e| e.to_string())?;
-        return Ok(apply_budget(&output, budget));
+        return Ok(crate::listing::finish(&output, budget));
     }
 
     // Multi-section path: bypass smart view + related-file hints (those only
@@ -203,23 +193,32 @@ pub(in crate::mcp) fn read_with_navigation(
             ));
         }
         session.record_read(&path);
-        let output = match budget {
-            Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
-                .map_err(|e| e.to_string())?,
-            None => {
-                crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
+        let output = if paginated {
+            crate::read::read_ranges_page(&path, &ranges, edit_mode, page, mcp_navigation)
+                .map_err(|e| e.to_string())?
+        } else {
+            match budget {
+                Some(b) => crate::read::read_ranges_with_budget(&path, &ranges, edit_mode, b)
+                    .map_err(|e| e.to_string())?,
+                None => crate::read::read_ranges(&path, &ranges, edit_mode)
+                    .map_err(|e| e.to_string())?,
             }
         };
-        let output = if paginated {
-            crate::with_ignored_paging_notice(output)
+        return Ok(if paginated {
+            crate::listing::finish(&output, budget)
         } else {
-            output
-        };
-        return Ok(apply_budget(&output, budget));
+            apply_budget(&output, budget)
+        });
     }
 
     session.record_read(&path);
 
+    if let Some(section) = section.filter(|_| paginated) {
+        let output =
+            crate::read::read_ranges_page(&path, &[section], edit_mode, page, mcp_navigation)
+                .map_err(|e| e.to_string())?;
+        return Ok(crate::listing::finish(&output, budget));
+    }
     let mut output = if section.is_none() && force_signature {
         read_signature_file(&path, cache)
             .map(|(body, _)| body)
@@ -247,11 +246,6 @@ pub(in crate::mcp) fn read_with_navigation(
         }
     }
 
-    let output = if paginated {
-        crate::with_ignored_paging_notice(output)
-    } else {
-        output
-    };
     Ok(apply_budget(&output, budget))
 }
 
@@ -260,6 +254,15 @@ pub(in crate::mcp) fn read_with_navigation(
 // re-parses every call. Wiring a structured cache is a separate change. The param
 // is still used by the non-code fallback (read_file), so it keeps its real name.
 fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32), TilthError> {
+    read_signature_file_page(path, cache, None, false)
+}
+
+fn read_signature_file_page(
+    path: &Path,
+    cache: &OutlineCache,
+    page: Option<crate::listing::Page>,
+    mcp: bool,
+) -> Result<(String, u32), TilthError> {
     let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
@@ -280,7 +283,11 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
     let FileType::Code(lang) = detect_file_type(path) else {
-        let body = crate::read::read_file(path, None, false, cache, false)?;
+        let body = if let Some(page) = page {
+            crate::read::read_file_page(path, false, cache, false, page, mcp)?
+        } else {
+            crate::read::read_file(path, None, false, cache, false)?
+        };
         return Ok((body, line_count));
     };
 
@@ -289,6 +296,35 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
     let header = crate::format::file_header(path, meta.len(), line_count, ViewMode::Signature);
     let entries = get_outline_entries(&content, lang);
     let lines: Vec<&str> = content.lines().collect();
+    if let Some(page) = page {
+        fn blocks(
+            entries: &[OutlineEntry],
+            lines: &[&str],
+            parents: &[String],
+            out: &mut Vec<(u32, usize, String)>,
+        ) {
+            for entry in entries {
+                let mut body = String::new();
+                render_signature_entry(entry, lines, &mut body);
+                if !parents.is_empty() {
+                    body.insert_str(0, &format!("> Within: {}\n", parents.join("::")));
+                }
+                out.push((entry.start_line, parents.len(), body));
+                let mut parents = parents.to_vec();
+                parents.push(entry.name.clone());
+                blocks(&entry.children, lines, &parents, out);
+            }
+        }
+        let mut rows = Vec::new();
+        blocks(&entries, &lines, &[], &mut rows);
+        rows.sort_by_key(|(line, depth, _)| (*line, *depth));
+        if !rows.is_empty() {
+            let rows: Vec<_> = rows.into_iter().map(|(_, _, body)| body).collect();
+            return Ok((page.render(&header, &rows, "declarations", mcp), line_count));
+        }
+        return crate::read::read_file_page(path, true, cache, true, page, mcp)
+            .map(|body| (body, line_count));
+    }
     let mut body = String::new();
     render_signature_entries(&entries, &lines, &mut body);
     if body.is_empty() {
@@ -299,31 +335,54 @@ fn read_signature_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32
 
 fn render_signature_entries(entries: &[OutlineEntry], lines: &[&str], out: &mut String) {
     for entry in entries {
-        let start_idx = entry.start_line.saturating_sub(1) as usize;
-        let end = entry.signature_end;
-        let end_idx = end
-            .map_or(start_idx, |position| {
-                position.line.saturating_sub(1) as usize
-            })
-            .max(start_idx)
-            .min(lines.len().saturating_sub(1));
-
-        for idx in start_idx..=end_idx {
-            let Some(line) = lines.get(idx) else {
-                continue;
-            };
-            let visible = match end.filter(|_| idx == end_idx) {
-                Some(position) if position.column < line.len() => {
-                    line.get(..position.column).unwrap_or(line).trim_end()
-                }
-                _ => line,
-            };
-            let hash = crate::format::line_hash(line.as_bytes());
-            let _ = writeln!(out, "{}:{hash:03x}|{visible}", idx + 1);
-        }
-
+        render_signature_entry(entry, lines, out);
         render_signature_entries(&entry.children, lines, out);
     }
+}
+
+fn render_signature_entry(entry: &OutlineEntry, lines: &[&str], out: &mut String) {
+    let start_idx = entry.start_line.saturating_sub(1) as usize;
+    let end = entry.signature_end;
+    let end_idx = end
+        .map_or(start_idx, |position| {
+            position.line.saturating_sub(1) as usize
+        })
+        .max(start_idx)
+        .min(lines.len().saturating_sub(1));
+
+    for idx in start_idx..=end_idx {
+        let Some(line) = lines.get(idx) else {
+            continue;
+        };
+        let visible = match end.filter(|_| idx == end_idx) {
+            Some(position) if position.column < line.len() => {
+                line.get(..position.column).unwrap_or(line).trim_end()
+            }
+            _ => line,
+        };
+        let hash = crate::format::line_hash(line.as_bytes());
+        let _ = writeln!(out, "{}:{hash:03x}|{visible}", idx + 1);
+    }
+}
+
+fn read_page_view(
+    path: &Path,
+    mode: &str,
+    cache: &OutlineCache,
+    edit: bool,
+    page: crate::listing::Page,
+    mcp: bool,
+) -> Result<String, TilthError> {
+    if mode == "signature" {
+        return read_signature_file_page(path, cache, Some(page), mcp).map(|(body, _)| body);
+    }
+    if mode == "stripped" && matches!(detect_file_type(path), FileType::Code(_)) {
+        let (output, _, _) = read_stripped_file(path, cache)?;
+        let (header, body) = output.split_once("\n\n").unwrap_or((&output, ""));
+        let rows: Vec<_> = body.lines().map(str::to_owned).collect();
+        return Ok(page.render(header, &rows, "retained lines", mcp));
+    }
+    crate::read::read_file_page(path, mode == "full", cache, edit, page, mcp)
 }
 
 // `cache` is intentionally unwired on the tree-sitter path: OutlineCache stores
@@ -774,7 +833,7 @@ mod tests {
         let file =
             run(serde_json::json!({"path":project.path().join("file000.txt"),"offset":0})).unwrap();
         assert!(
-            file.contains("offset and limit ignored") && file.contains("data"),
+            file.contains("Showing source lines 1-1 of 1") && file.contains("data"),
             "{file}"
         );
         let paged_batch = run(serde_json::json!({"paths":[project.path()],"limit":2})).unwrap();
@@ -1086,7 +1145,7 @@ mod markdown_pagination_tests {
                 .extend(extra.as_object().unwrap().clone());
             let output = tool_read(&args, &cache, &session, false).unwrap();
             assert!(
-                output.contains("offset and limit ignored") && output.contains("Root"),
+                !output.contains("ignored") && output.contains("Root"),
                 "{args}: {output}"
             );
         }
@@ -1115,12 +1174,8 @@ mod tolerant_paging_tests {
         .unwrap();
         assert!(output.contains("Showing items 2-2 of 2"), "{output}");
         assert!(output.contains("Requested headings 2-2 of 2"), "{output}");
-        assert_eq!(
-            output.matches("offset and limit ignored").count(),
-            1,
-            "{output}"
-        );
-        assert!(output.contains("hot"), "{output}");
+        assert!(!output.contains("ignored"), "{output}");
+        assert!(output.contains("Showing declarations 0 of 1"), "{output}");
         for field in ["section", "sections"] {
             let mut args =
                 serde_json::json!({"root":dir.path(), "paths":["guide.md"], "offset":1, "limit":1});
@@ -1135,7 +1190,7 @@ mod tolerant_paging_tests {
         for mode in ["full", "signature", "stripped"] {
             let output = tool_read(
                 &serde_json::json!({
-                    "root":dir.path(), "path":"code.rs", "offset":999_999, "limit":1,
+                    "root":dir.path(), "path":"code.rs", "offset":0, "limit":1,
                     "mode":mode, "budget":100
                 }),
                 &cache,
@@ -1144,7 +1199,7 @@ mod tolerant_paging_tests {
             )
             .unwrap();
             assert!(
-                output.contains("offset and limit ignored") && output.contains("hot"),
+                output.contains("Showing") && output.contains("hot"),
                 "{output}"
             );
             assert!(output.len() <= 100 * 4 + 1, "{output}");

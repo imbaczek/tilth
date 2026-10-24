@@ -2209,6 +2209,34 @@ where
     ))
 }
 
+pub(crate) fn search_glob_page(
+    pattern: &str,
+    scope: &Path,
+    page: crate::listing::Page,
+) -> Result<String, TilthError> {
+    let result = glob::search_with_page(pattern, scope, Some(page))?;
+    let mut output = format!(
+        "# Glob: \"{pattern}\" in {}\n\n{}",
+        scope.display(),
+        page.summary(result.total_found, "files")
+    );
+    if result.total_found == 0 && !result.available_extensions.is_empty() {
+        let _ = write!(
+            output,
+            "\n\nNo matches. Available extensions in scope: {}",
+            result.available_extensions.join(", ")
+        );
+    }
+    for file in result.files {
+        let _ = write!(output, "\n  {}", rel(&file.path, scope));
+        if let Some(preview) = file.preview {
+            let _ = write!(output, "  ({preview})");
+        }
+    }
+    page.append_navigation(&mut output, result.total_found, false);
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

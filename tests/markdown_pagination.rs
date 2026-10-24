@@ -127,7 +127,7 @@ fn budgeted_page_does_not_skip_headings_hidden_by_truncation() {
 }
 
 #[test]
-fn markdown_content_views_accept_paging_and_keep_view_precedence() {
+fn markdown_content_views_page_source_and_selected_lines() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("guide.md"), "# Root\n## Child\nbody\n").unwrap();
     for prefix in [vec!["guide.md"], vec!["read", "guide.md"]] {
@@ -137,7 +137,7 @@ fn markdown_content_views_accept_paging_and_keep_view_precedence() {
             args.extend(["--offset", "999999", "--limit", "2"]);
             let output = success(dir.path(), &args);
             assert!(
-                output.contains("offset and limit ignored") && output.contains("body"),
+                output.contains("Showing") && output.contains("0 of"),
                 "{output}"
             );
             assert!(!output.contains("Next page:"), "{output}");

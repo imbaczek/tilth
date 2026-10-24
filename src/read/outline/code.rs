@@ -209,6 +209,37 @@ fn fallback_outline(content: &str, _max_lines: usize) -> String {
     super::fallback::head_tail(content)
 }
 
+/// Uncapped source-ordered declaration blocks, each retaining its ancestor context.
+pub(crate) fn page_blocks(content: &str, lang: Lang) -> Vec<String> {
+    fn gather<'a>(
+        entries: &'a [OutlineEntry],
+        parents: &[String],
+        depth: usize,
+        rows: &mut Vec<(u32, usize, &'a OutlineEntry, Vec<String>)>,
+    ) {
+        for entry in entries {
+            rows.push((entry.start_line, depth, entry, parents.to_vec()));
+            let mut parents = parents.to_vec();
+            parents.push(entry.name.clone());
+            gather(&entry.children, &parents, depth + 1, rows);
+        }
+    }
+    let entries = crate::lang::outline::get_outline_entries(content, lang);
+    let mut rows = Vec::new();
+    gather(&entries, &[], 0, &mut rows);
+    rows.sort_by_key(|(line, depth, _, _)| (*line, *depth));
+    rows.into_iter()
+        .map(|(_, depth, entry, parents)| {
+            let body = format_entry(entry, depth, lang);
+            if parents.is_empty() {
+                body
+            } else {
+                format!("> Within: {}\n{body}", parents.join("::"))
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

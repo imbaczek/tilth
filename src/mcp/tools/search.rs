@@ -54,18 +54,31 @@ pub(in crate::mcp) fn tool_search(
         && scopes.iter().any(|scope| scope.join(query).is_file())
     {
         session.record_search(query);
-        let output = crate::run_expanded_scopes(
-            query, &scopes, None, budget, full, expand, glob, cache, full,
+        let listing_page = if page_requested {
+            Some(crate::listing::Page::from_args(args)?)
+        } else {
+            None
+        };
+        let output = crate::run_expanded_scopes_with_listing(
+            query,
+            &scopes,
+            None,
+            budget,
+            full,
+            expand,
+            glob,
+            cache,
+            full,
+            listing_page.map(|page| (page.offset, Some(page.limit))),
         )
         .map_err(|e| e.to_string())?;
         let mut result = scope_warning.unwrap_or_default();
         result.push_str(&output);
-        let result = if page_requested {
-            crate::with_ignored_paging_notice(result)
+        return Ok(if page_requested {
+            crate::listing::finish(&read_mcp_navigation(&result), budget)
         } else {
-            result
-        };
-        return Ok(apply_budget(&result, budget));
+            apply_budget(&result, budget)
+        });
     }
 
     if page_requested && matches!(kind, "symbol" | "content" | "regex") {
@@ -217,12 +230,30 @@ pub(in crate::mcp) fn tool_search(
         return Ok(crate::budget::apply(&caller_mcp_navigation(&safe), budget));
     }
     result.push_str(&output);
-    let result = if page_requested {
-        crate::with_ignored_paging_notice(result)
-    } else {
-        result
-    };
     Ok(apply_budget(&result, budget))
+}
+
+/// File queries share the CLI reader, so adapt continuation patches before budgeting.
+fn read_mcp_navigation(output: &str) -> String {
+    output
+        .lines()
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("> Next page: --offset ") {
+                let parts: Vec<_> = rest.split_whitespace().collect();
+                if let (Some(offset), Some(limit)) = (
+                    parts.first().and_then(|value| value.parse::<usize>().ok()),
+                    parts.get(2).and_then(|value| value.parse::<usize>().ok()),
+                ) {
+                    return format!(
+                        "> Next page: {} (keep query, scopes and filters unchanged).",
+                        serde_json::json!({"offset":offset,"limit":limit})
+                    );
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Validate rather than silently ignoring malformed paging values.
@@ -1399,7 +1430,7 @@ mod tolerant_paging_tests {
         )
         .unwrap();
         assert!(
-            output.contains("offset and limit ignored") && output.contains("body"),
+            output.contains("Requested headings 1-1 of 1") && !output.contains("ignored"),
             "{output}"
         );
     }

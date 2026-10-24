@@ -125,13 +125,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Skip N directory children sorted by name or Markdown headings in document order (zero-based). Applied independently per path, including batches. Markdown paging uses auto mode without full/section/sections; accepted but ignored on other file views with a notice. TOC addresses stay stable across pages."
+                        "description": "Skip N entries per path, including batches (zero-based). Units: directory children by name; declarations in auto/code and signature; headings in auto/Markdown; source lines in full/section; retained lines in stripped. Original source/hash/TOC addresses remain stable. Explicit code paging requests an uncapped declaration outline even for small files."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "default": 50,
-                        "description": "Directory entries or automatic Markdown headings per page per path (default 50), including batches. Accepted but ignored on other file views with a notice. If budget truncates, retry the same offset with a smaller limit before advancing."
+                        "description": "Entries per page per path (default 50), including batches. Unit depends on mode; see offset. If budget truncates, retry the same offset with a smaller limit or a larger budget before advancing."
                     },
                     "budget": {
                         "type": "number",
@@ -400,7 +400,18 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
     }
 
     for tool in &mut tools {
-        let name = tool["name"].as_str().unwrap_or("");
+        let name = tool["name"].as_str().unwrap_or("").to_owned();
+        if name == "tilth_deps" || name == "tilth_diff" {
+            let unit = if name == "tilth_deps" {
+                "dependency records across local, external, production dependents, then test dependents; paths sorted within each section. Explicit paging collects all exported symbols and callers before selecting the page"
+            } else {
+                "files by path in overview/directory view, symbol/hunk blocks by source order in file detail, or commits in git log order. Keep source/scope/search and the working tree unchanged between pages"
+            };
+            tool["inputSchema"]["properties"]["offset"] = serde_json::json!({"type":"integer","minimum":0,"default":0,
+                "description":format!("Skip N {unit} (zero-based).")});
+            tool["inputSchema"]["properties"]["limit"] = serde_json::json!({"type":"integer","minimum":1,"default":50,
+                "description":"Entries per page (default 50). If budget truncates, retry the same offset with a smaller limit or larger budget before advancing."});
+        }
         if name == "tilth_search" || name == "tilth_list" {
             tool["inputSchema"]["properties"]["gitignore"] = serde_json::json!({
                 "type": "boolean",

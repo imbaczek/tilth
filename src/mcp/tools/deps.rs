@@ -11,6 +11,7 @@ pub(in crate::mcp) fn tool_deps(
     args: &Value,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
+    let page = crate::listing::Page::optional(args)?;
     let path_str = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -27,9 +28,26 @@ pub(in crate::mcp) fn tool_deps(
         .map(|b| b as usize);
 
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
-    let deps_result = crate::search::deps::analyze_deps_with_options(&path, &scope, bloom, full)
-        .map_err(|e| e.to_string())?;
+    let deps_result = crate::search::deps::analyze_deps_with_options(
+        &path,
+        &scope,
+        bloom,
+        full || page.is_some(),
+    )
+    .map_err(|e| e.to_string())?;
     let mut output = scope_warning.unwrap_or_default();
+    if let Some(page) = page {
+        output.push_str(&crate::search::deps::format_deps_page(
+            &deps_result,
+            &scope,
+            page,
+            true,
+        ));
+        return Ok(crate::listing::finish(
+            &output,
+            budget.map(|value| value as u64),
+        ));
+    }
     output.push_str(&crate::search::deps::format_deps_with_options(
         &deps_result,
         &scope,

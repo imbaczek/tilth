@@ -18,6 +18,42 @@ impl Page {
         Ok(Self { offset, limit })
     }
 
+    pub fn optional(args: &serde_json::Value) -> Result<Option<Self>, String> {
+        if args.get("offset").is_some() || args.get("limit").is_some() {
+            Self::from_args(args).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub fn from_tuple(value: (usize, Option<usize>)) -> Result<Self, String> {
+        Self::new(value.0, value.1.unwrap_or(DEFAULT_LIMIT))
+    }
+
+    /// Page complete logical blocks. Headers and entry context are never counted.
+    pub fn render(self, header: &str, entries: &[String], noun: &str, mcp: bool) -> String {
+        let (start, end) = self.bounds(entries.len());
+        self.render_selected(header, &entries[start..end], entries.len(), noun, mcp)
+    }
+
+    /// Render blocks already selected from typed records, without formatting hidden entries.
+    pub fn render_selected(
+        self,
+        header: &str,
+        selected: &[String],
+        total: usize,
+        noun: &str,
+        mcp: bool,
+    ) -> String {
+        let mut out = format!("{header}\n\n{}", self.summary(total, noun));
+        for entry in selected {
+            out.push_str("\n\n");
+            out.push_str(entry);
+        }
+        self.append_navigation(&mut out, total, mcp);
+        out
+    }
+
     pub fn from_args(args: &serde_json::Value) -> Result<Self, String> {
         let parse = |name: &str, default: usize| {
             args.get(name).map_or(Ok(default), |value| {
@@ -72,4 +108,21 @@ impl Page {
             out.push_str("\n> End of listing.");
         }
     }
+}
+
+/// A continuation must never survive an output budget that hides page entries,
+/// including an earlier page in a batch or combined scope response.
+pub(crate) fn finish(output: &str, budget: Option<u64>) -> String {
+    let budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+    if crate::types::estimate_tokens(output.len() as u64) <= budget {
+        return output.into();
+    }
+    let safe = output
+        .lines()
+        .filter(|line| !line.starts_with("> Next page:") && !line.starts_with("> End of listing."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    crate::budget::apply(&format!(
+        "> Page or navigation omitted to fit budget; retry the same offset with a smaller limit or a larger budget.\n\n{safe}"
+    ), budget)
 }

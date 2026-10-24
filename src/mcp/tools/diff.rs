@@ -5,6 +5,7 @@ use crate::diff::DiffSource;
 use super::anchor_path;
 
 pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
+    let page = crate::listing::Page::optional(args)?;
     let source = args.get("source").and_then(|v| v.as_str());
     let scope = args.get("scope").and_then(|v| v.as_str());
     let a = args.get("a").and_then(|v| v.as_str());
@@ -52,7 +53,17 @@ pub(in crate::mcp) fn tool_diff(args: &Value) -> Result<String, String> {
         }
         _ => {}
     }
-    crate::diff::diff(&diff_source, root, scope, search, blast, expand, budget)
+    crate::diff::diff_paginated(
+        &diff_source,
+        root,
+        scope,
+        search,
+        blast,
+        expand,
+        budget,
+        page.map(|page| (page.offset, Some(page.limit))),
+        true,
+    )
 }
 
 #[cfg(test)]
