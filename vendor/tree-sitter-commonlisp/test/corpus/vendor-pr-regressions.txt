@@ -1,0 +1,174 @@
+==================
+LOOP termination clauses
+==================
+(loop for x in xs always (predicate x))
+(loop for x in xs never (predicate x))
+(loop for x in xs thereis (predicate x))
+
+---
+
+(source
+  (list_lit
+    (loop_macro
+      (loop_clause
+        (for_clause
+          (sym_lit)
+          (for_clause_word)
+          (sym_lit)))
+      (loop_clause
+        (while_clause
+          (list_lit
+            (sym_lit)
+            (sym_lit))))))
+  (list_lit
+    (loop_macro
+      (loop_clause
+        (for_clause
+          (sym_lit)
+          (for_clause_word)
+          (sym_lit)))
+      (loop_clause
+        (while_clause
+          (list_lit
+            (sym_lit)
+            (sym_lit))))))
+  (list_lit
+    (loop_macro
+      (loop_clause
+        (for_clause
+          (sym_lit)
+          (for_clause_word)
+          (sym_lit)))
+      (loop_clause
+        (while_clause
+          (list_lit
+            (sym_lit)
+            (sym_lit)))))))
+
+==================
+LOOP conditional END
+==================
+(loop for x in xs when (oddp x) collect x end collect 0)
+
+---
+
+(source
+  (list_lit
+    (loop_macro
+      (loop_clause
+        (for_clause
+          (sym_lit)
+          (for_clause_word)
+          (sym_lit)))
+      (loop_clause
+        (condition_clause
+          (list_lit
+            (sym_lit)
+            (sym_lit))))
+      (loop_clause
+        (accumulation_clause
+          (accumulation_verb)
+          (sym_lit)))
+      (loop_clause
+        (condition_clause))
+      (loop_clause
+        (accumulation_clause
+          (accumulation_verb)
+          (num_lit))))))
+
+==================
+LOOP names accept reader symbols
+==================
+(loop named #:outer for x in xs do (return-from #:outer x))
+(loop named pkg:done return t)
+(loop named |done now| return t)
+(loop named :keyword-name return t)
+(loop named nil return t)
+(defun following-named-loops () t)
+
+---
+
+(source
+  (list_lit
+    (loop_macro
+      (loop_named_clause
+        (kwd_lit
+          (kwd_symbol)))
+      (loop_clause
+        (for_clause
+          (sym_lit)
+          (for_clause_word)
+          (sym_lit)))
+      (loop_clause
+        (do_clause
+          (list_lit
+            (sym_lit)
+            (kwd_lit
+              (kwd_symbol))
+            (sym_lit))))))
+  (list_lit
+    (loop_macro
+      (loop_named_clause
+        (package_lit
+          (sym_lit)
+          (sym_lit)))
+      (loop_clause
+        (termination_clause
+          (sym_lit)))))
+  (list_lit
+    (loop_macro
+      (loop_named_clause
+        (fancy_literal))
+      (loop_clause
+        (termination_clause
+          (sym_lit)))))
+  (list_lit
+    (loop_macro
+      (loop_named_clause
+        (kwd_lit
+          (kwd_symbol)))
+      (loop_clause
+        (termination_clause
+          (sym_lit)))))
+  (list_lit
+    (loop_macro
+      (loop_named_clause
+        (nil_lit))
+      (loop_clause
+        (termination_clause
+          (sym_lit)))))
+  (list_lit
+    (defun
+      (defun_header
+        (defun_keyword)
+        (sym_lit)
+        (list_lit))
+      (sym_lit))))
+
+==================
+Named LOOP-shaped lambda-list data
+==================
+(defun data (&aux (loop named)) loop)
+(defun after-data () t)
+
+---
+
+(source
+  (list_lit
+    (defun
+      (defun_header
+        (defun_keyword)
+        (sym_lit)
+        (list_lit
+          (sym_lit)
+          (list_lit
+            (sym_lit)
+            (sym_lit))))
+      (sym_lit)))
+  (list_lit
+    (defun
+      (defun_header
+        (defun_keyword)
+        (sym_lit)
+        (list_lit))
+      (sym_lit))))

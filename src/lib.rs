@@ -440,7 +440,21 @@ fn run_inner_scopes(
         .cloned()
         .collect();
     let scopes = scopes.as_slice();
-    let classifications: Vec<_> = scopes.iter().map(|scope| classify(query, scope)).collect();
+    let mut classifications: Vec<_> = scopes.iter().map(|scope| classify(query, scope)).collect();
+    let lisp_symbol = classifications
+        .iter()
+        .all(|kind| matches!(kind, QueryType::Glob(_) | QueryType::Content(_)))
+        && lang::commonlisp::needs_symbol_probe(query)
+        && lang::commonlisp::has_definition(query, scopes, glob);
+    if lisp_symbol {
+        // An exact path retains priority over an ambiguous Lisp symbol/glob.
+        for (scope, kind) in scopes.iter().zip(&mut classifications) {
+            let path = scope.join(query);
+            if path.exists() {
+                *kind = QueryType::FilePath(path);
+            }
+        }
+    }
     let multi_scope = scopes.len() > 1;
     let has_file_path = classifications
         .iter()
@@ -450,6 +464,12 @@ fn run_inner_scopes(
     } else {
         classifications[0].clone()
     };
+    let query_type =
+        if lisp_symbol && matches!(query_type, QueryType::Glob(_) | QueryType::Content(_)) {
+            QueryType::Symbol(query.to_string())
+        } else {
+            query_type
+        };
     if listing_page.is_some() && !matches!(query_type, QueryType::FilePath(_)) {
         return Err(TilthError::InvalidQuery {
             query: query.to_string(),

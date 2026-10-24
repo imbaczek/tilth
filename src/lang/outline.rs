@@ -80,6 +80,9 @@ pub(crate) fn walk_top_level(
     lines: &[&str],
     lang: Lang,
 ) -> Vec<OutlineEntry> {
+    if lang == Lang::CommonLisp {
+        return super::commonlisp::outline(root, lines);
+    }
     let mut entries = Vec::new();
     let mut cursor = root.walk();
 

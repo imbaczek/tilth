@@ -112,6 +112,15 @@ fn resolve_by_name(name: &str, scope: &Path) -> Result<(ResolvedTarget, String, 
         if let Some(resolved) = resolve_qualified_method(prefix, bare, scope)? {
             return Ok(resolved);
         }
+        // Keep qualified method precedence in mixed-language checkouts. A Lisp
+        // package-qualified symbol is tried when no such method exists.
+        if name.contains(':') {
+            if let Some(resolved) = resolve_def_by_query(name, scope)? {
+                if resolved.2 == Lang::CommonLisp {
+                    return Ok(resolved);
+                }
+            }
+        }
     } else if let Some(resolved) = resolve_def_by_query(name, scope)? {
         return Ok(resolved);
     }
@@ -300,7 +309,15 @@ fn enrich_from_outline(
         other => other,
     })?;
     let entries = get_outline_entries(&content, lang);
-    let entry = find_named_entry_at_line(&entries, start_line, split_qualified(&name))
+    let lookup_name = if lang == Lang::CommonLisp {
+        entries
+            .iter()
+            .find(|entry| crate::lang::commonlisp::names_equal(&entry.name, &name))
+            .map_or(name.as_str(), |entry| entry.name.as_str())
+    } else {
+        split_qualified(&name)
+    };
+    let entry = find_named_entry_at_line(&entries, start_line, lookup_name)
         .or_else(|| find_by_start_line(&entries, start_line))
         .or_else(|| find_entry_at_line(&entries, start_line));
     let target = match entry {
@@ -312,7 +329,7 @@ fn enrich_from_outline(
             if go_binding {
                 target.name.clone_from(&name);
             }
-            if e.name != split_qualified(&name) && !go_binding {
+            if e.name != lookup_name && !go_binding {
                 target.resolution_note = Some(format!(
                     "definition `{name}` is missing from the outline; showing enclosing {} `{}`",
                     kind_label(e.kind),

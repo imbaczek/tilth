@@ -38,6 +38,7 @@ pub enum Lang {
     Kotlin,
     CSharp,
     Elixir,
+    CommonLisp,
     Bash,
     Dockerfile,
     Make,

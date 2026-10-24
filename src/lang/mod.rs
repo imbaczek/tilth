@@ -6,6 +6,7 @@ pub(crate) mod spec;
 
 pub(crate) mod bash;
 pub(crate) mod c;
+pub(crate) mod commonlisp;
 pub(crate) mod cpp;
 pub(crate) mod csharp;
 pub(crate) mod dockerfile;
@@ -49,6 +50,7 @@ const ALL_LANGS: &[Lang] = &[
     Lang::Kotlin,
     Lang::CSharp,
     Lang::Elixir,
+    Lang::CommonLisp,
     Lang::Dockerfile,
     Lang::Make,
     Lang::Bash,
