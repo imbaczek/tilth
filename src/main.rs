@@ -92,12 +92,13 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Skip N directory entries, Markdown headings, or ranked call sites per scope (0-based).
+    /// Skip N directory entries, automatic Markdown headings, or ranked call sites per scope (0-based).
+    /// Accepted but ignored on other views (with a notice).
     #[arg(long)]
     offset: Option<usize>,
 
     /// Entries per directory/Markdown page (default 50), or call sites per scope (10/100).
-    /// Output remains subject to --budget. Requires a directory/Markdown path or --callers.
+    /// Output remains subject to --budget. Accepted but ignored on other views (with a notice).
     #[arg(long)]
     limit: Option<std::num::NonZeroUsize>,
 
@@ -139,8 +140,6 @@ impl SearchOptions {
             Some("--callers conflicts with --deps, --map, and --edit")
         } else if self.deps && (self.map || edit) {
             Some("--deps conflicts with --map and --edit")
-        } else if (self.offset.is_some() || self.limit.is_some()) && (self.deps || self.map) {
-            Some("--offset and --limit require a directory/Markdown path or --callers")
         } else if self.map && (self.expand.is_some() || self.section.is_some() || self.full) {
             Some("--map conflicts with --expand, --section, and --full")
         } else {
@@ -178,10 +177,12 @@ enum Command {
         /// Maximum output tokens; also accepted before read.
         #[arg(long)]
         budget: Option<u64>,
-        /// Skip N directory entries or Markdown headings (zero-based).
+        /// Skip N directory entries or automatic Markdown headings per path (zero-based).
+        /// Accepted but ignored on other views (with a notice); explicit content modes take precedence.
         #[arg(long)]
         offset: Option<usize>,
-        /// Directory entries or Markdown headings per page (default 50).
+        /// Directory entries or automatic Markdown headings per page, per path (default 50).
+        /// Accepted but ignored on other views (with a notice); explicit content modes take precedence.
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
         /// Emit hash anchors; also accepted before read.
@@ -481,6 +482,11 @@ fn main() {
                 .map_err(|source| tilth::error::scope_io_error(scope, source))?;
             Ok(tilth::map::generate(scope, 3, cli.search.budget, &cache))
         });
+        let output = if cli.search.offset.is_some() || cli.search.limit.is_some() {
+            tilth::with_ignored_paging_notice(output)
+        } else {
+            output
+        };
         let output = apply_optional_budget(output, cli.search.budget);
         emit_output(&output, is_tty);
         return;
@@ -539,7 +545,22 @@ fn main() {
             std::fs::metadata(scope)
                 .map_err(|source| tilth::error::scope_io_error(scope, source))?;
             let path = resolve_query_path(&query, scope);
-            tilth::run_deps_with_options(&path, scope, cli.search.budget, cli.search.full)
+            let ignored_page = cli.search.offset.is_some() || cli.search.limit.is_some();
+            let deps_budget = if ignored_page {
+                None
+            } else {
+                cli.search.budget
+            };
+            tilth::run_deps_with_options(&path, scope, deps_budget, cli.search.full).map(|output| {
+                if ignored_page {
+                    apply_optional_budget(
+                        tilth::with_ignored_paging_notice(output),
+                        cli.search.budget,
+                    )
+                } else {
+                    output
+                }
+            })
         });
         emit_result(result, &query, cli.search.json, is_tty);
         return;

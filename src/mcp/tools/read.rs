@@ -56,14 +56,11 @@ pub(in crate::mcp) fn read_with_navigation(
 
     let paginated = args.get("offset").is_some() || args.get("limit").is_some();
     let page = crate::listing::Page::from_args(args)?;
-    if paginated && args.get("paths").is_some() {
-        return Err(
-            "offset and limit require a single directory or Markdown path, not paths".into(),
-        );
-    }
-
     // Multi-file batch read (capped at 20 to bound I/O)
     if let Some(paths_arr) = args.get("paths").and_then(|v| v.as_array()) {
+        if args.get("section").is_some() || args.get("sections").is_some() {
+            return Err("section/sections require a single path, not paths".into());
+        }
         if paths_arr.len() > 20 {
             return Err(format!(
                 "batch read limited to 20 files (got {})",
@@ -96,6 +93,15 @@ pub(in crate::mcp) fn read_with_navigation(
             let path_str = p.as_str().ok_or("paths must be an array of strings")?;
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
+            let markdown_page = paginated
+                && !force_full
+                && !force_signature
+                && !force_stripped
+                && matches!(
+                    crate::lang::detect_file_type(&path),
+                    crate::types::FileType::Markdown
+                );
+            let paging_applied = path.is_dir() || markdown_page;
             let read = if path.is_dir() {
                 if force_signature || force_stripped {
                     Err(TilthError::InvalidQuery {
@@ -105,6 +111,8 @@ pub(in crate::mcp) fn read_with_navigation(
                 } else {
                     crate::read::list_directory(&path, page, mcp_navigation)
                 }
+            } else if markdown_page {
+                crate::read::read_markdown_outline_page(&path, page, mcp_navigation)
             } else if force_signature {
                 read_signature_file(&path, cache).map(|(body, _)| body)
             } else if force_stripped {
@@ -115,7 +123,11 @@ pub(in crate::mcp) fn read_with_navigation(
                 )
             };
             match read {
-                Ok(output) => results.push(output),
+                Ok(output) => results.push(if paginated && !paging_applied {
+                    crate::with_ignored_paging_notice(output)
+                } else {
+                    output
+                }),
                 Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
             }
         }
@@ -157,18 +169,17 @@ pub(in crate::mcp) fn read_with_navigation(
             crate::read::list_directory(&path, page, mcp_navigation).map_err(|e| e.to_string())?;
         return Ok(apply_budget(&output, budget));
     }
-    if paginated {
-        if section.is_some()
-            || sections_arr.is_some()
-            || force_full
-            || force_signature
-            || force_stripped
-        {
-            return Err(
-                "Markdown outline pagination requires auto mode without full, section, or sections"
-                    .into(),
-            );
-        }
+    if paginated
+        && section.is_none()
+        && sections_arr.is_none()
+        && !force_full
+        && !force_signature
+        && !force_stripped
+        && matches!(
+            crate::lang::detect_file_type(&path),
+            crate::types::FileType::Markdown
+        )
+    {
         session.record_read(&path);
         let output = crate::read::read_markdown_outline_page(&path, page, mcp_navigation)
             .map_err(|e| e.to_string())?;
@@ -199,7 +210,12 @@ pub(in crate::mcp) fn read_with_navigation(
                 crate::read::read_ranges(&path, &ranges, edit_mode).map_err(|e| e.to_string())?
             }
         };
-        return Ok(output);
+        let output = if paginated {
+            crate::with_ignored_paging_notice(output)
+        } else {
+            output
+        };
+        return Ok(apply_budget(&output, budget));
     }
 
     session.record_read(&path);
@@ -231,6 +247,11 @@ pub(in crate::mcp) fn read_with_navigation(
         }
     }
 
+    let output = if paginated {
+        crate::with_ignored_paging_notice(output)
+    } else {
+        output
+    };
     Ok(apply_budget(&output, budget))
 }
 
@@ -750,10 +771,17 @@ mod tests {
             args[key] = value;
             assert!(run(args.clone()).is_err(), "accepted {args}");
         }
+        let file =
+            run(serde_json::json!({"path":project.path().join("file000.txt"),"offset":0})).unwrap();
         assert!(
-            run(serde_json::json!({"path":project.path().join("file000.txt"),"offset":0})).is_err()
+            file.contains("offset and limit ignored") && file.contains("data"),
+            "{file}"
         );
-        assert!(run(serde_json::json!({"paths":[project.path()],"limit":2})).is_err());
+        let paged_batch = run(serde_json::json!({"paths":[project.path()],"limit":2})).unwrap();
+        assert!(
+            paged_batch.contains("Showing items 1-2 of 55"),
+            "{paged_batch}"
+        );
         let batch = run(serde_json::json!({"paths":[project.path()]})).unwrap();
         assert!(
             batch.contains(r#""offset":50"#) && !batch.contains("--offset"),
@@ -1056,7 +1084,90 @@ mod markdown_pagination_tests {
             args.as_object_mut()
                 .unwrap()
                 .extend(extra.as_object().unwrap().clone());
-            assert!(tool_read(&args, &cache, &session, false).is_err(), "{args}");
+            let output = tool_read(&args, &cache, &session, false).unwrap();
+            assert!(
+                output.contains("offset and limit ignored") && output.contains("Root"),
+                "{args}: {output}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tolerant_paging_tests {
+    use super::*;
+
+    #[test]
+    fn mixed_batch_pages_each_eligible_path_and_notes_other_views() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("guide.md"), "# Root\n## Child\nbody\n").unwrap();
+        std::fs::write(dir.path().join("code.rs"), "pub fn hot() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let output = tool_read(
+            &serde_json::json!({
+                "root":dir.path(), "paths":[".","guide.md","code.rs"], "offset":1, "limit":1
+            }),
+            &cache,
+            &session,
+            false,
+        )
+        .unwrap();
+        assert!(output.contains("Showing items 2-2 of 2"), "{output}");
+        assert!(output.contains("Requested headings 2-2 of 2"), "{output}");
+        assert_eq!(
+            output.matches("offset and limit ignored").count(),
+            1,
+            "{output}"
+        );
+        assert!(output.contains("hot"), "{output}");
+        for field in ["section", "sections"] {
+            let mut args =
+                serde_json::json!({"root":dir.path(), "paths":["guide.md"], "offset":1, "limit":1});
+            args[field] = if field == "section" {
+                serde_json::json!("Child")
+            } else {
+                serde_json::json!(["Child"])
+            };
+            let error = tool_read(&args, &cache, &session, false).unwrap_err();
+            assert!(error.contains("single path"), "{error}");
+        }
+        for mode in ["full", "signature", "stripped"] {
+            let output = tool_read(
+                &serde_json::json!({
+                    "root":dir.path(), "path":"code.rs", "offset":999_999, "limit":1,
+                    "mode":mode, "budget":100
+                }),
+                &cache,
+                &session,
+                false,
+            )
+            .unwrap();
+            assert!(
+                output.contains("offset and limit ignored") && output.contains("hot"),
+                "{output}"
+            );
+            assert!(output.len() <= 100 * 4 + 1, "{output}");
+        }
+        for paths in [
+            serde_json::json!({"path":"code.rs"}),
+            serde_json::json!({"paths":["guide.md","code.rs"]}),
+        ] {
+            for (key, value) in [
+                ("offset", serde_json::json!(-1)),
+                ("offset", serde_json::json!(0.5)),
+                ("offset", Value::Null),
+                ("limit", serde_json::json!(0)),
+                ("limit", serde_json::json!("2")),
+                ("limit", Value::Null),
+            ] {
+                let mut args = paths.clone();
+                args["root"] = serde_json::json!(dir.path());
+                args[key] = value;
+                assert!(tool_read(&args, &cache, &session, false)
+                    .unwrap_err()
+                    .contains(key));
+            }
         }
     }
 }

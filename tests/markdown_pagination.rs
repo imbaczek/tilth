@@ -127,25 +127,36 @@ fn budgeted_page_does_not_skip_headings_hidden_by_truncation() {
 }
 
 #[test]
-fn markdown_pages_reject_content_modes_and_batches() {
-    let dir = fixture();
+fn markdown_content_views_accept_paging_and_keep_view_precedence() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("guide.md"), "# Root\n## Child\nbody\n").unwrap();
     for prefix in [vec!["guide.md"], vec!["read", "guide.md"]] {
-        for option in ["--full", "--section"] {
+        for extra in [vec!["--full"], vec!["--section", "Child"]] {
             let mut args = prefix.clone();
-            args.extend(["--limit", "2", option]);
-            if option == "--section" {
-                args.push("Root");
-            }
-            assert!(!run(dir.path(), &args).status.success(), "{args:?}");
+            args.extend(extra);
+            args.extend(["--offset", "999999", "--limit", "2"]);
+            let output = success(dir.path(), &args);
+            assert!(
+                output.contains("offset and limit ignored") && output.contains("body"),
+                "{output}"
+            );
+            assert!(!output.contains("Next page:"), "{output}");
         }
     }
-    for args in [
-        vec!["read", "guide.md", "--mode", "signature", "--limit", "2"],
-        vec!["read", "guide.md", "guide.md", "--limit", "2"],
-        vec!["guide.md", "--limit", "0"],
-    ] {
-        assert!(!run(dir.path(), &args).status.success(), "{args:?}");
-    }
+    assert!(!run(dir.path(), &["guide.md", "--limit", "0"])
+        .status
+        .success());
+    let batch = success(
+        dir.path(),
+        &[
+            "read", "guide.md", "guide.md", "--offset", "1", "--limit", "1",
+        ],
+    );
+    assert_eq!(
+        batch.matches("Requested headings 2-2 of 2").count(),
+        2,
+        "{batch}"
+    );
 }
 
 #[test]
@@ -171,7 +182,7 @@ fn markdown_extension_and_small_file_pages_work() {
 }
 
 #[test]
-fn markdown_paging_rejects_multiple_relative_files_but_allows_one_absolute_file() {
+fn markdown_paging_applies_per_scope_and_deduplicates_absolute_files() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["one", "two"] {
         fs::create_dir(dir.path().join(name)).unwrap();
@@ -185,7 +196,13 @@ fn markdown_paging_rejects_multiple_relative_files_but_allows_one_absolute_file(
     let mut args = vec![
         "guide.md", "--scope", "one", "--scope", "two", "--limit", "1",
     ];
-    assert!(!run(dir.path(), &args).status.success());
+    let relative = success(dir.path(), &args);
+    assert_eq!(
+        relative.matches("Requested headings 1-1 of 2").count(),
+        2,
+        "{relative}"
+    );
+    assert_eq!(rows(&relative).len(), 2, "{relative}");
     args[0] = path.to_str().unwrap();
     let output = success(dir.path(), &args);
     assert_eq!(rows(&output).len(), 1, "{output}");

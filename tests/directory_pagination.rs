@@ -79,20 +79,12 @@ fn directory_queries_and_read_share_stable_pages() {
 }
 
 #[test]
-fn directory_pagination_rejects_unsupported_queries_and_bad_limits() {
+fn directory_pagination_rejects_bad_limits_and_incompatible_views() {
     let root = fixture();
     for args in [
         vec![".", "--limit", "0"],
         vec!["read", ".", "--limit", "0"],
         vec![".", "--offset", "-1"],
-        vec!["entry000.txt", "--limit", "2"],
-        vec!["search", "entry000.txt", "--limit", "2"],
-        vec!["read", "entry000.txt", "--offset", "0"],
-        vec!["unknown_symbol", "--limit", "2"],
-        vec!["*.txt", "--offset", "0"],
-        vec![".", "--map", "--offset", "0"],
-        vec![".", "--deps", "--limit", "1"],
-        vec!["read", ".", ".", "--limit", "1"],
         vec!["read", ".", "--mode", "signature"],
         vec![".", "--section", "1-2"],
     ] {
@@ -191,4 +183,72 @@ fn empty_listing_and_extreme_offset_have_clear_terminal_pages() {
         );
         assert!(!out.contains("Next page:"), "{out}");
     }
+}
+
+#[test]
+fn paging_options_are_accepted_on_other_views_with_a_notice() {
+    let root = fixture();
+    fs::write(root.path().join("code.rs"), "pub fn hot() {}\n").unwrap();
+    for prefix in [
+        vec!["entry000.txt"],
+        vec!["search", "entry000.txt"],
+        vec!["read", "entry000.txt"],
+        vec!["read", "code.rs", "--mode", "signature"],
+        vec!["read", "code.rs", "--mode", "stripped"],
+        vec!["unknown_symbol"],
+        vec!["hot"],
+        vec!["hot,cold"],
+        vec!["/hot/"],
+        vec!["*.txt"],
+        vec![".", "--map"],
+        vec!["code.rs", "--deps"],
+    ] {
+        for page in [
+            vec!["--offset", "0"],
+            vec!["--limit", "2"],
+            vec!["--offset", "999999", "--limit", "2"],
+        ] {
+            let mut args = prefix.clone();
+            args.extend(page);
+            let output = success(root.path(), &args);
+            assert!(
+                output.contains("offset and limit ignored"),
+                "{args:?}: {output}"
+            );
+            assert!(!output.contains("Next page:"), "{args:?}: {output}");
+        }
+    }
+    let output = success(
+        root.path(),
+        &["read", ".", ".", "--offset", "54", "--limit", "1"],
+    );
+    assert_eq!(
+        output.matches("Showing items 55-55 of 58").count(),
+        2,
+        "{output}"
+    );
+    let output = success(root.path(), &["hot", "--limit", "2", "--budget", "80"]);
+    assert!(output.contains("offset and limit ignored"), "{output}");
+    assert!(output.len() <= 80 * 4 + 1, "{output}");
+}
+
+#[test]
+fn ignored_paging_notice_fits_deps_budget() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("code.rs"), "pub fn hot() {}\n").unwrap();
+    for i in 0..30 {
+        fs::write(
+            root.path().join(format!("caller{i}.rs")),
+            format!("fn caller{i}() {{ hot(); }}\n"),
+        )
+        .unwrap();
+    }
+    let output = success(
+        root.path(),
+        &[
+            "code.rs", "--deps", "--offset", "0", "--limit", "1", "--budget", "80",
+        ],
+    );
+    assert!(output.contains("offset and limit ignored"), "{output}");
+    assert!(output.len() <= 80 * 4 + 1, "{output}");
 }

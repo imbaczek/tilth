@@ -236,8 +236,18 @@ pub fn run_expanded_scopes(
     )
 }
 
-/// Run queries with optional directory pagination. Paging arguments are rejected
-/// for queries that do not resolve to directories.
+/// Explain accepted paging arguments on a view that does not paginate.
+#[must_use]
+pub fn with_ignored_paging_notice(mut output: String) -> String {
+    output.insert_str(
+        0,
+        "> offset and limit ignored: this view does not support pagination.\n\n",
+    );
+    output
+}
+
+/// Run queries with optional directory or automatic Markdown outline pagination.
+/// Other views accept valid paging arguments and report that they are ignored.
 pub fn run_expanded_scopes_with_listing(
     query: &str,
     scopes: &[PathBuf],
@@ -470,14 +480,16 @@ fn run_inner_scopes(
         } else {
             query_type
         };
-    if listing_page.is_some() && !matches!(query_type, QueryType::FilePath(_)) {
-        return Err(TilthError::InvalidQuery {
-            query: query.to_string(),
-            reason:
-                "offset and limit require --callers, a directory path, or a Markdown file outline"
-                    .into(),
-        });
+    if let Some((offset, limit)) = listing_page {
+        listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT)).map_err(|reason| {
+            TilthError::InvalidQuery {
+                query: query.into(),
+                reason,
+            }
+        })?;
     }
+    let ignored_search_page =
+        listing_page.is_some() && !matches!(query_type, QueryType::FilePath(_));
     let use_expanded =
         expand > 0 && !matches!(query_type, QueryType::FilePath(_) | QueryType::Glob(_));
 
@@ -516,6 +528,11 @@ fn run_inner_scopes(
                 cli_full,
                 budget_tokens,
             )?;
+            let output = if ignored_search_page {
+                with_ignored_paging_notice(output)
+            } else {
+                output
+            };
             return match budget_tokens {
                 Some(budget) => Ok(budget::apply(&output, budget)),
                 None => Ok(output),
@@ -559,34 +576,30 @@ fn run_inner_scopes(
                                 })?;
                         read::list_directory(&path, page, false)
                     }
-                } else if let Some((offset, limit)) = listing_page {
-                    if multi_scope
-                        && !Path::new(query).is_absolute()
+                } else if let Some((offset, limit)) = listing_page.filter(|_| {
+                    section.is_none()
+                        && !full
                         && matches!(
                             crate::lang::detect_file_type(&path),
                             crate::types::FileType::Markdown
                         )
-                    {
-                        Err(TilthError::InvalidQuery {
-                            query: query.to_string(),
-                            reason: "Markdown outline pagination requires a single scope".into(),
-                        })
-                    } else if section.is_some() || full {
-                        Err(TilthError::InvalidQuery {
-                            query: query.to_string(),
-                            reason: "Markdown outline pagination cannot be combined with section or full".into(),
-                        })
-                    } else {
-                        let page =
-                            listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT))
-                                .map_err(|reason| TilthError::InvalidQuery {
-                                    query: query.to_string(),
-                                    reason,
-                                })?;
-                        read::read_markdown_outline_page(&path, page, false)
-                    }
+                }) {
+                    let page = listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT))
+                        .map_err(|reason| TilthError::InvalidQuery {
+                            query: query.into(),
+                            reason,
+                        })?;
+                    read::read_markdown_outline_page(&path, page, false)
                 } else {
-                    read_file_query(&path, scope, section, full, cache, budget_tokens)
+                    read_file_query(&path, scope, section, full, cache, budget_tokens).map(
+                        |output| {
+                            if listing_page.is_some() {
+                                with_ignored_paging_notice(output)
+                            } else {
+                                output
+                            }
+                        },
+                    )
                 };
                 match read {
                     Ok(output) => {
@@ -609,7 +622,13 @@ fn run_inner_scopes(
             let mut outputs = Vec::new();
             let mut failures = Vec::new();
             for scope in scopes {
-                match search::search_glob(&pattern, scope) {
+                match search::search_glob(&pattern, scope).map(|output| {
+                    if ignored_search_page {
+                        with_ignored_paging_notice(output)
+                    } else {
+                        output
+                    }
+                }) {
                     Ok(output) => {
                         if multi_scope {
                             let output = apply_budget(output, budget_tokens);
@@ -639,6 +658,11 @@ fn run_inner_scopes(
         _ => run_query_basic(&query_type, scopes, cache, glob, cli_full)?,
     };
 
+    let output = if ignored_search_page {
+        with_ignored_paging_notice(output)
+    } else {
+        output
+    };
     // Expanded search already fits to budget; this preserves the no-op fast path.
     match budget_tokens {
         Some(budget) => Ok(budget::apply(&output, budget)),

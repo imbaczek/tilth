@@ -59,12 +59,12 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Skip N ranked call sites per target (zero-based). Only supported for kind: callers. Keep query, scope, context and filters unchanged between pages."
+                        "description": "Skip N ranked call sites per target (zero-based). Applied for kind: callers; accepted but ignored for other kinds with a notice. Keep query, scope, context and filters unchanged between pages."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Call sites per page per target. Only supported for kind: callers. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
+                        "description": "Call sites per page per target. Applied for kind: callers; accepted but ignored for other kinds with a notice. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
                     },
                     "context": {
                         "type": "string",
@@ -99,7 +99,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple file paths to read in one call. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
+                        "description": "Multiple file paths to read in one call. Section selection requires path instead of paths. Each file gets independent smart handling. Saves round-trips vs multiple single reads."
                     },
                     "section": {
                         "type": "string",
@@ -125,13 +125,13 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Skip N directory children sorted by name or Markdown headings in document order (zero-based). Single path only; Markdown paging requires auto mode without full/section/sections. TOC addresses stay stable across pages."
+                        "description": "Skip N directory children sorted by name or Markdown headings in document order (zero-based). Applied independently per path, including batches. Markdown paging uses auto mode without full/section/sections; accepted but ignored on other file views with a notice. TOC addresses stay stable across pages."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
                         "default": 50,
-                        "description": "Directory entries or Markdown headings per page (default 50). Single path only. If budget truncates, retry the same offset with a smaller limit before advancing."
+                        "description": "Directory entries or automatic Markdown headings per page per path (default 50), including batches. Accepted but ignored on other file views with a notice. If budget truncates, retry the same offset with a smaller limit before advancing."
                     },
                     "budget": {
                         "type": "number",

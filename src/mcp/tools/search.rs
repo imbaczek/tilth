@@ -33,9 +33,8 @@ pub(in crate::mcp) fn tool_search(
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(2) as usize;
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
-    if kind != "callers" && (args.get("offset").is_some() || args.get("limit").is_some()) {
-        return Err("offset and limit are supported only for kind: callers".into());
-    }
+    let ignored_page =
+        kind != "callers" && (args.get("offset").is_some() || args.get("limit").is_some());
     let offset = caller_page_argument(args, "offset", 0, 0)?;
     let limit = caller_page_argument(args, "limit", if full { 100 } else { 10 }, 1)?;
     let context_path = args
@@ -60,8 +59,13 @@ pub(in crate::mcp) fn tool_search(
         )
         .map_err(|e| e.to_string())?;
         let mut result = scope_warning.unwrap_or_default();
-        result.push_str(&apply_budget(&output, budget));
-        return Ok(result);
+        result.push_str(&output);
+        let result = if ignored_page {
+            crate::with_ignored_paging_notice(result)
+        } else {
+            result
+        };
+        return Ok(apply_budget(&result, budget));
     }
 
     let output = match kind {
@@ -201,8 +205,13 @@ pub(in crate::mcp) fn tool_search(
         let safe = crate::prepare_callers_output_budget(&formatted, budget);
         return Ok(crate::budget::apply(&caller_mcp_navigation(&safe), budget));
     }
-    result.push_str(&apply_budget(&output, budget));
-    Ok(result)
+    result.push_str(&output);
+    let result = if ignored_page {
+        crate::with_ignored_paging_notice(result)
+    } else {
+        result
+    };
+    Ok(apply_budget(&result, budget))
 }
 
 /// Validate rather than silently ignoring malformed paging values.
@@ -328,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn caller_mcp_pagination_rejects_invalid_arguments() {
+    fn mcp_pagination_validates_arguments_for_every_search_kind() {
         let root = tempfile::tempdir().unwrap();
         let cache = OutlineCache::new();
         let session = Session::new();
@@ -344,17 +353,20 @@ mod tests {
             ("limit", serde_json::json!(true)),
             ("limit", Value::Null),
         ] {
-            let mut args = serde_json::json!({"query":"hot","kind":"callers","scope":root.path()});
-            args[name] = value;
-            let error = tool_search(&args, &cache, &session, &bloom).unwrap_err();
-            assert!(error.contains(name), "{error}");
+            for kind in ["callers", "symbol", "content", "regex"] {
+                let mut args = serde_json::json!({"query":"hot","kind":kind,"scope":root.path()});
+                args[name] = value.clone();
+                let error = tool_search(&args, &cache, &session, &bloom).unwrap_err();
+                assert!(error.contains(name), "{error}");
+            }
         }
         for kind in ["symbol", "content", "regex"] {
             for name in ["offset", "limit"] {
                 let mut args = serde_json::json!({"query":"hot","kind":kind,"scope":root.path()});
                 args[name] = 1.into();
-                let error = tool_search(&args, &cache, &session, &bloom).unwrap_err();
-                assert!(error.contains("callers"), "{error}");
+                let output = tool_search(&args, &cache, &session, &bloom).unwrap();
+                assert!(output.contains("offset and limit ignored"), "{output}");
+                assert!(!output.contains("Next page:"), "{output}");
             }
         }
     }
@@ -1330,6 +1342,54 @@ mod tests {
             search.pointer("/inputSchema/properties/full/type"),
             Some(&Value::from("boolean")),
             "tilth_search must advertise a boolean `full`: {search}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tolerant_paging_tests {
+    use super::*;
+
+    #[test]
+    fn accepted_search_paging_keeps_results_and_budget() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("code.rs"), "pub fn hot() {}\n").unwrap();
+        let cache = OutlineCache::new();
+        let session = Session::new();
+        let bloom = Arc::new(BloomFilterCache::new());
+        for kind in ["symbol", "content", "regex"] {
+            let output = tool_search(
+                &serde_json::json!({
+                    "root":root.path(), "query":"hot", "kind":kind,
+                    "offset":999_999, "limit":1, "budget":200
+                }),
+                &cache,
+                &session,
+                &bloom,
+            )
+            .unwrap();
+            assert!(
+                output.contains("offset and limit ignored") && output.contains("code.rs"),
+                "{output}"
+            );
+            assert!(output.len() <= 200 * 4 + 1, "{output}");
+        }
+        for name in ["one", "two"] {
+            std::fs::create_dir(root.path().join(name)).unwrap();
+            std::fs::write(root.path().join(name).join("guide.md"), "# Root\nbody\n").unwrap();
+        }
+        let output = tool_search(
+            &serde_json::json!({
+                "root":root.path(), "scopes":["one","two"], "query":"guide.md", "limit":1
+            }),
+            &cache,
+            &session,
+            &bloom,
+        )
+        .unwrap();
+        assert!(
+            output.contains("offset and limit ignored") && output.contains("body"),
+            "{output}"
         );
     }
 }
