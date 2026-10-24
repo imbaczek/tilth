@@ -24,7 +24,7 @@ src/
 ├── lib.rs           Public API + dispatch (run / run_full / run_expanded /
 │                    run_callers / run_deps)
 ├── main.rs          CLI binary (clap parser → lib calls or mcp::run)
-├── mcp.rs           MCP server: JSON-RPC stdio loop, tool dispatch,
+├── mcp/mod.rs       MCP server: JSON-RPC stdio loop, tool dispatch,
 │                    per-request timeout / abandoned-thread tracking
 ├── classify.rs      Query string → QueryType (8-rule precedence ladder)
 ├── types.rs         Shared types: QueryType, Lang, FileType, ViewMode,
@@ -33,6 +33,7 @@ src/
 │                    InvalidQuery, IoError, ParseError)
 ├── format.rs        Output headers, line numbering, hashlines
 ├── budget.rs        Token cap (truncate output to a token budget)
+├── listing.rs       Shared page bounds, rendering and safe navigation
 ├── session.rs       Per-MCP-process counters: reads, searches, top
 │                    queries, hot dirs, expanded-set dedup
 ├── cache.rs         OutlineCache: rendered outlines + parsed
@@ -60,7 +61,9 @@ src/
 │   ├── callees.rs       Resolve function calls inside a definition
 │   ├── deps.rs          Blast-radius analysis (`tilth_deps`)
 │   ├── grok.rs          One-call symbol bundle (`tilth_grok`)
-│   ├── glob.rs          Glob query → file list (`tilth_files`)
+│   ├── grok_paging.rs   Selected Grok relationship pages
+│   ├── paging.rs        Ranked search pages after scope merge/dedup
+│   ├── glob.rs          Glob query → file list (CLI glob queries)
 │   ├── blast.rs         Symbol-level blast radius
 │   ├── bloom_walk.rs    Shared walker preamble (size gating, mtime,
 │   │                    bloom filter) factored out of callers/callees
@@ -75,6 +78,7 @@ src/
 │   ├── mod.rs           read_file decision tree, multi-section reader
 │   │                    (`read_ranges`), heading resolver, suggestion
 │   │                    fallback
+│   ├── paging.rs        Declaration, heading, line and section pages
 │   ├── imports.rs       Resolve "Related: file1, file2" hints
 │   └── outline/
 │       ├── mod.rs       Dispatch by FileType
@@ -143,7 +147,7 @@ touch: it detects terminal height via `TIOCGWINSZ` (so paging respects
 the actual terminal, not a stale 24-row fallback) and writes shell
 completions (`--completions <shell>`) using `clap_complete`.
 
-### MCP server (`src/mcp.rs`)
+### MCP server (`src/mcp/mod.rs`)
 
 Invoked as `tilth --mcp` (or `tilth --mcp --edit` for edit mode). The
 binary becomes a JSON-RPC server speaking newline-delimited messages
@@ -464,9 +468,9 @@ machinery:
   them in a process-wide `LazyLock<Mutex<HashMap>>`. The cache key
   uses the query string's pointer address (`&'static str`) so distinct
   queries against the same language stay separated.
-- **Deps** (`deps.rs`) — `analyze_deps` is what `tilth_deps` runs.
+- **Deps** (`deps.rs`) — `analyze_deps_with_options` is what `tilth_deps` runs.
   Returns a `DepsResult` with `Uses` (local + external) and `Used by`.
-  `format_deps` does the human output. The external-dep stdlib
+  `format_deps_with_options` does the human output. The external-dep stdlib
   heuristic (`is_stdlib`) is per-language; module-path validation
   (`is_valid_module_path`) avoids treating relative paths as packages.
 - **Blast** (`blast.rs`) — symbol-level blast radius for diff
@@ -475,14 +479,15 @@ machinery:
 ### Glob (`glob.rs`)
 
 Thin wrapper that builds a walker with a single override pattern and
-emits `path  (~N tokens)` lines, sorted by relevance. The token
+emits `path  (~N tokens)` lines, sorted by path. The token
 estimate comes from `estimate_tokens(byte_len)` — `bytes / 4` ceiling
 division.
 
 ## Read subsystem (`src/read/`)
 
 `read::read_file(path, section, full, cache, edit_mode)` is the
-gateway. The decision tree, in order:
+gateway for unpaged reads. Explicit pages use `read/paging.rs`.
+The unpaged decision tree, in order:
 
 1. `metadata` errors → typed `TilthError::NotFound` /
    `PermissionDenied` / `IoError` with a `suggest_similar` fallback
@@ -511,7 +516,7 @@ gateway. The decision tree, in order:
    the cap, returns the outline with a banner explaining how to
    override.
 9. **Below the token threshold or `--full`** → return full content
-   (with `format::hashlines` if `edit_mode`, plain `number_lines`
+   (with `format::hashlines` if `edit_mode`, raw content
    otherwise).
 10. **Otherwise** → `outline::generate` per `FileType`, cached in
     `OutlineCache::get_or_compute`.
@@ -703,7 +708,7 @@ unconditional in MCP (every successful edit gets the warning); the
 shown alongside the hashlined context, *not* whether the blast
 radius runs.
 
-## MCP server (`src/mcp.rs`)
+## MCP server (`src/mcp/mod.rs`)
 
 (Briefly above, in detail here.)
 
@@ -751,6 +756,42 @@ the MCP `instructions` field. It is regenerated from the same
 markdown and re-running the script keeps both surfaces in lockstep.
 Byte-equality tests in `src/mcp/mod.rs` lock the runtime strings to
 their refactor baseline and flag accidental drift.
+
+## Pagination across views
+
+`listing.rs::Page` validates zero-based offsets and positive limits. Pages
+default to 50 entries, except ranked search/callers (10, or 100 with `full`).
+Explicit limits override defaults; unpaged previews keep their existing behavior.
+
+- `search/paging.rs` slices ranked symbol/content/regex matches after merging
+  and deduplicating scopes. Each comma-separated symbol gets its own page.
+  Callers are filtered/ranked first; CLI scopes page independently, while MCP
+  callers accept one scope. Incomplete scope searches suppress navigation.
+- `read/paging.rs` forces uncapped code declarations or Markdown headings in
+  auto mode, even for small files. Full mode pages physical lines; stripped
+  mode pages retained lines; signature mode pages declarations. Other non-Markdown
+  text falls back to source lines; Markdown keeps headings unless full. Sections concatenate ranges in
+  request order, preserving overlaps and original line numbers and hashes.
+  Batches apply the same page independently per path.
+- Glob pages sort paths and expand selected files. Directories count children.
+  `map::generate_paginated` slices files before rebuilding page-local rollups.
+- Dependencies page the complete analysis: local imports, external imports,
+  production dependents, then test dependents. Each dependent file is one record.
+- `search/grok_paging.rs` selects callers, callees, siblings, or tests with
+  `section`; offset/limit require a section. Callees combine resolved definitions
+  then external names; siblings follow source order. Qualified selectors survive
+  continuation. Section requests do not consume body/delegate expansion state.
+- `diff::diff_paginated` filters before slicing: overview/directory views count
+  files, file detail counts source-ordered symbol/hunk blocks, function detail
+  counts its symbol, and log mode counts commits. Counts/warnings/conflicts are
+  metadata, separate from page entries.
+
+Entry limits and token budgets are independent. `listing::finish` budgets the
+final response including navigation. Truncation removes continuation claims and
+tells the caller to retry the same offset with a smaller limit or larger budget.
+Continuation arguments patch the original request; preserve queries, roots,
+scopes, filters, views, and diff sources. See the
+[page units and examples](README.md#pagination).
 
 ## Cross-cutting modules
 

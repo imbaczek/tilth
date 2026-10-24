@@ -46,15 +46,15 @@ Markdown titles match exactly with or without a `#` prefix; a prefix constrains 
 
 The examples in this README are real output from the [FastAPI](https://github.com/fastapi/fastapi) and [Gin](https://github.com/gin-gonic/gin) repositories. Lines marked `...` are cut for length.
 
-For files over 500 KB, the default outline shows at most 100 entries. An explicit `--budget` replaces that fixed entry cap with a token limit, so increasing the budget can reveal more entries. Markdown outlines also support zero-based heading pagination (default page size 50):
+Without paging, outlines for files over 500 KB show at most 100 entries by default. An explicit `--budget` replaces that entry cap with a token limit. Use `--offset` and `--limit` to page an uncapped code outline or a Markdown heading outline, including small files:
 
 ```bash
 tilth docs/experiment_log.md --budget 20000
-tilth docs/experiment_log.md --offset 100 --limit 100
-tilth read docs/experiment_log.md --offset 200 --limit 100
+tilth read src/main.rs --offset 100 --limit 50
+tilth read docs/experiment_log.md --offset 100 --limit 50
 ```
 
-`--limit` controls heading rows; `--budget` controls the total response size. If the budget truncates a page, retry the same offset with a smaller limit before advancing. Keep the file unchanged between pages.
+The page unit depends on the view: declarations for code outlines, headings for Markdown outlines, and source lines with `--full`. See [Pagination](#pagination) for all view units, defaults, batch behavior, and budget handling.
 
 ## Search finds definitions first
 
@@ -104,7 +104,21 @@ tilth uses the syntax tree to tell a definition from a mention, and it lists def
 
 An expanded definition ends with a `-- calls --` footer. It lists the functions the definition calls, each with its file, line range and signature. An agent can follow a call chain from there without searching again.
 
-When a search finds more than it shows, the header says so, for example `10 of 43 matches`. Add `--full` to raise the limit from 10 to 100.
+Without explicit paging, a search shows a preview of up to 10 matches, or 100 with `--full`. Use `--offset` and `--limit` to retrieve ranked symbol, content, or regex matches beyond that preview; an explicit limit overrides the 10/100 default:
+
+```bash
+tilth search get_typed_signature --scope fastapi --offset 20 --limit 20
+tilth "TODO: fix" --offset 0 --limit 25
+tilth "/get_.*signature/" --offset 25 --limit 25
+```
+
+In MCP, `tilth_search` accepts the same paging fields for every `kind` (`symbol`, `content`, `regex`, and `callers`):
+
+```json
+{"query":"TODO: fix","kind":"content","root":"/project","offset":0,"limit":25}
+```
+
+Symbol/content/regex searches combine and deduplicate all requested scopes before selecting a page. Comma-separated symbol targets each get their own page. This differs from CLI caller searches, which page each scope independently.
 
 ### Expanded search
 
@@ -125,7 +139,7 @@ Look up several symbols in one call:
 tilth "ServeHTTP, HandlersChain, Next" --scope .
 ```
 
-Each symbol gets its own block of results. The expand budget is shared across them, with at least one expansion per symbol.
+Each symbol gets its own block of results and its own offset/limit page. The expand budget is shared across them; CLI multi-symbol queries retain an expansion floor even with `--expand=0`, while MCP honors an explicit `expand: 0`.
 
 ### Multiple scopes
 
@@ -152,9 +166,9 @@ Caller previews show up to 10 ranked call sites, or 100 with `--full`. On the CL
 tilth isTrustedProxy --callers --full --offset 100 --limit 100 --scope .
 ```
 
-Each scope is paginated independently. The output reports the range, total and next offset. Keep the query, scopes and filters unchanged between pages; edits to the source can change the ranking. `--budget` still caps the rendered output. If it truncates a page, reduce `--limit` and retry the same offset before advancing.
+Each CLI scope is paginated independently. The output reports the range, total and next offset. Keep the query, scopes and filters unchanged between pages; edits to the source can change the ranking. `--budget` still caps the rendered output. If it truncates a page, reduce `--limit` and retry the same offset before advancing.
 
-In MCP mode, use `kind: "callers"` on `tilth_search` with the same zero-based `offset` and positive `limit` parameters. With comma-separated targets, the page applies independently to each target. An explicit `limit` overrides the default 10-result page (100 with `full: true`). Next-page and budget-retry hints use JSON arguments.
+In MCP mode, use `kind: "callers"` on `tilth_search` with the same zero-based `offset` and positive `limit` parameters. With comma-separated targets, the page applies independently to each target. An explicit `limit` overrides the default 10-result page (100 with `full: true`). Continuation hints use JSON arguments to merge into the original request. MCP caller searches accept one scope; multi-scope `scopes` are supported for symbol/content/regex searches.
 
 ```json
 {"query":"isTrustedProxy","kind":"callers","full":true,"offset":100,"limit":100}
@@ -183,7 +197,19 @@ recovery_test.go:22            TestPanicClean       → RecoveryWithWriter
 ...
 ```
 
-In MCP mode, use the `tilth_deps` tool.
+Add `--offset` and `--limit` to page dependency records:
+
+```bash
+tilth recovery.go --deps --offset 10 --limit 10
+```
+
+Records are ordered by section: local dependencies, external dependencies, production dependents, then test dependents; paths or names are sorted within each section. A dependent file and all its caller details form one record. Explicit paging collects all exported symbols and callers before selecting the page, even without `--full`.
+
+In MCP mode, use `tilth_deps` with the same paging fields:
+
+```json
+{"path":"recovery.go","root":"/project","offset":10,"limit":10}
+```
 
 ### Grok a symbol
 
@@ -227,7 +253,13 @@ tilth grok get_typed_signature --scope fastapi --section callers --offset 50 --l
 
 Section pages default to 50 individual records. Offsets are zero-based, and `--offset`/`--limit` require `--section`. Internal and external callees share one list; siblings follow source order. `--full` still widens the overview but does not cap a selected section. Keep the target selector, scope, and source unchanged between pages; use the file reader's `--section` option for source bodies.
 
-In MCP mode, use `tilth_grok` with the same `section`, `offset`, `limit`, and optional `budget` fields. Continuation arguments preserve qualified target selectors, including methods that share a source line.
+In MCP mode, use `tilth_grok` with the same `section`, `offset`, `limit`, and optional `budget` fields:
+
+```json
+{"target":"Type::method","root":"/project","section":"callers","offset":50,"limit":25}
+```
+
+Continuation arguments preserve qualified target selectors, including methods that share a source line. Section requests do not consume the session's body-expansion state.
 
 ### Session memory
 
@@ -252,6 +284,22 @@ $ tilth diff HEAD~1
 ```
 
 The diff reports changes per function: what was added, what was removed, and whether a signature or only a body changed. Narrow it with `--scope`, or summarise a range of commits with `--log`.
+
+Paging follows the selected view: files in an overview or directory scope, symbol/unattributed-hunk blocks in a file scope, one symbol in a `file:function` scope, or commits in log mode. Scope and search filters apply before paging:
+
+```bash
+tilth diff HEAD~1 --offset 20 --limit 20
+tilth diff HEAD~1 --scope src/lib.rs --offset 10 --limit 10
+tilth diff --log HEAD~20..HEAD --offset 5 --limit 5
+```
+
+MCP `tilth_diff` accepts the same `offset`/`limit` fields:
+
+```json
+{"source":"HEAD~1","scope":"src/lib.rs","root":"/project","offset":10,"limit":10}
+```
+
+Keep the diff source, scope, search filter, and working tree unchanged between pages. Warnings and conflicts retain their context and do not count as page entries.
 
 ## Why
 
@@ -340,13 +388,14 @@ claude --disallowedTools "Bash,Grep,Glob"
 |-------|-----------|
 | 0 bytes | `[empty]` |
 | Binary | `[skipped]` with mime type |
-| Generated (lockfiles, .min.js) | `[generated]` |
-| Up to ~6,000 tokens | Full content with line numbers |
-| Over ~6,000 tokens | Structural outline with line ranges |
+| Generated (lockfiles, generated code) | `[generated]` |
+| Minified (such as .min.js) | `[minified]` summary |
+| Up to ~6,000 tokens | Full content |
+| Over ~6,000 tokens | Structural outline with line ranges when meaningfully shorter; otherwise full content |
 
-The rule counts tokens, so a 1-line minified bundle gets outlined and a 120-line module prints whole.
+The smart-view rule counts tokens rather than lines. Binary, generated, and minified detection runs first; ordinary small modules print whole.
 
-When the output is piped to another program, the command-line tool prints the full file, the way `cat` would. MCP reads and terminal reads follow the table.
+Piped, captured, and terminal reads use the same smart-view rules. Use `--full` to request source content explicitly. Supplying `--offset` or `--limit` selects the pageable view described below.
 
 ## Edit mode
 
@@ -384,12 +433,14 @@ tilth read <path>                 # read file (outline if large)
 tilth read <path> --section 45-89      # exact line range
 tilth read <path> --section "Foo"      # markdown heading (optional ## prefix)
 tilth read <path> --section toc:1.2    # TOC address from ambiguity hints
-tilth read <path> --full               # force full content
+tilth read <path> --full               # request full content (subject to skip/size guards)
 tilth <symbol> --scope <dir>      # definitions + usages
 tilth <symbol> --expand=5         # inline source for top 5 matches
-tilth <symbol> --full             # up to 100 matches instead of 10
+tilth <symbol> --full             # preview up to 100 matches instead of 10
+tilth <symbol> --offset 100 --limit 25 # ranked matches beyond the preview
 tilth <symbol> --callers          # find call sites (structural)
-tilth grok <symbol>               # everything about one symbol
+tilth grok <symbol>               # overview of one symbol
+tilth grok <symbol> --section callers --limit 25 # one relationship page
 tilth <path> --deps               # what a file uses, and what uses it
 tilth "TODO: fix" --scope <dir>   # content search
 tilth "/<regex>/" --scope <dir>   # regex search
@@ -420,33 +471,71 @@ for full content. Sections require one file and auto/full mode. Up to 20 files
 or sections are accepted; batch output shares the token budget. Batch file errors
 are reported alongside successful reads.
 
-### Directory listings
+### Pagination
 
-Directory paths return 50 immediate children per page, sorted by name. Use a
-positive `--limit` and zero-based `--offset` to choose a page:
+Offsets are zero-based nonnegative integers; limits are positive integers. Supplying either flag/field opts into paging, except directory reads, MCP `tilth_list`, and caller searches, which already return pages by default. Without explicit paging, other views retain their existing previews and smart-view behavior.
+
+| View | One page entry | Default page size |
+|------|----------------|-------------------|
+| Symbol/content/regex search | Ranked match, per symbol target, after merging and deduplicating scopes | 10; 100 with `--full` / `full: true` |
+| Caller search | Call site, per target; each CLI scope separately | 10; 100 with `--full` / `full: true` |
+| Directory read | Immediate child, sorted by name | 50, including with `--full` |
+| Code `auto` / code `signature` read | Declaration in source order, with nested-owner context | 50 |
+| Markdown `auto` read | Heading in document order, with global TOC addresses | 50 |
+| `full` or other text read | Physical source line, with original line/hash addresses | 50 |
+| Code `stripped` read | Retained line, with its original source line number | 50 |
+| `section` / `sections` read | Line in the selected ranges, in supplied range order | 50 |
+| CLI glob / MCP `tilth_list` | Matching file, sorted by path | 50; unpaged CLI globs retain their 20-file preview |
+| CLI `--map` | File, sorted by path; directory context is retained | 50 |
+| Dependencies | One local/external dependency or dependent-file record | 50 |
+| Diff overview / directory scope | Changed file, sorted by path | 50 |
+| Diff file scope / `file:function` | Symbol or unattributed-hunk block / the selected symbol | 50 |
+| Diff `--log` / MCP `log` | Commit, in Git log order | 50 |
+| Grok with `section` | Caller, callee, sibling declaration, or test reference in that section | 50 |
+
+An explicit limit overrides the default, including search's 10/100 sizes. Grok requires `section` when supplying `offset` or `limit`; its overview has independent default/`full` caps. Other paged views default to 50 entries; `--full` does not increase that page size.
+
+#### File modes and batches
+
+Explicit code `auto` paging requests an uncapped declaration outline even for small files. Markdown `auto` paging similarly forces a heading outline. `--full` / `mode: "full"` pages source lines instead. Code files with no recognized declarations and other non-Markdown text files fall back to source-line pages. Non-code signature/stripped requests use the normal read fallback: Markdown keeps heading pages unless full mode selects physical lines. Binary, generated, and minified files retain their skipped/summary handling.
 
 ```bash
-tilth artifacts/ --limit 20
-tilth artifacts/ --offset 20 --limit 20
-tilth read artifacts/ --offset 20 --limit 20
+tilth read src/main.rs --offset 100 --limit 25
+tilth read src/main.rs --mode signature --offset 25 --limit 25
+tilth read src/main.rs --full --offset 100 --limit 25
+tilth read src/main.rs --mode stripped --offset 100 --limit 25
+tilth read src/main.rs --section 40-80 --section 120-160 --offset 20 --limit 20
+tilth read src/main.rs src/lib.rs --offset 25 --limit 25 --budget 4000
 ```
 
-The output reports the range, total and next offset. `--full` still uses the
-50-entry directory default; set `--limit` explicitly for a larger page.
-`--budget` caps the output independently. If a page is truncated, retry the same
-offset with a smaller limit before advancing. Keep the directory unchanged
-between calls for stable pages. Pagination requires a single directory or Markdown path
-for `tilth read`; other file types and batch reads reject explicit pagination. Markdown paging uses heading order and requires auto mode without `full`, `section`, or `sections`.
+Batch `paths` and CLI multi-path reads apply the same offset/limit independently to each path; the assembled response shares the output budget. Section selection still requires one file (`path`, not batch `paths`), and cannot be combined with signature/stripped mode. Multiple ranges preserve their supplied order and overlaps; page offsets count the concatenated selected lines. Source line numbers, signature hashes, and Markdown TOC addresses are not renumbered for a page.
 
-MCP `tilth_read` accepts the same `offset` and `limit` for a single directory
-or Markdown path. MCP `tilth_list` pages matching files sorted by scope-relative path, then
-renders that page as a tree. Directory nodes do not count against its limit,
-and tree counts and token rollups describe only the selected files. Keep
-patterns, depth and ignore settings unchanged between pages:
+MCP `tilth_read` uses the same modes and units:
+
+```json
+{"root":"/project","paths":["src/main.rs","src/lib.rs"],"mode":"signature","offset":25,"limit":25,"budget":4000}
+```
+
+#### Directories, globs, and maps
+
+```bash
+tilth artifacts/ --offset 20 --limit 20
+tilth read artifacts/ --offset 20 --limit 20
+tilth "*.rs" --scope src --offset 50 --limit 50
+tilth --map --scope src --offset 50 --limit 50
+```
+
+CLI globs and maps page each scope independently. MCP `tilth_list` pages matching files before rendering the tree; directory nodes do not count against its limit. Map and list tree counts/token rollups describe only the selected files. Keep patterns, depth, ignore settings, and scope unchanged between pages. Maps remain CLI-only; use `tilth_list` for MCP file listings:
 
 ```json
 {"patterns":["*.json"],"scope":"/project/artifacts","offset":50,"limit":50}
 ```
+
+#### Continuations and output budgets
+
+`limit` counts logical entries; `budget` independently bounds the rendered output. Larger pages can still exceed the budget. If expansion is the cause, paged searches try a compact view before omitting matches. When a page or its navigation cannot fit, tilth reports the omission and withholds the continuation. Retry the same offset with a smaller limit or larger budget before advancing. Ranked searches with failed scopes report lower-bound counts and withhold continuation until the scope errors are resolved.
+
+Use a CLI next-page hint with the original command. MCP continuation JSON is an argument patch: merge it into the original tool call rather than replacing required arguments. Keep the target/query, root, scopes, mode, filters, and source unchanged. Grok hints also preserve the original qualified target selector and section. An offset at or beyond the total returns an empty terminal page.
 
 ## Speed
 
@@ -473,7 +562,7 @@ tilth is about 35,000 lines of Rust with no runtime dependencies.
 - **ripgrep's crates** (`grep-regex`, `grep-searcher`) run content search.
 - The **ignore** crate walks directories in parallel with `.tilthignore` support and honors `.gitignore`, `.ignore` and Git exclude rules by default. It always skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
 - `.tilthignore` is a custom ignore file that works like `.gitignore` but is always honored, even when gitignore rules are bypassed. Place it in any directory to exclude its contents from walks.
-- This release adds opt-in `.gitignore`, `.ignore` and Git exclude handling. To bypass these rules, use CLI `--no-respect-gitignore` or set `TILTH_RESPECT_GITIGNORE=0`. CLI `--respect-gitignore` explicitly enables them and overrides the environment. In MCP mode, pass `gitignore: false` for one call. `.tilthignore` and built-in junk-directory exclusions always remain active.
+- To bypass `.gitignore`, `.ignore` and Git excludes, use CLI `--no-respect-gitignore` or set `TILTH_RESPECT_GITIGNORE=0`. CLI `--respect-gitignore` explicitly enables them and overrides the environment. In MCP mode, pass `gitignore: false` for one call. `.tilthignore` and built-in junk-directory exclusions always remain active.
 - **memmap2** reads files through memory maps.
 - **DashMap** holds the outline cache, which is invalidated when a file's modified time changes.
 

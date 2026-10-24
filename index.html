@@ -730,6 +730,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       <div class="kicker">one binary, the whole loop</div>
       <h2>read, search, and navigate by structure.</h2>
       <p>The same engine behind the CLI is exposed as MCP tools, so an agent reaches for the right one without a wall of upfront instructions.</p>
+        <p>Use <code>--offset</code> and <code>--limit</code> to page through search, reads, listings, dependencies, maps, and diffs. Grok requires <code>--section callers</code>, <code>callees</code>, <code>siblings</code>, or <code>tests</code>. The corresponding MCP tools accept <code>offset</code> and <code>limit</code>; maps are CLI-only. See the <a href="https://github.com/jahala/tilth#pagination">pagination guide</a> for page units and continuation rules.</p>
     </div>
     <div class="verbs stagger reveal">
       <div class="verb">
@@ -738,7 +739,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       </div>
       <div class="verb">
         <span class="cmd">tilth &lt;symbol&gt; --callers</span>
-        <p>Every call site of a symbol, matched on the syntax tree, so comments and strings that mention the name are left out.</p>
+        <p>Ranked call sites of a symbol, matched on the syntax tree, so comments and strings that mention the name are left out.</p>
       </div>
       <div class="verb">
         <span class="cmd">tilth &lt;path&gt; --deps</span>
@@ -754,7 +755,7 @@ footer h4 { color: #FAF5E9; font-size: 1.05rem; margin-bottom: 16px; }
       </div>
       <div class="verb">
         <span class="cmd">tilth "/regex/" --scope</span>
-        <p>Content and glob search on ripgrep&rsquo;s own engine. When results are cut, the header says how many matches there are in total.</p>
+        <p>Content and regex search on ripgrep&rsquo;s own engine. When results are cut, the header says how many matches there are in total.</p>
       </div>
     </div>
   </div>

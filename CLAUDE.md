@@ -20,7 +20,7 @@ src/
       deps.rs          tool_deps — file-level dependency analysis (imports + dependents), bloom-filtered.
       diff.rs          tool_diff — structural diff dispatch (uncommitted/staged/ref/file-pair/patch/log).
       list.rs          tool_list — glob file listing as a directory tree, pattern/patterns batch, scope resolution.
-      grok.rs          tool_grok — one-call symbol bundle, default vs full caps.
+      grok.rs          tool_grok — overview caps or selected-section pagination.
       session.rs       tool_session — summary/reset actions for grok dedup state.
   classify.rs          Query type detection (file path, glob, symbol, content, fallthrough).
   lang/
@@ -44,6 +44,7 @@ src/
       tabular.rs       CSV/TSV outline: headers + row count + first 5 / last 3 rows via memchr.
       fallback.rs      head_tail() / log_view() — unknown files and logs with no outline support.
       test_file.rs     Test file detection (suppresses outline noise).
+    paging.rs          Pages of declarations, headings, lines, sections and batches.
     imports.rs         Import extraction for deps analysis.
   search/
     mod.rs             Search orchestration. Symbol, content, regex, callers search types.
@@ -62,6 +63,8 @@ src/
     truncate.rs        Smart truncation to fit budget constraints.
     alloc.rs           Value-based budget allocation — keeps the highest-value blocks when output exceeds budget, not just positional tail-cut.
     bloom_walk.rs      Shared file-prefilter for relational queries (callers/callees/deps): size gate + bloom-filter pre-check before a full parse.
+    paging.rs          Ranked pages after scope merge/dedup.
+    grok_paging.rs     Selected Grok sections without body/dedup side effects.
     glob.rs            File glob search.
     blast.rs           Blast radius — find callers of definitions touched by edits.
   index/
@@ -73,6 +76,7 @@ src/
   install.rs           `tilth install <host>` — writes MCP config for 23 hosts.
   format.rs            Output formatting helpers.
   budget.rs            Token budget enforcement.
+  listing.rs           Page bounds, rendering, continuation and budget safety.
   map.rs               Codebase map generation (CLI only, disabled as MCP tool).
   overview.rs          Project fingerprint for MCP initialization (manifest, languages, modules, deps, git). Instant orientation without a tool call.
   timeout.rs           Per-request wall-clock timeout for sync tool calls — worker thread + bounded channel, tracks abandoned threads on expiry.
@@ -101,6 +105,15 @@ cargo install --path .       # install to ~/.cargo/bin/tilth
 ```
 
 CI runs `fmt --check`, `clippy --all-targets -D warnings`, `cargo test` on every push/PR.
+
+## Pagination invariants
+
+See [README pagination](README.md#pagination) for units and examples. Collect,
+filter and sort before slicing; preserve unpaged previews. Read batches page
+per path; merged search scopes share a page. Preserve source addresses and
+qualified Grok selectors. Grok sections must not consume body/delegate state.
+Budget the final response including navigation; truncation must suppress
+next-page claims and tell the caller to retry the same offset.
 
 ## Version bumps
 
