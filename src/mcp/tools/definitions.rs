@@ -98,6 +98,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Absolute or relative file path to read. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                     },
+                    "slices": {"type":"array","minItems":1,"maxItems":20,"items":{"type":"object","required":["path","sections"],"properties":{"path":{"type":"string"},"sections":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"string","pattern":"^[1-9][0-9]*-[1-9][0-9]*$"}}}},"description":"Per-file numeric line ranges; at most 20 ranges total. Files follow first appearance; ranges sorted and overlapping/adjacent ranges merged per physical file. Shared budget. Exclusive with path/paths/symbols/sections/paging; auto/full modes only."},
                     "symbols": {"type":"array","items":{"type":"string","minLength":1},"minItems":1,"maxItems":20,"description":"Exact symbol names across path/paths; commas remain literal. Qualified names or name@line disambiguate. Returns per-name status, source once per declaration, shared budget. Supports auto/full/signature; signature conflicts with edit mode. Conflicts with sections and paging."},
                     "paths": {
                         "type": "array",

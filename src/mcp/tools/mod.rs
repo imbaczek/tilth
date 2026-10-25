@@ -4,6 +4,7 @@ mod diff;
 mod grok;
 mod list;
 mod read;
+mod read_slices;
 mod read_symbols;
 mod search;
 mod session;

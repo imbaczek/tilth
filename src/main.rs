@@ -189,8 +189,11 @@ enum Command {
     /// Read files directly without query classification.
     Read {
         /// File paths, at most 20.
-        #[arg(required = true, num_args = 1..=20)]
+        #[arg(required_unless_present = "slices", num_args = 1..=20, conflicts_with = "slices")]
         paths: Vec<PathBuf>,
+        /// Per-file range path:start-end; repeat to combine files and merge overlapping ranges.
+        #[arg(long = "slice")]
+        slices: Vec<String>,
         /// Exact symbol name; repeat to fetch multiple declarations. Use name@line to disambiguate.
         #[arg(long = "symbol")]
         symbols: Vec<String>,
@@ -358,6 +361,7 @@ fn main() {
         match cmd {
             Command::Read {
                 paths,
+                slices,
                 symbols,
                 root,
                 mode,
@@ -391,7 +395,21 @@ fn main() {
                 if let Some(limit) = limit.or(cli.search.limit) {
                     args["limit"] = serde_json::json!(limit.get());
                 }
-                if paths.len() == 1 {
+                if !slices.is_empty() {
+                    let specs: Vec<_> = slices
+                        .iter()
+                        .map(|slice| {
+                            let (path, section) = slice
+                                .rsplit_once(':')
+                                .unwrap_or_else(|| usage_exit("--slice requires path:start-end"));
+                            if path.is_empty() {
+                                usage_exit("--slice path must not be empty");
+                            }
+                            serde_json::json!({"path":path,"sections":[section]})
+                        })
+                        .collect();
+                    args["slices"] = serde_json::json!(specs);
+                } else if paths.len() == 1 {
                     args["path"] = serde_json::json!(paths[0]);
                 } else {
                     args["paths"] = serde_json::json!(paths);

@@ -28,6 +28,9 @@ pub(in crate::mcp) fn read_with_navigation(
     edit_mode: bool,
     mcp_navigation: bool,
 ) -> Result<String, String> {
+    if args.get("slices").is_some() {
+        return super::read_slices::read(args, cache, session, edit_mode);
+    }
     if args.get("symbols").is_some() {
         return super::read_symbols::read(args, cache, session, edit_mode, mcp_navigation);
     }

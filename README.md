@@ -103,6 +103,20 @@ physical source lines and safe edit anchors.
 MCP uses `symbols: ["parse_query", "Parser::parse_statement"]` with `path` or
 `paths`. This is a stateless selection, not a record of previously seen code.
 
+Read different line ranges from several files under one budget:
+
+```bash
+tilth read --slice 'src/parser.rs:40-80' --slice 'src/types.rs:10-35' --budget 2500
+```
+
+Repeat `--slice path:start-end` for up to 20 ranges. Files follow first appearance;
+ranges are sorted within each physical file and overlapping/adjacent ranges merge.
+File errors appear alongside successful slices. `--edit` emits source hash anchors.
+Slices accept auto/full modes and cannot combine with positional paths, symbols,
+sections, or paging. MCP uses
+`slices: [{"path":"src/parser.rs","sections":["40-80","90-100"]}]`.
+
+
 MCP `tilth_search` accepts `queries: ["parse_query", "parse_statement"]` instead
 of `query`, with the same `select` options. `--offset`/`--limit` page each query;
 keep queries, selection, scopes and filters unchanged between pages.
