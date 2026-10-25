@@ -330,7 +330,11 @@ and 1,000 matching paths across the request, honors ignore rules, sorts matches,
 and deduplicates canonical paths. Unmatched globs remain failed scopes so the
 normal reducer can preserve successful results from other scopes. Missing scopes
 receive bounded directory hints or filename hints with normalized Levenshtein
-similarity ≥0.8; errors and partial-result hints share the output budget.
+similarity ≥0.8. Only when no strong filename matches exist, a lower-confidence
+fallback accepts similarity ≥0.4 with the same nonempty extension and a shared
+whole stem component of at least two characters (split on nonalphanumeric
+characters). Strong matches suppress this fallback. Errors and partial-result
+hints share the output budget.
 
 File searches walk the selected file's parent with an exact-path predicate,
 composed with the optional `glob` filter. That filter is relative to each resolved

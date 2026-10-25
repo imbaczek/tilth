@@ -45,8 +45,10 @@ struct SearchOptions {
     /// Scope globs select files and directories, honor ignore rules, and are limited
     /// to 100,000 visited entries and 1,000 matching paths across the request.
     /// Missing scopes suggest up to five filenames with normalized Levenshtein
-    /// similarity >=0.8, or nearby directory hints, within --budget. Suggestions
-    /// do not replace the scope. Valid scopes can return results alongside failed
+    /// similarity >=0.8. If none qualify, lower-confidence suggestions require
+    /// similarity >=0.4, the same extension, and a shared whole stem component
+    /// of at least two characters. Otherwise nearby directory hints are offered.
+    /// Hints fit within --budget and do not replace the scope. Valid scopes can return results alongside failed
     /// scopes. Callers page each resolved
     /// scope independently. Map, deps, and MCP startup require directory scopes.
     #[arg(long)]

@@ -32,7 +32,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory, file, or glob of files/directories to search. Omit for the whole project. Relative scopes require an absolute root. Glob expansion honors ignore rules and is limited to 100,000 visited entries and 1,000 matching paths across the request. Missing scopes report up to five similar filenames (normalized Levenshtein similarity >=0.8) or directory hints, within budget, without choosing a replacement or widening the search. Valid scopes can still return results alongside failed scopes."
+                        "description": "Directory, file, or glob of files/directories to search. Omit for the whole project. Relative scopes require an absolute root. Glob expansion honors ignore rules and is limited to 100,000 visited entries and 1,000 matching paths across the request. Missing scopes report up to five similar filenames (normalized Levenshtein similarity >=0.8). If none qualify, lower-confidence suggestions require similarity >=0.4, the same nonempty extension, and a shared whole filename-stem component of at least two characters (split on nonalphanumeric characters). Otherwise directory hints are offered. Hints stay within budget without choosing a replacement or widening the search. Valid scopes can still return results alongside failed scopes."
                     },
                     "scopes": {
                         "type": "array",

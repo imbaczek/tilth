@@ -1,10 +1,12 @@
-//! Bounded directory hints for misspelled search scopes.
+//! Bounded file and directory hints for missing search scopes.
 use std::path::{Path, PathBuf};
 
 const MAX_DIRECTORIES: usize = 5_000;
 const MAX_SCAN_ENTRIES: usize = 10_000;
 const MAX_HINTS: usize = 5;
 const MAX_DEPTH: usize = 6;
+const STRONG_FILE_SIMILARITY: f64 = 0.8;
+const RELATED_FILE_SIMILARITY: f64 = 0.4;
 
 pub(crate) fn suggestion_suffix(scope: &Path) -> String {
     if !matches!(std::fs::metadata(scope), Err(ref error) if error.kind() == std::io::ErrorKind::NotFound)
@@ -12,15 +14,15 @@ pub(crate) fn suggestion_suffix(scope: &Path) -> String {
         return String::new();
     }
     let files = file_suggestions(scope);
-    let label = if files.is_empty() {
-        "directories"
+    let (label, hints) = if files.is_empty() {
+        ("directories", directory_suggestions(scope))
     } else {
-        "files"
-    };
-    let hints = if files.is_empty() {
-        directory_suggestions(scope)
-    } else {
-        files
+        let label = if files[0].0 < STRONG_FILE_SIMILARITY {
+            "files (lower confidence)"
+        } else {
+            "files"
+        };
+        (label, files.into_iter().map(|(_, path)| path).collect())
     };
     if hints.is_empty() {
         String::new()
@@ -37,7 +39,7 @@ pub(crate) fn suggestion_suffix(scope: &Path) -> String {
 }
 
 /// Compare basenames so a correct filename can still be found under a moved directory.
-fn file_suggestions(scope: &Path) -> Vec<PathBuf> {
+fn file_suggestions(scope: &Path) -> Vec<(f64, PathBuf)> {
     let absolute = std::path::absolute(scope).unwrap_or_else(|_| scope.to_path_buf());
     let Some(name) = absolute.file_name() else {
         return Vec::new();
@@ -51,7 +53,8 @@ fn file_suggestions(scope: &Path) -> Vec<PathBuf> {
     }
     let mut builder = crate::search::base_walk_builder(ancestor);
     builder.follow_links(false).max_depth(Some(MAX_DEPTH));
-    let mut candidates = Vec::new();
+    let mut strong = Vec::new();
+    let mut related = Vec::new();
     for entry in builder
         .build()
         .take(MAX_SCAN_ENTRIES)
@@ -60,20 +63,47 @@ fn file_suggestions(scope: &Path) -> Vec<PathBuf> {
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
         }
-        let score = strsim::normalized_levenshtein(
-            &target,
-            &entry.file_name().to_string_lossy().to_lowercase(),
-        );
-        if score >= 0.8 {
-            candidates.push((score, entry.into_path()));
+        let candidate = entry.file_name().to_string_lossy().to_lowercase();
+        let score = strsim::normalized_levenshtein(&target, &candidate);
+        if score >= STRONG_FILE_SIMILARITY {
+            strong.push((score, entry.into_path()));
+        } else if score >= RELATED_FILE_SIMILARITY && shares_filename_component(&target, &candidate)
+        {
+            related.push((score, entry.into_path()));
         }
     }
+    // Never dilute strong spelling corrections with more speculative relatives.
+    let mut candidates = if strong.is_empty() { related } else { strong };
     candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates.truncate(MAX_HINTS);
     candidates
-        .into_iter()
-        .take(MAX_HINTS)
-        .map(|(_, path)| path)
-        .collect()
+}
+
+fn shares_filename_component(target: &str, candidate: &str) -> bool {
+    let target = Path::new(target);
+    let candidate = Path::new(candidate);
+    let Some(extension) = target.extension().filter(|extension| !extension.is_empty()) else {
+        return false;
+    };
+    if candidate.extension() != Some(extension) {
+        return false;
+    }
+    let target_stem = target
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    let candidate_stem = candidate
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    target_stem
+        .split(|ch: char| !ch.is_alphanumeric())
+        .any(|component| {
+            component.chars().count() >= 2
+                && candidate_stem
+                    .split(|ch: char| !ch.is_alphanumeric())
+                    .any(|other| other == component)
+        })
 }
 
 fn directory_suggestions(scope: &Path) -> Vec<PathBuf> {
@@ -157,6 +187,55 @@ fn directory_suggestions(scope: &Path) -> Vec<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn related_filename_fallback_requires_shared_component_and_extension() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["wal.lisp", "bufmgr.lisp", "wal.rs", "notwal.lisp"] {
+            fs::write(root.path().join(name), "").unwrap();
+        }
+        let missing = root.path().join("wal-checkpoint.lisp");
+        let hints = file_suggestions(&missing);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].1, root.path().join("wal.lisp"));
+        assert!((hints[0].0 - 8.0 / 19.0).abs() < 1e-9);
+        assert!(suggestion_suffix(&missing).contains("files (lower confidence)"));
+        assert!(!shares_filename_component(
+            "a-checkpoint.lisp",
+            "a-other.lisp"
+        ));
+        assert!(!shares_filename_component("wal-checkpoint", "wal"));
+        assert!(file_suggestions(&root.path().join("wal-veryverylongcheckpoint.lisp")).is_empty());
+    }
+
+    #[test]
+    fn strong_corrections_suppress_related_fallbacks() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("wal.lisp"), "").unwrap();
+        let strong = root.path().join("wal-checkpoints.lisp");
+        fs::write(&strong, "").unwrap();
+        let missing = root.path().join("wal-checkpoint.lisp");
+        let hints = file_suggestions(&missing);
+        assert_eq!(hints.len(), 1);
+        assert_eq!(hints[0].1, strong);
+        assert!(!suggestion_suffix(&missing).contains("lower confidence"));
+    }
+
+    #[test]
+    fn related_fallbacks_are_ranked_capped_and_ignore_aware() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..10 {
+            fs::write(root.path().join(format!("wal-{index}.lisp")), "").unwrap();
+        }
+        let missing = root.path().join("wal-checkpoint.lisp");
+        let hints = file_suggestions(&missing);
+        assert_eq!(hints.len(), MAX_HINTS);
+        assert!(hints.windows(2).all(|pair| pair[0].0 >= pair[1].0));
+        let paths: Vec<_> = hints.into_iter().map(|(_, path)| path).collect();
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
+        fs::write(root.path().join(".tilthignore"), "wal-*.lisp\n").unwrap();
+        assert!(file_suggestions(&missing).is_empty());
+    }
 
     #[test]
     fn ranks_leaf_and_intermediate_typos_and_excludes_files() {

@@ -317,3 +317,40 @@ fn symlink_file_scope_searches_target_only() {
     assert_eq!(out.matches("[definition]").count(), 1, "{out}");
     assert!(out.contains("alpha.rs:"), "{out}");
 }
+
+#[test]
+fn related_missing_file_is_suggested_without_searching_it() {
+    let root = fixture();
+    fs::write(root.path().join("src/wal.lisp"), "(defun needle () nil)\n").unwrap();
+    fs::write(root.path().join("src/other.lisp"), "").unwrap();
+    let output = cli(
+        root.path(),
+        &[
+            "needle",
+            "--scope",
+            "src/wal-checkpoint.lisp",
+            "--budget",
+            "100",
+        ],
+    );
+    assert_eq!(output.status.code(), Some(2));
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        text.contains("files (lower confidence)") && text.contains("wal.lisp"),
+        "{text}"
+    );
+    assert!(!text.contains("other.lisp"), "{text}");
+    assert!(text.len().div_ceil(4) <= 100, "{text}");
+    let reply = mcp(
+        root.path(),
+        json!({"query":"needle", "root":root.path(), "scope":"src/wal-checkpoint.lisp", "budget":100}),
+    );
+    assert_eq!(reply["isError"], true, "{reply}");
+    let text = reply["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("files (lower confidence)") && text.contains("wal.lisp"),
+        "{text}"
+    );
+    assert!(!text.contains("[definition]"), "{text}");
+    assert!(text.len().div_ceil(4) <= 100, "{text}");
+}
