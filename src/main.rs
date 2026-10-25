@@ -40,8 +40,7 @@ struct Cli {
 
 #[derive(clap::Args)]
 struct SearchOptions {
-    /// Directory to search within or resolve relative paths against. Can be
-    /// repeated to search in multiple directories.
+    /// Directory, file, or glob to search within. Can be repeated to combine scopes.
     #[arg(long)]
     scope: Vec<PathBuf>,
 
@@ -559,14 +558,29 @@ fn main() {
 
     let cache = tilth::cache::OutlineCache::new();
     let scopes = resolve_scopes(&cli.search.scope);
-    let hint = if cli.search.deps {
-        FileScopeHint::Directory
-    } else {
-        FileScopeHint::Glob
-    };
-    for scope in &scopes {
-        tilth::refuse_file_scope(scope, scope, hint).unwrap_or_else(|e| usage_exit(&e));
+    if cli.search.deps {
+        for scope in &scopes {
+            tilth::refuse_file_scope(scope, scope, FileScopeHint::Directory)
+                .unwrap_or_else(|e| usage_exit(&e));
+        }
     }
+    let scopes = if cli.search.deps {
+        scopes
+    } else {
+        match tilth::search_scopes::expand(&scopes) {
+            Ok(scopes) => scopes,
+            Err(error) => {
+                emit_result(
+                    Err(error),
+                    &query,
+                    cli.search.json,
+                    is_tty,
+                    cli.search.budget,
+                );
+                return;
+            }
+        }
+    };
 
     // Output destination only controls paging. File views and search expansion
     // are selected by explicit flags, so captured agent calls keep smart views.
@@ -592,7 +606,7 @@ fn main() {
             Some(budget) => tilth::apply_callers_output_budget(&output, budget),
             None => output,
         });
-        emit_result(result, &query, cli.search.json, is_tty);
+        emit_result(result, &query, cli.search.json, is_tty, cli.search.budget);
         return;
     }
 
@@ -624,7 +638,7 @@ fn main() {
                 output
             }
         });
-        emit_result(result, &query, cli.search.json, is_tty);
+        emit_result(result, &query, cli.search.json, is_tty, cli.search.budget);
         return;
     }
 
@@ -644,7 +658,7 @@ fn main() {
         )),
     );
 
-    emit_result(result, &query, cli.search.json, is_tty);
+    emit_result(result, &query, cli.search.json, is_tty, cli.search.budget);
 }
 
 fn scopes_are_default(scopes: &[PathBuf]) -> bool {
@@ -777,6 +791,7 @@ fn emit_result(
     query: &str,
     json: bool,
     is_tty: bool,
+    budget: Option<u64>,
 ) {
     match result {
         Ok(output) => {
@@ -795,7 +810,7 @@ fn emit_result(
             }
         }
         Err(e) => {
-            tilth::diagnostic!("{e}");
+            tilth::diagnostic!("{}", apply_optional_budget(e.to_string(), budget));
             process::exit(e.exit_code());
         }
     }

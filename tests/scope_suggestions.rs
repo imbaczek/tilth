@@ -107,7 +107,7 @@ fn cli_single_missing_scope_exits_two_and_intermediate_typo_is_repaired() {
 }
 
 #[test]
-fn mcp_singular_warning_and_plural_scope_errors_include_hints() {
+fn mcp_missing_scope_errors_and_partial_results_include_hints() {
     let root = fixture();
     let requests = [
         serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"1"}}}),
@@ -146,7 +146,12 @@ fn mcp_singular_warning_and_plural_scope_errors_include_hints() {
             count,
             "{reply}"
         );
-        assert!(text.contains("hit.rs"), "{reply}");
+        if id == 2 {
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(!text.contains("hit.rs"), "{reply}");
+        } else {
+            assert!(text.contains("hit.rs"), "{reply}");
+        }
     }
 }
 

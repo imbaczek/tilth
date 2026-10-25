@@ -568,7 +568,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.trim_end().len(),
-            1945,
+            1936,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -587,8 +587,8 @@ mod tests {
             "require-root path discipline must lead the file-I/O guidance"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("DO NOT pass a file as scope — scope is a directory"),
-            "file-valued-scope steering (#195) must stay in the PATHS guidance"
+            SERVER_INSTRUCTIONS.contains("Search scopes accept directories, files, and file globs"),
+            "search scope capabilities must stay in the PATHS guidance"
         );
         // De-dup (R1) moved per-tool usage into the schemas. Lock that the
         // native-vs-tilth steering for weaker models stays verbatim, and that the

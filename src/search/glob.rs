@@ -36,6 +36,7 @@ pub(super) fn search_with_page(
         reason: e.to_string(),
     })?;
     let matcher = glob.compile_matcher();
+    let file_scope = scope.is_file();
 
     let matched: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
     let extensions: std::sync::Mutex<HashSet<String>> = std::sync::Mutex::new(HashSet::new());
@@ -70,7 +71,15 @@ pub(super) fn search_with_page(
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let rel = path.strip_prefix(scope).unwrap_or(path);
 
-            if matcher.is_match(name) || matcher.is_match(rel) {
+            // A selected file has no relative path beneath itself. Match its
+            // path suffixes so qualified patterns still identify that file.
+            let selected_path_matches = file_scope
+                && (matcher.is_match(path)
+                    || path.ancestors().skip(1).any(|ancestor| {
+                        path.strip_prefix(ancestor)
+                            .is_ok_and(|relative| matcher.is_match(relative))
+                    }));
+            if matcher.is_match(name) || matcher.is_match(rel) || selected_path_matches {
                 matched
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)

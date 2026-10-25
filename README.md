@@ -118,7 +118,16 @@ In MCP, `tilth_search` accepts the same paging fields for every `kind` (`symbol`
 {"query":"TODO: fix","kind":"content","root":"/project","offset":0,"limit":25}
 ```
 
-Symbol/content/regex searches combine and deduplicate all requested scopes before selecting a page. Comma-separated symbol targets each get their own page. This differs from CLI caller searches, which page each scope independently.
+Search scopes accept directories, individual files, and quoted globs:
+
+```bash
+tilth 'retention,slot-wal' --scope src/storage/wal.lisp
+tilth needle --scope 'src/**/*.rs'
+```
+
+Globs select matching files and directories, honor ignore rules, and never widen an unmatched selection to the whole project. Expansion is limited to 100,000 visited entries and 1,000 matching paths; use a narrower scope if a limit is reached. File scopes honor ignore rules too; `--no-respect-gitignore` bypasses Git ignores. An additional `--glob` narrows each resolved scope (relative to its directory, or a selected file's parent). Missing scopes suggest up to five similar filenames with normalized Levenshtein similarity of at least 0.8, within the response budget. Suggestions do not automatically select a replacement.
+
+Symbol/content/regex searches combine and deduplicate all requested scopes before selecting a page. Comma-separated symbol targets each get their own page. Caller searches page each resolved scope independently in both CLI and MCP.
 
 ### Expanded search
 

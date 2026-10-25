@@ -164,6 +164,12 @@ pub(super) fn resolve_scopes(
     }
 
     let Some(scopes_value) = args.get("scopes") else {
+        if let Some(raw) = args.get("scope").and_then(Value::as_str) {
+            let anchored = anchor_path(std::path::Path::new(raw), root, "scope")?;
+            return crate::search_scopes::expand(&[anchored])
+                .map(|scopes| (scopes, None))
+                .map_err(|error| error.to_string());
+        }
         let (scope, warning) = resolve_scope(args, root, crate::FileScopeHint::Glob)?;
         return Ok((vec![scope], warning));
     };
@@ -182,14 +188,11 @@ pub(super) fn resolve_scopes(
             .ok_or("\"scopes\" must be an array of strings")?;
         let anchored = anchor_path(std::path::Path::new(raw), root, "scope")?;
         let canonical = anchored.canonicalize().unwrap_or(anchored);
-        crate::refuse_file_scope(
-            std::path::Path::new(raw),
-            &canonical,
-            crate::FileScopeHint::Glob,
-        )?;
         resolved.push(canonical);
     }
-    Ok((resolved, None))
+    crate::search_scopes::expand(&resolved)
+        .map(|scopes| (scopes, None))
+        .map_err(|error| error.to_string())
 }
 
 /// Resolve a relative read path under the absolute-path discipline

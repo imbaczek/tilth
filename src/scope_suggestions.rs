@@ -11,12 +11,22 @@ pub(crate) fn suggestion_suffix(scope: &Path) -> String {
     {
         return String::new();
     }
-    let hints = directory_suggestions(scope);
+    let files = file_suggestions(scope);
+    let label = if files.is_empty() {
+        "directories"
+    } else {
+        "files"
+    };
+    let hints = if files.is_empty() {
+        directory_suggestions(scope)
+    } else {
+        files
+    };
     if hints.is_empty() {
         String::new()
     } else {
         format!(
-            " — did you mean directories: {}",
+            " — did you mean {label}: {}",
             hints
                 .iter()
                 .map(|p| format!("\"{}\"", p.display()))
@@ -24,6 +34,46 @@ pub(crate) fn suggestion_suffix(scope: &Path) -> String {
                 .join(", ")
         )
     }
+}
+
+/// Compare basenames so a correct filename can still be found under a moved directory.
+fn file_suggestions(scope: &Path) -> Vec<PathBuf> {
+    let absolute = std::path::absolute(scope).unwrap_or_else(|_| scope.to_path_buf());
+    let Some(name) = absolute.file_name() else {
+        return Vec::new();
+    };
+    let target = name.to_string_lossy().to_lowercase();
+    let Some(ancestor) = absolute.ancestors().skip(1).find(|path| path.is_dir()) else {
+        return Vec::new();
+    };
+    if ancestor.parent().is_none() {
+        return Vec::new();
+    }
+    let mut builder = crate::search::base_walk_builder(ancestor);
+    builder.follow_links(false).max_depth(Some(MAX_DEPTH));
+    let mut candidates = Vec::new();
+    for entry in builder
+        .build()
+        .take(MAX_SCAN_ENTRIES)
+        .filter_map(Result::ok)
+    {
+        if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let score = strsim::normalized_levenshtein(
+            &target,
+            &entry.file_name().to_string_lossy().to_lowercase(),
+        );
+        if score >= 0.8 {
+            candidates.push((score, entry.into_path()));
+        }
+    }
+    candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    candidates
+        .into_iter()
+        .take(MAX_HINTS)
+        .map(|(_, path)| path)
+        .collect()
 }
 
 fn directory_suggestions(scope: &Path) -> Vec<PathBuf> {

@@ -15,6 +15,16 @@ pub(in crate::mcp) fn tool_search(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
+    search_inner(args, cache, session, bloom)
+        .map_err(|error| apply_budget(&error, args.get("budget").and_then(Value::as_u64)))
+}
+
+fn search_inner(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -44,6 +54,10 @@ pub(in crate::mcp) fn tool_search(
     let context = context_path.as_deref();
     let glob = args.get("glob").and_then(|v| v.as_str());
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
+
+    if kind == "callers" && scopes.len() > 1 {
+        return search_callers_scopes(args, query, &scopes, cache, session, bloom);
+    }
 
     // A relative file query may exist in a later scope. Dispatch all such
     // queries through the shared reader before searching their text.
@@ -165,12 +179,6 @@ pub(in crate::mcp) fn tool_search(
             }
         }
         "callers" => {
-            if scopes.len() > 1 {
-                return Err(
-                    "multi-scope callers search is not implemented yet; use a single scope"
-                        .to_string(),
-                );
-            }
             let targets: Vec<&str> = query
                 .split(',')
                 .map(str::trim)
@@ -224,13 +232,76 @@ pub(in crate::mcp) fn tool_search(
     if kind == "callers" {
         result.push_str(&output);
         let budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
-        // Adapt hints before the final cap so JSON syntax also fits the budget.
-        let formatted = caller_mcp_navigation(&result);
-        let safe = crate::prepare_callers_output_budget(&formatted, budget);
-        return Ok(crate::budget::apply(&caller_mcp_navigation(&safe), budget));
+        return Ok(finish_callers_response(&result, budget));
     }
     result.push_str(&output);
     Ok(apply_budget(&result, budget))
+}
+
+fn search_callers_scopes(
+    args: &Value,
+    query: &str,
+    scopes: &[PathBuf],
+    cache: &OutlineCache,
+    session: &Session,
+    bloom: &Arc<BloomFilterCache>,
+) -> Result<String, String> {
+    let targets: Vec<_> = query
+        .split(',')
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+        .collect();
+    if targets.is_empty() {
+        return Err("missing required parameter: query".into());
+    }
+    if targets.len() > 5 {
+        return Err(format!(
+            "multi-target callers search limited to 5 queries (got {})",
+            targets.len()
+        ));
+    }
+    let mut outputs = Vec::new();
+    let mut failures = Vec::new();
+    let mut successes = 0;
+    for scope in scopes {
+        let mut scoped_args = args.clone();
+        let object = scoped_args
+            .as_object_mut()
+            .ok_or("expected object arguments")?;
+        object.remove("scopes");
+        object.insert("scope".into(), Value::String(scope.display().to_string()));
+        // Apply a single response budget after combining per-scope pages.
+        object.insert("budget".into(), Value::from(crate::budget::DEFAULT_BUDGET));
+        let output = match search_inner(&scoped_args, cache, session, bloom) {
+            Ok(output) => {
+                successes += 1;
+                output
+            }
+            Err(error) => {
+                failures.push(error.clone());
+                format!("scope error: {error}")
+            }
+        };
+        outputs.push(format!("## Scope: {}\n{output}", scope.display()));
+    }
+    if successes == 0 {
+        return Err(failures.join("\n"));
+    }
+    let output = format!(
+        "Caller pagination applies independently to each scope.\n\n{}",
+        outputs.join("\n\n")
+    );
+    let budget = args
+        .get("budget")
+        .and_then(Value::as_u64)
+        .unwrap_or(crate::budget::DEFAULT_BUDGET);
+    Ok(finish_callers_response(&output, budget))
+}
+
+fn finish_callers_response(output: &str, budget: u64) -> String {
+    let formatted = caller_mcp_navigation(output);
+    let safe = crate::prepare_callers_output_budget(&formatted, budget);
+    crate::budget::apply(&caller_mcp_navigation(&safe), budget)
 }
 
 /// File queries share the CLI reader, so adapt continuation patches before budgeting.
@@ -902,28 +973,24 @@ mod tests {
     }
 
     #[test]
-    fn scopes_callers_errors_instead_of_searching_first_scope_only() {
+    fn scopes_callers_search_each_scope() {
         let tmp = tempfile::tempdir().unwrap();
-        let one = tmp.path().join("one");
-        let two = tmp.path().join("two");
-        std::fs::create_dir_all(&one).unwrap();
-        std::fs::create_dir_all(&two).unwrap();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "query": "target",
-            "kind": "callers",
-            "root": tmp.path().to_str().unwrap(),
-            "scopes": ["one", "two"],
-        });
-
-        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
-
-        assert!(
-            err.contains("multi-scope callers"),
-            "callers must not silently search only the first scope: {err}"
+        for name in ["one", "two"] {
+            std::fs::create_dir(tmp.path().join(name)).unwrap();
+            std::fs::write(
+                tmp.path().join(name).join("call.rs"),
+                format!("fn {name}() {{ target(); }}\n"),
+            )
+            .unwrap();
+        }
+        let out = run_search(
+            &serde_json::json!({"query":"target", "kind":"callers", "root":tmp.path(), "scopes":["one", "two"]}),
         );
+        assert!(
+            out.contains("[caller: one]") && out.contains("[caller: two]"),
+            "{out}"
+        );
+        assert!(out.contains("independently to each scope"), "{out}");
     }
 
     #[test]
@@ -1040,22 +1107,14 @@ mod tests {
     }
 
     #[test]
-    fn multi_scope_file_arguments_are_refused_with_glob_hint() {
+    fn multi_scope_file_arguments_combine_without_duplicate_matches() {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("src")).unwrap();
         std::fs::write(root.path().join("src/file.rs"), "fn target() {}\n").unwrap();
-        let args = serde_json::json!({"query":"target", "root":root.path(), "scopes":["src", "src/file.rs"]});
-        let err = tool_search(
-            &args,
-            &OutlineCache::new(),
-            &Session::new(),
-            &Arc::new(BloomFilterCache::new()),
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("scope \"src/file.rs\" is a file") && err.contains("glob"),
-            "{err}"
+        let out = run_search(
+            &serde_json::json!({"query":"target", "root":root.path(), "scopes":["src", "src/file.rs"]}),
         );
+        assert_eq!(out.matches("[definition]").count(), 1, "{out}");
     }
 
     /// An EXPLICITLY passed relative scope with no absolute root to anchor it
@@ -1084,52 +1143,22 @@ mod tests {
         tmp
     }
 
-    /// #195: a file passed as `scope` together with an absolute `root` used
-    /// to succeed with a warning and search the whole root. Agents treat a
-    /// successful response as authoritative, so a narrowing argument must
-    /// never widen. The refusal names the file and the call that does work.
     #[test]
-    fn file_scope_with_root_is_refused_with_glob_hint() {
+    fn relative_and_absolute_file_scopes_search_only_selected_file() {
         let tmp = two_file_checkout();
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({
-            "query": "needle",
-            "scope": "src/x.py",
-            "root": tmp.path().to_str().unwrap(),
-        });
-        let err = tool_search(&args, &cache, &session, &bloom)
-            .expect_err("a file scope must be refused, not widened to root");
-        assert!(
-            err.contains("scope \"src/x.py\" is a file"),
-            "refusal must name the file: {err}"
-        );
-        assert!(
-            err.contains("scope to its directory (\"src\")")
-                && err.contains("glob to its name (\"x.py\")"),
-            "refusal must name the working call: {err}"
-        );
-    }
-
-    /// The absolute-file case without `root` already refused, but its message
-    /// blamed the missing root. It must name the real problem and the fix.
-    #[test]
-    fn absolute_file_scope_without_root_names_the_fix() {
-        let tmp = two_file_checkout();
-        let file = tmp.path().join("src/x.py");
-        let cache = OutlineCache::new();
-        let session = Session::new();
-        let bloom = Arc::new(BloomFilterCache::new());
-        let args = serde_json::json!({ "query": "needle", "scope": file.to_str().unwrap() });
-        let err = tool_search(&args, &cache, &session, &bloom).unwrap_err();
-        let dir = tmp.path().join("src");
-        assert!(
-            err.contains("is a file")
-                && err.contains(&format!("(\"{}\")", dir.display()))
-                && err.contains("glob to its name (\"x.py\")"),
-            "refusal must name the directory and glob fix: {err}"
-        );
+        for scope in [
+            "src/x.py".to_string(),
+            tmp.path().join("src/x.py").display().to_string(),
+        ] {
+            let out = run_search(
+                &serde_json::json!({"query":"needle", "root":tmp.path(), "scope":scope}),
+            );
+            assert!(out.contains("### x.py:1-2"), "{out}");
+            assert!(!out.contains("y.py"), "{out}");
+        }
+        let out =
+            run_search(&serde_json::json!({"query":"needle", "scope":tmp.path().join("src/x.py")}));
+        assert!(out.contains("### x.py:1-2"), "{out}");
     }
 
     /// The refusal's advice must actually work: scope at the directory plus
@@ -1153,26 +1182,18 @@ mod tests {
         );
     }
 
-    /// A scope that does not exist at all (usually a typo) keeps the soft
-    /// fallback: search root and say so. This is deliberate, so it is pinned.
     #[test]
-    fn missing_dir_scope_with_root_still_falls_back_with_warning() {
+    fn missing_scope_does_not_widen_to_root() {
         let tmp = two_file_checkout();
-        let out = run_search(&serde_json::json!({
-            "query": "needle",
-            "scope": "no/such/dir",
-            "root": tmp.path().to_str().unwrap(),
-        }));
-        assert!(
-            out.starts_with(
-                "scope \"no/such/dir\" is not a valid directory, searching the root/checkout directory instead."
-            ),
-            "a missing directory must warn and fall back to root: {out}"
-        );
-        assert!(
-            out.contains("x.py") && out.contains("y.py"),
-            "the fallback must search the whole root: {out}"
-        );
+        let err = tool_search(
+            &serde_json::json!({"query":"needle", "root":tmp.path(), "scope":"no/such/dir"}),
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+        .unwrap_err();
+        assert!(err.contains("No such file"), "{err}");
+        assert!(!err.contains("[definition]"), "{err}");
     }
 
     /// How many of the `n` numbered `<prefix>_NN.rs` fixture files the output
@@ -1600,6 +1621,56 @@ mod ranked_pagination_tests {
         assert!(
             !tight.contains("Next page:") && !tight.contains("End of listing."),
             "{tight}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod caller_scope_error_tests {
+    use super::*;
+    use std::fmt::Write as _;
+    #[test]
+    fn combined_callers_budget_uses_mcp_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut body = String::new();
+        for i in 0..20 {
+            writeln!(body, "fn caller_{i}() {{ target(); }}").unwrap();
+        }
+        for file in ["one.rs", "two.rs"] {
+            std::fs::write(root.path().join(file), &body).unwrap();
+        }
+        let out = tool_search(&serde_json::json!({"query":"target", "kind":"callers", "root":root.path(), "scope":"*.rs", "limit":2, "budget":100}),
+            &OutlineCache::new(), &Session::new(), &Arc::new(BloomFilterCache::new())).unwrap();
+        assert!(!out.contains("--offset"), "{out}");
+        assert!(out.len().div_ceil(4) <= 100, "{out}");
+    }
+
+    #[test]
+    fn multi_scope_callers_keep_error_status_and_validate_paging() {
+        let root = tempfile::tempdir().unwrap();
+        for extra in [
+            serde_json::json!({"query":"a,b,c,d,e,f"}),
+            serde_json::json!({"query":"target", "limit":0}),
+            serde_json::json!({"query":"target"}),
+        ] {
+            let mut args = serde_json::json!({"kind":"callers", "root":root.path(), "scopes":["missing-one", "missing-two"]});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(tool_search(
+                &args,
+                &OutlineCache::new(),
+                &Session::new(),
+                &Arc::new(BloomFilterCache::new())
+            )
+            .is_err());
+        }
+        std::fs::write(root.path().join("hit.rs"), "fn caller() { target(); }\n").unwrap();
+        let out = tool_search(&serde_json::json!({"query":"target", "kind":"callers", "root":root.path(), "scopes":["missing", "hit.rs"]}),
+            &OutlineCache::new(), &Session::new(), &Arc::new(BloomFilterCache::new())).unwrap();
+        assert!(
+            out.contains("scope error:") && out.contains("[caller: caller]"),
+            "{out}"
         );
     }
 }

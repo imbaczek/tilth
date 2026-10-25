@@ -1,7 +1,7 @@
 <!-- generated from prompts/mcp-base.md + prompts/mcp-edit.md by scripts/regen-agents-md.sh — do not edit directly -->
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
 
-PATHS: DO NOT pass a relative path or scope without also setting root (absolute) — the server cannot see your shell cwd, so bare relative paths are refused. Absolute paths always work; omitting path/scope searches the project the server was launched in. DO NOT pass a file as scope — scope is a directory; to search one file, set glob to that file's path.
+PATHS: DO NOT pass a relative path or scope without also setting root (absolute) — the server cannot see your shell cwd, so bare relative paths are refused. Absolute paths always work; omitting path/scope searches the project the server was launched in. Search scopes accept directories, files, and file globs. Other tools require directory scopes.
 
 With multiple scopes, a relative query that resolves to a file in any scope reads the matching file(s). It does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
 

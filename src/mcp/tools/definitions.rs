@@ -32,12 +32,12 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Existing directory only, never a file. Omit for the whole project. To search one file, set scope to its directory and glob to its name."
+                        "description": "Directory, file, or glob of paths to search. Omit for the whole project. Relative scopes require an absolute root. Missing scopes report similar paths without widening the search."
                     },
                     "scopes": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Search multiple explicit directories as one combined result set for symbol, content, and regex searches. Multi-scope callers search is not supported. Do not provide both `scope` and `scopes`; relative scopes require an absolute `root`."
+                        "description": "Search multiple directories, files, or globs as one combined result set for symbol, content, and regex searches. Callers pagination applies independently to each resolved scope. Do not provide both `scope` and `scopes`; relative scopes require an absolute `root`."
                     },
                     "kind": {
                         "type": "string",
@@ -521,8 +521,8 @@ mod tests {
         assert!(
             scopes["description"]
                 .as_str()
-                .is_some_and(|desc| desc.contains("callers") && desc.contains("not supported")),
-            "description should disclose the callers limitation: {scopes}"
+                .is_some_and(|desc| desc.contains("Callers") && desc.contains("independently")),
+            "description should explain callers pagination: {scopes}"
         );
         assert!(
             search["description"]
@@ -599,7 +599,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} must advertise scope"))
                 .to_string()
         };
-        for name in ["tilth_search", "tilth_list", "tilth_deps", "tilth_grok"] {
+        for name in ["tilth_list", "tilth_deps", "tilth_grok"] {
             let desc = scope_desc(name);
             assert!(
                 desc.contains("directory") && desc.contains("never a file"),
@@ -608,7 +608,7 @@ mod tests {
         }
         assert!(
             scope_desc("tilth_search").contains("glob"),
-            "tilth_search must point at glob for one file"
+            "tilth_search must advertise file globs"
         );
         assert!(
             scope_desc("tilth_diff").contains("file or directory"),

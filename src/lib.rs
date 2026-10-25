@@ -34,6 +34,7 @@ pub mod overview;
 pub(crate) mod read;
 mod scope_suggestions;
 pub(crate) mod search;
+pub mod search_scopes;
 pub(crate) mod session;
 pub(crate) mod timeout;
 pub(crate) mod types;

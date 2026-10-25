@@ -192,12 +192,24 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
         });
 
     let respect_gitignore = gitignore_config().0;
-    let mut builder = base_walk_builder_with_gitignore(scope, respect_gitignore);
+    // Walk the parent for file scopes so explicit-root ignore bypasses cannot
+    // defeat the additional glob filter. The predicate keeps only that file.
+    let selected_file = metadata.is_file().then(|| scope.to_path_buf());
+    let walk_root = if metadata.is_file() {
+        scope.parent().unwrap_or(Path::new("."))
+    } else {
+        scope
+    };
+    let mut builder = base_walk_builder_with_gitignore(walk_root, respect_gitignore);
     builder.threads(threads);
+    if let Some(file) = selected_file.clone() {
+        let root = walk_root.to_path_buf();
+        builder.filter_entry(move |entry| entry.path() == root || entry.path() == file);
+    }
 
     if let Some(pattern) = glob {
         if !pattern.is_empty() {
-            let mut overrides = ignore::overrides::OverrideBuilder::new(scope);
+            let mut overrides = ignore::overrides::OverrideBuilder::new(walk_root);
             overrides
                 .add(pattern)
                 .map_err(|e| TilthError::InvalidQuery {
@@ -208,10 +220,14 @@ pub(crate) fn walker(scope: &Path, glob: Option<&str>) -> Result<ignore::WalkPar
                 query: pattern.to_string(),
                 reason: format!("invalid glob: {e}"),
             })?;
-            if respect_gitignore {
+            if respect_gitignore || selected_file.is_some() {
+                let root = walk_root.to_path_buf();
                 // A glob narrows the walk without whitelisting ignored entries.
                 builder.filter_entry(move |entry| {
                     include_entry(entry)
+                        && selected_file
+                            .as_ref()
+                            .is_none_or(|file| entry.path() == root || entry.path() == file)
                         && !overrides
                             .matched(
                                 entry.path(),
@@ -709,8 +725,9 @@ pub fn search_regex_scopes_expanded(
 }
 
 fn search_header_for_scopes(result: &SearchResult, scopes: &[PathBuf]) -> String {
-    let scope_list = scopes
+    let mut scope_list = scopes
         .iter()
+        .take(5)
         .map(|scope| {
             let canonical = scope.canonicalize().unwrap_or_else(|_| scope.clone());
             let count = result
@@ -725,6 +742,9 @@ fn search_header_for_scopes(result: &SearchResult, scopes: &[PathBuf]) -> String
         })
         .collect::<Vec<_>>()
         .join(", ");
+    if scopes.len() > 5 {
+        let _ = write!(scope_list, ", … ({} scopes total)", scopes.len());
+    }
     let parts = match (result.definitions, result.usages) {
         (0, _) => format!("{} matches", result.total_found),
         (definitions, usages) => format!(

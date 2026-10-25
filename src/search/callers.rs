@@ -753,11 +753,7 @@ fn write_caller_bucket(
         let _ = write!(
             output,
             "\n## {}:{} [caller: {}]\n",
-            caller
-                .path
-                .strip_prefix(scope)
-                .unwrap_or(&caller.path)
-                .display(),
+            crate::format::rel(&caller.path, scope),
             caller.line,
             caller.calling_function
         );
@@ -849,7 +845,7 @@ fn write_second_hop_impact(
             break;
         }
 
-        let rel_path = m.path.strip_prefix(scope).unwrap_or(&m.path).display();
+        let rel_path = crate::format::rel(&m.path, scope);
         let _ = writeln!(
             output,
             "  {:<20} {}:{}  -> {}",
@@ -1021,7 +1017,7 @@ fn no_callers_message(target: &str, scope: &Path, target_seen: bool, glob: Optio
         return format!(
             "# Callers of \"{target}\" in {scope_disp} — no call sites found\n\n\
              The name \"{target}\" does not appear anywhere in scope. \
-             Check the spelling, or widen scope if you expected hits outside this directory.",
+             Check the spelling, or widen scope if you expected hits outside this scope.",
             scope_disp = scope.display()
         );
     }

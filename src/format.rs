@@ -120,10 +120,15 @@ pub(crate) fn parse_anchor(s: &str) -> Option<(usize, u16)> {
 
 /// Path relative to scope for cleaner output. Falls back to full path.
 pub(crate) fn rel(path: &Path, scope: &Path) -> String {
-    path.strip_prefix(scope)
-        .unwrap_or(path)
-        .display()
-        .to_string()
+    let relative = path.strip_prefix(scope).unwrap_or(path);
+    if relative.as_os_str().is_empty() {
+        path.file_name().map_or_else(
+            || path.display().to_string(),
+            |name| name.to_string_lossy().into_owned(),
+        )
+    } else {
+        relative.display().to_string()
+    }
 }
 
 #[cfg(test)]

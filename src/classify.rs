@@ -33,6 +33,15 @@ pub fn classify(query: &str, scope: &Path) -> QueryType {
         }
     }
 
+    // A selected file can be addressed by basename, without resolving queries
+    // into sibling files outside that selection.
+    if scope.is_file() {
+        let candidate = scope.parent().unwrap_or(Path::new(".")).join(query);
+        if scope.ends_with(query) || candidate.canonicalize().ok() == scope.canonicalize().ok() {
+            return QueryType::FilePath(scope.to_path_buf());
+        }
+    }
+
     // 1. Glob — check first because globs can contain path separators.
     //    But only if no spaces: real globs don't have spaces, content like "import { X }" does.
     if !query.contains(' ')
