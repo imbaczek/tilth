@@ -98,6 +98,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "description": "Absolute or relative file path to read. A relative path requires an absolute `root`; the server cannot see your shell cwd."
                     },
+                    "symbols": {"type":"array","items":{"type":"string","minLength":1},"minItems":1,"maxItems":20,"description":"Exact symbol names across path/paths; commas remain literal. Qualified names or name@line disambiguate. Returns per-name status, source once per declaration, shared budget. Supports auto/full/signature; signature conflicts with edit mode. Conflicts with sections and paging."},
                     "paths": {
                         "type": "array",
                         "items": { "type": "string" },

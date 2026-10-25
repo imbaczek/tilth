@@ -191,6 +191,9 @@ enum Command {
         /// File paths, at most 20.
         #[arg(required = true, num_args = 1..=20)]
         paths: Vec<PathBuf>,
+        /// Exact symbol name; repeat to fetch multiple declarations. Use name@line to disambiguate.
+        #[arg(long = "symbol")]
+        symbols: Vec<String>,
         /// Directory anchoring relative paths; defaults to the current directory.
         #[arg(long)]
         root: Option<PathBuf>,
@@ -355,6 +358,7 @@ fn main() {
         match cmd {
             Command::Read {
                 paths,
+                symbols,
                 root,
                 mode,
                 full,
@@ -391,6 +395,9 @@ fn main() {
                     args["path"] = serde_json::json!(paths[0]);
                 } else {
                     args["paths"] = serde_json::json!(paths);
+                }
+                if !symbols.is_empty() {
+                    args["symbols"] = serde_json::json!(symbols);
                 }
                 if section.len() == 1 {
                     args["section"] = serde_json::json!(section[0]);

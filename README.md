@@ -82,6 +82,27 @@ Repeat `--query` (up to 20) to search literal values without splitting commas.
 The positional comma-separated symbol shorthand remains available. A batch keeps
 per-query results, deduplicates repeated queries, and shares one output budget.
 These compact searches do not expand source (`--expand=0` is accepted).
+
+Fetch declarations directly without looking up line ranges:
+
+```bash
+tilth read src/parser.rs --symbol parse_query --symbol 'Parser::parse_statement'
+tilth read src/parser.rs src/types.rs --symbol parse_query --symbol Query --mode signature
+```
+
+Repeat `--symbol` up to 20 times; each value is literal (including commas).
+Names are resolved across all supplied files. Ambiguous names return candidates;
+use a qualified name, narrower files, or `name@line` to select one declaration.
+Repeated requests report each status but emit each declaration once. Missing
+names and indexing problems are explicit. One shared budget covers the summary
+and bodies; truncated output reports omissions. Normal reads return exact AST
+source spans; edit mode returns whole physical lines with hash anchors.
+Symbol reads support auto/full/signature, and conflict with sections or paging.
+Signature mode cannot be combined with edit mode; request auto/full for complete
+physical source lines and safe edit anchors.
+MCP uses `symbols: ["parse_query", "Parser::parse_statement"]` with `path` or
+`paths`. This is a stateless selection, not a record of previously seen code.
+
 MCP `tilth_search` accepts `queries: ["parse_query", "parse_statement"]` instead
 of `query`, with the same `select` options. `--offset`/`--limit` page each query;
 keep queries, selection, scopes and filters unchanged between pages.

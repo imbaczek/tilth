@@ -28,6 +28,9 @@ pub(in crate::mcp) fn read_with_navigation(
     edit_mode: bool,
     mcp_navigation: bool,
 ) -> Result<String, String> {
+    if args.get("symbols").is_some() {
+        return super::read_symbols::read(args, cache, session, edit_mode, mcp_navigation);
+    }
     let budget = args.get("budget").and_then(serde_json::Value::as_u64);
     // Extract optional root for anchoring relative paths. A relative path
     // without an absolute `root` is unresolvable (the server cannot see the
