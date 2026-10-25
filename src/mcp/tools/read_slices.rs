@@ -4,6 +4,8 @@ use serde_json::Value;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+type SliceGroup = (PathBuf, PathBuf, Vec<(u32, u32)>);
+
 fn range(text: &str) -> Result<(u32, u32), String> {
     let (start, end) = text
         .split_once('-')
@@ -47,7 +49,7 @@ pub(super) fn read(
         .filter(|a| !a.is_empty() && a.len() <= 20)
         .ok_or("slices requires 1-20 objects")?;
     let root = args.get("root").and_then(Value::as_str).map(Path::new);
-    let mut groups: Vec<(PathBuf, PathBuf, Vec<(u32, u32)>)> = Vec::new();
+    let mut groups: Vec<SliceGroup> = Vec::new();
     let mut count = 0;
     for slice in slices {
         let raw = slice

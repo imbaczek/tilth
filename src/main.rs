@@ -292,6 +292,22 @@ enum Command {
     },
     /// Show the project fingerprint (what MCP init would inject).
     Overview,
+    /// Trace bounded static calls, with explicit heuristic and completeness limits.
+    Trace {
+        from: String,
+        #[arg(long)]
+        to: Option<String>,
+        #[arg(long, default_value = "callees", value_parser = ["callers", "callees"])]
+        direction: String,
+        #[arg(long, default_value_t = 2)]
+        depth: usize,
+        #[arg(long)]
+        scope: Option<PathBuf>,
+        #[arg(long)]
+        budget: Option<u64>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Grok a symbol — one call returns def + doc + callees + callers + siblings + tests.
     ///
     /// Target accepts: bare symbol (`parse_unified_diff`), path:line
@@ -445,6 +461,43 @@ fn main() {
                     process::exit(1);
                 }
                 emit_output(&output, false);
+            }
+            Command::Trace {
+                from,
+                to,
+                direction,
+                depth,
+                scope,
+                budget,
+                json,
+            } => {
+                if cli.search.scope.len() > 1 {
+                    usage_exit("trace accepts one directory scope");
+                }
+                let root = std::env::current_dir().expect("current directory");
+                let scope = scope
+                    .or_else(|| cli.search.scope.first().cloned())
+                    .unwrap_or_else(|| PathBuf::from("."));
+                let mut args = serde_json::json!({"root":root,"scope":scope,"from":from,"direction":direction,"depth":depth});
+                if let Some(to) = to {
+                    args["to"] = to.into();
+                }
+                if let Some(budget) = budget.or(cli.search.budget) {
+                    args["budget"] = budget.into();
+                }
+                match tilth::mcp::trace_for_cli(&args) {
+                    Ok(output) => emit_result(
+                        Ok(output),
+                        &from,
+                        json || cli.search.json,
+                        io::stdout().is_terminal(),
+                        budget.or(cli.search.budget),
+                    ),
+                    Err(error) => {
+                        tilth::diagnostic!("trace error: {error}");
+                        process::exit(1);
+                    }
+                }
             }
             Command::Grok {
                 target,

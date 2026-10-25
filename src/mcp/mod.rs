@@ -36,6 +36,11 @@ pub fn read_for_cli(args: &Value, edit_mode: bool) -> Result<String, String> {
     )
 }
 
+/// Trace static calls with the same validation and budget as MCP.
+pub fn trace_for_cli(args: &Value) -> Result<String, String> {
+    tools::tool_trace(args, &OutlineCache::new())
+}
+
 /// Shared dependencies passed through the request → dispatch pipeline.
 #[derive(Clone)]
 struct Services {
@@ -358,6 +363,7 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
             }),
             "tilth_deps" => tool_deps(args, services.bloom()),
             "tilth_grok" => tool_grok(args, services.bloom(), services.session()),
+            "tilth_trace" => tools::tool_trace(args, services.cache()),
             "tilth_diff" => tool_diff(args),
             "tilth_session" => tool_session(args, services.session()),
             "tilth_write" if edit_mode => tool_write(args, services.session(), services.bloom()),

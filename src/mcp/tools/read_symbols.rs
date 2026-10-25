@@ -1,111 +1,10 @@
 //! Symbol-addressed reads shared by CLI and MCP.
-use crate::{
-    cache::{OutlineCache, ParsedFile},
-    session::Session,
-    types::{Lang, OutlineEntry},
-};
+use crate::lang::declarations::exact_body;
+use crate::{cache::OutlineCache, session::Session, types::Lang};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
-
-struct Declaration {
-    path: PathBuf,
-    qualified: String,
-    entry: OutlineEntry,
-    parsed: std::sync::Arc<ParsedFile>,
-    span: Option<(usize, usize)>,
-}
-
-fn flatten(
-    entries: Vec<OutlineEntry>,
-    parents: &[String],
-    path: &Path,
-    parsed: &std::sync::Arc<ParsedFile>,
-    out: &mut Vec<Declaration>,
-    spans: &mut SpanIndex,
-) {
-    for mut entry in entries {
-        let mut names = parents.to_vec();
-        names.push(entry.name.trim_start_matches("impl ").to_owned());
-        let children = std::mem::take(&mut entry.children);
-        let span = claim_span(&entry, spans);
-        out.push(Declaration {
-            path: path.to_owned(),
-            qualified: names.join("::"),
-            entry,
-            parsed: parsed.clone(),
-            span,
-        });
-        flatten(children, &names, path, parsed, out, spans);
-    }
-}
-
-struct SourceSpan {
-    name: Option<String>,
-    grouped_go: bool,
-    bytes: (usize, usize),
-}
-type SpanIndex = HashMap<(u32, u32), Vec<SourceSpan>>;
-
-fn index_spans(parsed: &ParsedFile) -> SpanIndex {
-    let lines: Vec<_> = parsed.content.lines().collect();
-    let mut spans = SpanIndex::new();
-    let mut pending = vec![parsed.tree.root_node()];
-    while let Some(node) = pending.pop() {
-        let name = (crate::lang::spec::spec(parsed.lang)
-            .definitions
-            .extract_name)(node, &lines);
-        let grouped_go = parsed.lang == Lang::Go
-            && matches!(node.kind(), "var_spec" | "const_spec" | "type_spec");
-        if name.is_some() || grouped_go {
-            let source_node = if grouped_go {
-                node.parent()
-                    .filter(|parent| {
-                        matches!(
-                            parent.kind(),
-                            "var_declaration" | "const_declaration" | "type_declaration"
-                        ) && parent.start_position().row == node.start_position().row
-                            && parent.end_position().row == node.end_position().row
-                    })
-                    .unwrap_or(node)
-            } else {
-                node
-            };
-            spans
-                .entry((
-                    node.start_position().row as u32 + 1,
-                    node.end_position().row as u32 + 1,
-                ))
-                .or_insert_with(Vec::new)
-                .push(SourceSpan {
-                    name,
-                    grouped_go,
-                    bytes: (source_node.start_byte(), source_node.end_byte()),
-                });
-        }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        pending.extend(children.into_iter().rev());
-    }
-    spans
-}
-
-fn claim_span(entry: &OutlineEntry, spans: &mut SpanIndex) -> Option<(usize, usize)> {
-    let candidates = spans.get_mut(&(entry.start_line, entry.end_line))?;
-    let index = candidates.iter().position(|candidate| {
-        candidate.name.as_deref() == Some(entry.name.as_str()) || candidate.grouped_go
-    })?;
-    Some(candidates.remove(index).bytes)
-}
-
-fn exact_body(d: &Declaration) -> Option<String> {
-    let (start, end) = d.span?;
-    d.parsed
-        .content
-        .get(start..end)
-        .map(|body| format!("```\n{body}\n```"))
-}
+use std::path::Path;
 
 pub(super) fn read(
     args: &Value,
@@ -174,8 +73,7 @@ pub(super) fn read(
         match cache.get_or_parse(&path) {
             Some(parsed)=> {
                 if parsed.tree.root_node().has_error() { notices.push(format!("{}: parse errors; symbol results may be incomplete",path.display())); }
-                let entries=crate::lang::outline::get_outline_entries(&parsed.content,parsed.lang);
-                flatten(entries,&[],&path,&parsed,&mut declarations,&mut index_spans(&parsed));
+                declarations.extend(crate::lang::declarations::collect(&path,&parsed));
             }
             None=>notices.push(format!("{}: cannot index symbols (missing/unreadable file, unsupported language, or file exceeds 500 KB)",path.display())),
         }

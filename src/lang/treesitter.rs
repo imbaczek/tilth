@@ -120,10 +120,40 @@ pub(crate) fn extract_definition_name(node: tree_sitter::Node, lines: &[&str]) -
         if let Some(child) = node.child_by_field_name(field) {
             let text = node_text_simple(child, lines, NodeTextMode::Full);
             if !text.is_empty() {
-                // For variable_declarator, get the identifier inside
+                // C/C++ function and pointer names live inside a declarator chain.
                 if child.kind().contains("declarator") {
-                    if let Some(id) = child.child_by_field_name("name") {
-                        return Some(node_text_simple(id, lines, NodeTextMode::Full));
+                    let mut current = child;
+                    loop {
+                        if let Some(inner) = current
+                            .child_by_field_name("declarator")
+                            .or_else(|| current.child_by_field_name("name"))
+                        {
+                            current = inner;
+                            continue;
+                        }
+                        if current.kind().contains("declarator") {
+                            let mut cursor = current.walk();
+                            let inner = current.named_children(&mut cursor).find(|n| {
+                                n.kind().contains("declarator")
+                                    || matches!(
+                                        n.kind(),
+                                        "identifier"
+                                            | "field_identifier"
+                                            | "qualified_identifier"
+                                            | "operator_name"
+                                            | "destructor_name"
+                                    )
+                            });
+                            if let Some(inner) = inner {
+                                current = inner;
+                                continue;
+                            }
+                        }
+                        let name = node_text_simple(current, lines, NodeTextMode::Full);
+                        if !name.is_empty() {
+                            return Some(name);
+                        }
+                        break;
                     }
                 }
                 return Some(text);

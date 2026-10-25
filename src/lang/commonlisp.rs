@@ -37,7 +37,7 @@ pub(crate) const SPEC: LangSpec = LangSpec {
 
 /// Default reader case folding, preserving escaped characters and separating
 /// package syntax from colons inside escaped symbol names.
-fn symbol_key(name: &str) -> String {
+pub(crate) fn symbol_key(name: &str) -> String {
     let mut result = String::new();
     let mut escaped = false;
     let mut chars = name.chars();

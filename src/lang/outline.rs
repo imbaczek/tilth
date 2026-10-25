@@ -141,6 +141,7 @@ fn node_to_entry(
         | "protocol_function_declaration" => {
             let name = find_child_text(node, "name", lines)
                 .or_else(|| find_child_text(node, "identifier", lines))
+                .or_else(|| (crate::lang::spec::spec(lang).definitions.extract_name)(node, lines))
                 .unwrap_or_else(|| {
                     // Swift deinit has no name field — use the node kind as name
                     if kind_str == "deinit_declaration" {

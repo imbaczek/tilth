@@ -649,3 +649,55 @@ Earlier versions of this README carried a cost benchmark. It was measured on v0.
 ## License
 
 MIT
+
+
+## Bounded call traces
+
+```bash
+tilth trace handle_request --to execute_query --depth 5
+tilth trace execute_query --direction callers --depth 3 --budget 2000
+```
+
+`trace` builds a stateless graph of static syntactic calls within one directory
+scope. It returns a shortest discovered path to `--to`, or a bounded neighborhood
+without it. Endpoints accept function names, qualified names, `name@line`, or
+scope-relative `file:line`. Ambiguity returns candidates rather than picking one.
+MCP exposes `tilth_trace` with `from`, optional `to`, `direction`, `depth`, `scope`,
+`root`, and `budget`. Depth is 1–16 (default 2).
+
+Edges cite source call sites and are resolved by name, not by executing a program
+or running its compiler. A missing path means **no path found within the requested
+depth**, not unreachable. Receiver dispatch, import aliases, external Rust module
+layouts, generated definitions, callbacks, generic method combination, macros,
+reader conditionals and evaluation phases can leave gaps or heuristic bindings.
+HTML/Vue template bindings, HTTP routes and cross-language runtime bridges are
+not inferred. Use content projections and batch slices for those sources.
+
+Observed limitations appear ahead of results. A clean, same-file Rust path can
+suppress warnings about unrelated files; path-local parse/binding concerns and
+hard work limits remain visible. Completing the requested depth alone is normal
+and does not trigger a warning. The output budget is independent of scan limits:
+100,000 visited directory entries, 2,000 source files, 64 MiB of source, 30,000
+functions, 50,000 call sites, and 500 KB per parsed file. Narrow the scope when a
+limit prevents a useful result.
+
+### Manual trace checks
+
+These examples were checked against the neighboring source trees, including
+inspection of the reported call sites. They are smoke checks, not recall scores.
+
+| Source | Request (with `tilth trace`) | Observed result |
+| --- | --- | --- |
+| Postgres C | `PostgresMain --to exec_simple_query --scope ../postgres/src/backend/tcop` | Path found at `postgres.c:4943`; C bindings and parser limitations reported. |
+| Postgres Lisp | `parse-statements --to parse-statement --scope ../postgres/src/lisp` | Direct call at `backend/parser/gram.lisp:98`; macro/LOOP and unresolved-call limitations reported. |
+| SBCL Lisp | `update-dfun --to compute-discriminating-function --scope ../sbcl/src/pcl` | Destination ambiguous: generic declaration plus primary and `:around` methods; no invented method chain. |
+| Filebrowser Go | `NewHandler --to getStaticHandlers --scope ../filebrowser/http` | Direct call at `http.go:36`; receiver/callback and by-name limitations reported. |
+| Filebrowser TypeScript | `remove --scope ../filebrowser/frontend/src/api` | Three declarations reported, requiring disambiguation. |
+| Filebrowser TypeScript | `files.ts:68 --to fetchURL --scope ../filebrowser/frontend/src/api` | `remove → resourceAction → fetchURL`, with sites `files.ts:69` and `files.ts:63`. |
+| Filebrowser TypeScript | `post --to upload --scope ../filebrowser/frontend/src/api` | No path: aliased `postTus` is not resolved to `upload`; heuristic/unresolved-call warnings retained. |
+
+Also checked `--select signatures` and `read --symbol` on Postgres C and Filebrowser
+Go, `--select files --kind content --query '@click'` on Vue files, and mixed
+HTML/Vue `read --slice` requests. Vue symbol reads explicitly report unsupported
+indexing. The SBCL definition-indexing corpus audit measures definition coverage;
+it does not establish call-edge or trace recall.

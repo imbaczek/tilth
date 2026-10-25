@@ -150,12 +150,6 @@ pub(crate) fn run(
 }
 
 fn signature(m: &Match, cache: &OutlineCache) -> String {
-    let unavailable = || {
-        format!(
-            "{} [signature unavailable]",
-            m.def_name.as_deref().unwrap_or("declaration")
-        )
-    };
     fn find<'a>(
         entries: &'a [crate::types::OutlineEntry],
         line: u32,
@@ -169,6 +163,12 @@ fn signature(m: &Match, cache: &OutlineCache) -> String {
             }
         })
     }
+    let unavailable = || {
+        format!(
+            "{} [signature unavailable]",
+            m.def_name.as_deref().unwrap_or("declaration")
+        )
+    };
     let Some(parsed) = cache.get_or_parse(&m.path) else {
         return unavailable();
     };

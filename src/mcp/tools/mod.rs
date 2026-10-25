@@ -8,6 +8,7 @@ mod read_slices;
 mod read_symbols;
 mod search;
 mod session;
+mod trace;
 mod write;
 
 pub(super) use definitions::tool_definitions;
@@ -18,6 +19,7 @@ pub(super) use list::tool_list;
 pub(super) use read::{read_with_navigation, tool_read};
 pub(super) use search::{projected_search, tool_search};
 pub(super) use session::tool_session;
+pub(super) use trace::tool_trace;
 pub(super) use write::tool_write;
 
 use std::path::PathBuf;

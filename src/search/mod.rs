@@ -14,6 +14,7 @@ pub mod rank;
 pub mod siblings;
 pub mod strip;
 pub mod symbol;
+pub(crate) mod trace;
 pub mod truncate;
 
 mod bloom_walk;

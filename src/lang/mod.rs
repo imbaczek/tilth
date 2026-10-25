@@ -9,6 +9,7 @@ pub(crate) mod c;
 pub(crate) mod commonlisp;
 pub(crate) mod cpp;
 pub(crate) mod csharp;
+pub(crate) mod declarations;
 pub(crate) mod dockerfile;
 pub(crate) mod elixir;
 pub(crate) mod go;
