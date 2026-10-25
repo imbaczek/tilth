@@ -9,6 +9,7 @@ pub mod glob;
 pub mod grok;
 pub mod merge;
 pub(crate) mod paging;
+pub(crate) mod projection;
 pub mod rank;
 pub mod siblings;
 pub mod strip;

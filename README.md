@@ -67,6 +67,26 @@ with a single value, a value after `search` takes precedence.
 tilth search get_typed_signature --scope fastapi --expand=1
 ```
 
+For compact results, choose `--select files|definitions|signatures|count`.
+Projection happens before pagination. Definitions and signatures require symbol
+search; counts describe all observed matches, independently of the page size.
+Incomplete scans report lower bounds and scope errors.
+
+```bash
+tilth parse_query --select signatures
+tilth search --query parse_query --query parse_statement --select definitions
+tilth search --query 'alpha,beta' --kind content --select count
+```
+
+Repeat `--query` (up to 20) to search literal values without splitting commas.
+The positional comma-separated symbol shorthand remains available. A batch keeps
+per-query results, deduplicates repeated queries, and shares one output budget.
+These compact searches do not expand source (`--expand=0` is accepted).
+MCP `tilth_search` accepts `queries: ["parse_query", "parse_statement"]` instead
+of `query`, with the same `select` options. `--offset`/`--limit` page each query;
+keep queries, selection, scopes and filters unchanged between pages.
+
+
 ````
 $ tilth get_typed_signature --scope fastapi --expand=1
 # Search: "get_typed_signature" in fastapi — 2 matches (1 definitions, 1 usages)

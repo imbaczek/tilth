@@ -14,7 +14,7 @@ pub(super) use diff::tool_diff;
 pub(super) use grok::tool_grok;
 pub(super) use list::tool_list;
 pub(super) use read::{read_with_navigation, tool_read};
-pub(super) use search::tool_search;
+pub(super) use search::{projected_search, tool_search};
 pub(super) use session::tool_session;
 pub(super) use write::tool_write;
 

@@ -21,6 +21,11 @@ use tools::{
 
 /// Read with the same views and validation as `tilth_read`.
 /// CLI callers supply an absolute root for relative paths.
+/// Search with the same literal batch and projection semantics as MCP.
+pub fn search_for_cli(args: &Value) -> Result<String, String> {
+    tools::projected_search(args, &OutlineCache::new(), &Session::new(), false)
+}
+
 pub fn read_for_cli(args: &Value, edit_mode: bool) -> Result<String, String> {
     tools::read_with_navigation(
         args,

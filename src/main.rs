@@ -40,6 +40,15 @@ struct Cli {
 
 #[derive(clap::Args)]
 struct SearchOptions {
+    /// Literal query; repeat for a batch (commas are not split). Max 20.
+    #[arg(long = "query", short = 'q')]
+    queries: Vec<String>,
+    /// Compact result shape, applied before paging.
+    #[arg(long, value_parser = ["files", "definitions", "signatures", "count"])]
+    select: Option<String>,
+    /// Explicit search kind for literal batches or projections.
+    #[arg(long, value_parser = ["symbol", "content", "regex"])]
+    kind: Option<String>,
     /// Directory, file, or quoted glob to search within. Repeat to combine scopes.
     ///
     /// Scope globs select files and directories, honor ignore rules, and are limited
@@ -129,6 +138,9 @@ struct SearchOptions {
 
 impl SearchOptions {
     fn merge(&mut self, options: Self) {
+        self.queries.extend(options.queries);
+        self.select = options.select.or(self.select.take());
+        self.kind = options.kind.or(self.kind.take());
         self.scope.extend(options.scope);
         self.respect_gitignore |= options.respect_gitignore;
         self.no_respect_gitignore |= options.no_respect_gitignore;
@@ -146,7 +158,12 @@ impl SearchOptions {
     }
 
     fn validate(&self, edit: bool) -> Result<(), clap::Error> {
-        let conflict = if self.respect_gitignore && self.no_respect_gitignore {
+        let compact = !self.queries.is_empty() || self.select.is_some() || self.kind.is_some();
+        let conflict = if compact
+            && (self.deps || self.map || self.callers || self.section.is_some() || edit)
+        {
+            Some("--query, --select, and --kind conflict with --deps, --map, --callers, --section, and --edit")
+        } else if self.respect_gitignore && self.no_respect_gitignore {
             Some("--respect-gitignore conflicts with --no-respect-gitignore")
         } else if self.callers && (self.deps || self.map || edit) {
             Some("--callers conflicts with --deps, --map, and --edit")
@@ -203,7 +220,8 @@ enum Command {
     /// Search for a file, symbol, glob pattern, or text.
     Search {
         /// File path, symbol name, glob pattern, or text search.
-        query: String,
+        #[arg(required_unless_present = "queries")]
+        query: Option<String>,
         #[command(flatten)]
         options: SearchOptions,
     },
@@ -306,7 +324,7 @@ fn main() {
         .command
         .take_if(|cmd| matches!(cmd, Command::Search { .. }))
     {
-        cli.query = Some(query);
+        cli.query = query;
         cli.search.merge(options);
     }
     if let Err(error) = cli.search.validate(cli.edit) {
@@ -559,6 +577,77 @@ fn main() {
         };
         let output = apply_optional_budget(output, cli.search.budget);
         emit_output(&output, is_tty);
+        return;
+    }
+
+    if !cli.search.queries.is_empty() || cli.search.select.is_some() || cli.search.kind.is_some() {
+        if cli.query.is_some() && !cli.search.queries.is_empty() {
+            usage_exit("positional query and --query are mutually exclusive");
+        }
+        if cli.search.expand.is_some_and(|n| n > 0) {
+            usage_exit("literal batches and projections do not expand source; use --expand=0");
+        }
+        let root = std::env::current_dir().expect("current directory");
+        let mut args = serde_json::json!({"root":root,"kind":cli.search.kind.as_deref().unwrap_or("symbol"),"full":cli.search.full});
+        if cli.search.queries.is_empty() {
+            let query = cli
+                .query
+                .as_deref()
+                .unwrap_or_else(|| usage_exit("missing query"));
+            if cli.search.select.is_some() {
+                args["query"] = query.into();
+            } else {
+                args["queries"] = serde_json::json!([query]);
+            }
+        } else {
+            args["queries"] = serde_json::json!(cli.search.queries);
+        }
+        if !cli.search.scope.is_empty() {
+            args["scopes"] = serde_json::json!(cli.search.scope);
+        }
+        if let Some(value) = cli.search.select {
+            args["select"] = value.into();
+        }
+        if let Some(value) = cli.search.glob {
+            args["glob"] = value.into();
+        }
+        if let Some(value) = cli.search.offset {
+            args["offset"] = value.into();
+        }
+        if let Some(value) = cli.search.limit {
+            args["limit"] = value.get().into();
+        }
+        if let Some(value) = cli.search.budget {
+            args["budget"] = value.into();
+        }
+        match tilth::mcp::search_for_cli(&args) {
+            Ok(output) => emit_result(
+                Ok(output),
+                &args
+                    .get("query")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        args["queries"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    }),
+                cli.search.json,
+                is_tty,
+                cli.search.budget,
+            ),
+            Err(error) => {
+                tilth::diagnostic!(
+                    "{}",
+                    apply_optional_budget(format!("search error: {error}"), cli.search.budget)
+                );
+                process::exit(1);
+            }
+        }
         return;
     }
 
@@ -991,7 +1080,7 @@ mod tests {
         let Some(Command::Search { query, options }) = cli.command else {
             panic!("expected search subcommand");
         };
-        assert_eq!(query, "target");
+        assert_eq!(query.as_deref(), Some("target"));
         assert_eq!(
             options.scope,
             vec![PathBuf::from("src"), PathBuf::from("tests")]

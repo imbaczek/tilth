@@ -25,6 +25,9 @@ fn search_inner(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
+    if args.get("queries").is_some() || args.get("select").is_some() {
+        return projected_search(args, cache, session, true);
+    }
     let query = args
         .get("query")
         .and_then(|v| v.as_str())
@@ -236,6 +239,89 @@ fn search_inner(
     }
     result.push_str(&output);
     Ok(apply_budget(&result, budget))
+}
+
+pub(in crate::mcp) fn projected_search(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    mcp_navigation: bool,
+) -> Result<String, String> {
+    if args
+        .get("expand")
+        .and_then(Value::as_u64)
+        .is_some_and(|n| n > 0)
+    {
+        return Err(
+            "literal batches and projections do not expand source; omit expand or use expand=0"
+                .into(),
+        );
+    }
+    let queries = if let Some(value) = args.get("queries") {
+        if args.get("query").is_some() {
+            return Err("query and queries are mutually exclusive".into());
+        }
+        value
+            .as_array()
+            .ok_or("queries must be an array of strings")?
+            .iter()
+            .map(|q| {
+                q.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "queries must contain strings".to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        let query = args
+            .get("query")
+            .and_then(Value::as_str)
+            .ok_or("missing query or queries")?;
+        if args.get("kind").and_then(Value::as_str).unwrap_or("symbol") == "symbol" {
+            query.split(',').map(str::trim).map(str::to_owned).collect()
+        } else {
+            vec![query.to_owned()]
+        }
+    };
+    let select = args
+        .get("select")
+        .map(|v| v.as_str().ok_or("select must be a string"))
+        .transpose()?;
+    let root = args
+        .get("root")
+        .and_then(Value::as_str)
+        .map(std::path::Path::new);
+    let (scopes, warning) = resolve_scopes(args, root)?;
+    let kind = args.get("kind").and_then(Value::as_str).unwrap_or("symbol");
+    let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
+    let page = crate::listing::Page::new(
+        caller_page_argument(args, "offset", 0, 0)?,
+        caller_page_argument(args, "limit", if full { 100 } else { 10 }, 1)?,
+    )?;
+    let budget = args.get("budget").and_then(Value::as_u64);
+    let context = args
+        .get("context")
+        .and_then(Value::as_str)
+        .map(std::path::Path::new);
+    for query in &queries {
+        session.record_search(query);
+    }
+    let output = crate::search::projection::run(
+        &queries,
+        kind,
+        select,
+        &scopes,
+        context,
+        args.get("glob").and_then(Value::as_str),
+        page,
+        budget,
+        mcp_navigation,
+        cache,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(crate::listing::finish(
+        &format!("{}{output}", warning.unwrap_or_default()),
+        budget,
+    ))
 }
 
 fn search_callers_scopes(
@@ -1672,5 +1758,49 @@ mod caller_scope_error_tests {
             out.contains("scope error:") && out.contains("[caller: caller]"),
             "{out}"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    #[test]
+    fn literal_batches_validate_inputs_and_project_with_shared_budget() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("a.rs"),
+            "fn alpha() {}\nfn beta() { alpha(); }\n// alpha,beta\n",
+        )
+        .unwrap();
+        let run = |extra: Value| {
+            let mut args = serde_json::json!({"root":root.path()});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            tool_search(
+                &args,
+                &OutlineCache::new(),
+                &Session::new(),
+                &Arc::new(BloomFilterCache::new()),
+            )
+        };
+        let out =
+            run(serde_json::json!({"queries":["alpha,beta"],"kind":"content","select":"count"}))
+                .unwrap();
+        assert!(out.contains("1 matches"), "{out}");
+        for args in [
+            serde_json::json!({"query":"alpha","queries":["beta"]}),
+            serde_json::json!({"queries":[]}),
+            serde_json::json!({"queries":[false]}),
+            serde_json::json!({"queries":["alpha"],"select":"wat"}),
+            serde_json::json!({"queries":["alpha"],"kind":"callers"}),
+            serde_json::json!({"queries":["alpha"],"expand":2}),
+        ] {
+            assert!(run(args.clone()).is_err(), "{args}");
+        }
+        let out =
+            run(serde_json::json!({"queries":["alpha","beta"],"select":"definitions","budget":50}))
+                .unwrap();
+        assert!(!out.contains("> Next page:"), "{out}");
     }
 }

@@ -1,0 +1,303 @@
+//! Compact projections and literal query batches, without source expansion.
+use crate::{
+    cache::OutlineCache,
+    error::TilthError,
+    listing::Page,
+    types::{CountEstimate, Match},
+};
+use std::collections::{BTreeSet, HashSet};
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+
+pub(crate) fn run(
+    queries: &[String],
+    kind: &str,
+    select: Option<&str>,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    page: Page,
+    budget: Option<u64>,
+    mcp: bool,
+    cache: &OutlineCache,
+) -> Result<String, TilthError> {
+    let invalid = |reason: &str| TilthError::InvalidQuery {
+        query: queries.join("; "),
+        reason: reason.into(),
+    };
+    if queries.is_empty() || queries.len() > 20 || queries.iter().any(|q| q.trim().is_empty()) {
+        return Err(invalid("requires 1-20 nonempty literal queries"));
+    }
+    if !matches!(kind, "symbol" | "content" | "regex") {
+        return Err(invalid(
+            "literal batches and projections support symbol, content, or regex search",
+        ));
+    }
+    if !matches!(
+        select,
+        None | Some("files" | "definitions" | "signatures" | "count")
+    ) {
+        return Err(invalid(
+            "select must be files, definitions, signatures, or count",
+        ));
+    }
+    if matches!(select, Some("definitions" | "signatures")) && kind != "symbol" {
+        return Err(invalid("definitions and signatures require kind=symbol"));
+    }
+    let mut bodies = Vec::new();
+    let mut seen = HashSet::new();
+    for query in queries.iter().filter(|q| seen.insert(q.as_str())) {
+        // Project before paging. Count needs no retained rows.
+        let prefix = if select == Some("count") || (select == Some("files") && kind != "symbol") {
+            1
+        } else if select.is_some() {
+            usize::MAX
+        } else {
+            page.offset.saturating_add(page.limit)
+        };
+        let result = super::merge::page_raw_scopes(query, kind, scopes, context, glob, prefix)?;
+        let lower_bound = matches!(result.count_estimate, CountEstimate::Observed { .. });
+        let mut header = format!("# Search: {query:?} [{}]", select.unwrap_or("matches"));
+        if lower_bound {
+            header.push_str("\n> Results may be incomplete: some eligible work was skipped.");
+        }
+        for error in &result.scope_errors {
+            let _ = write!(
+                header,
+                "\n> Scope error: {}: {}",
+                error.scope.display(),
+                error.error
+            );
+        }
+        if select == Some("count") {
+            let qualifier = if lower_bound { "at least " } else { "" };
+            let _ = write!(header, "\n{qualifier}{} matches", result.total_found);
+            bodies.push(header);
+            continue;
+        }
+        let display_root = if result.scope.is_file() {
+            result.scope.parent().unwrap_or(&result.scope)
+        } else {
+            &result.scope
+        };
+        let rows: Vec<String> = if select == Some("files") {
+            let paths: Vec<_> = if let Some(ledger) = &result.file_ledger {
+                ledger.keys().collect()
+            } else {
+                result.matches.iter().map(|m| &m.path).collect()
+            };
+            paths
+                .into_iter()
+                .map(|path| {
+                    path.strip_prefix(display_root)
+                        .unwrap_or(path)
+                        .display()
+                        .to_string()
+                })
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        } else {
+            result
+                .matches
+                .iter()
+                .filter(|m| {
+                    !matches!(select, Some("definitions" | "signatures")) || m.is_definition
+                })
+                .map(|m| {
+                    let path = m.path.strip_prefix(display_root).unwrap_or(&m.path);
+                    let text = if select == Some("signatures") {
+                        signature(m, cache)
+                    } else {
+                        m.text.trim().to_string()
+                    };
+                    format!("{}:{} {}", path.display(), m.line, text)
+                })
+                .collect()
+        };
+        let noun = if select == Some("files") {
+            "files"
+        } else if matches!(select, Some("definitions" | "signatures")) {
+            "definitions"
+        } else {
+            "matches"
+        };
+        let total = if select.is_none() {
+            result.total_found
+        } else {
+            rows.len()
+        };
+        let (start, end) = page.bounds(total);
+        let mut body = page.render_selected(
+            &header,
+            &rows[start.min(rows.len())..end.min(rows.len())],
+            total,
+            noun,
+            mcp,
+        );
+        if lower_bound {
+            body = body
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("> Next page:") && !line.starts_with("> End of listing.")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+        }
+        bodies.push(body);
+    }
+    Ok(crate::listing::finish(&bodies.join("\n\n---\n\n"), budget))
+}
+
+fn signature(m: &Match, cache: &OutlineCache) -> String {
+    let unavailable = || {
+        format!(
+            "{} [signature unavailable]",
+            m.def_name.as_deref().unwrap_or("declaration")
+        )
+    };
+    fn find<'a>(
+        entries: &'a [crate::types::OutlineEntry],
+        line: u32,
+        name: Option<&str>,
+    ) -> Option<&'a crate::types::OutlineEntry> {
+        entries.iter().find_map(|e| {
+            if e.start_line == line && name.is_none_or(|name| e.name == name) {
+                Some(e)
+            } else {
+                find(&e.children, line, name)
+            }
+        })
+    }
+    let Some(parsed) = cache.get_or_parse(&m.path) else {
+        return unavailable();
+    };
+    let entries = crate::lang::outline::get_outline_entries(&parsed.content, parsed.lang);
+    let Some(entry) = find(&entries, m.line, m.def_name.as_deref()) else {
+        return unavailable();
+    };
+    entry.signature.clone().unwrap_or_else(unavailable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn projection_filters_before_paging_and_literal_commas_stay_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn needle(\n x: i32,\n) -> i32 { x }\nfn use_it() { needle(1); }\n// alpha,beta\n",
+        )
+        .unwrap();
+        let run = |queries: &[String], kind, select, page| {
+            run(
+                queries,
+                kind,
+                select,
+                &[dir.path().to_path_buf()],
+                None,
+                None,
+                page,
+                None,
+                false,
+                &OutlineCache::new(),
+            )
+            .unwrap()
+        };
+        let out = run(
+            &["needle".into()],
+            "symbol",
+            Some("signatures"),
+            Page::new(0, 1).unwrap(),
+        );
+        assert!(out.contains("fn needle(x: i32,) -> i32"), "{out}");
+        assert!(!out.contains("{ x }"), "{out}");
+        assert!(out.contains("definitions 1-1 of 1"), "{out}");
+        let out = run(
+            &["alpha,beta".into(), "absent".into()],
+            "content",
+            Some("count"),
+            Page::new(0, 1).unwrap(),
+        );
+        assert!(
+            out.contains("1 matches") && out.contains("0 matches"),
+            "{out}"
+        );
+    }
+    #[test]
+    fn files_are_unique_and_count_is_not_page_size() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn needle() {}\nfn caller() { needle(); }\n",
+        )
+        .unwrap();
+        let run = |select| {
+            run(
+                &["needle".into()],
+                "symbol",
+                Some(select),
+                &[dir.path().to_path_buf()],
+                None,
+                None,
+                Page::new(0, 1).unwrap(),
+                None,
+                true,
+                &OutlineCache::new(),
+            )
+            .unwrap()
+        };
+        assert!(run("files").contains("files 1-1 of 1"));
+        assert!(run("count").contains("2 matches"));
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn file_projection_uses_all_file_counts_without_retaining_every_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.txt", "b.txt"] {
+            std::fs::write(dir.path().join(name), "needle\n".repeat(1000)).unwrap();
+        }
+        let scopes = [dir.path().to_path_buf()];
+        let out = run(
+            &["needle".into()],
+            "content",
+            Some("files"),
+            &scopes,
+            None,
+            None,
+            Page::new(0, 10).unwrap(),
+            None,
+            false,
+            &OutlineCache::new(),
+        )
+        .unwrap();
+        assert!(
+            out.contains("files 1-2 of 2") && out.contains("a.txt") && out.contains("b.txt"),
+            "{out}"
+        );
+    }
+    #[test]
+    fn unavailable_signature_never_exposes_inline_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "struct Secret { hidden: i32 }\n").unwrap();
+        let out = run(
+            &["Secret".into()],
+            "symbol",
+            Some("signatures"),
+            &[dir.path().to_path_buf()],
+            None,
+            None,
+            Page::new(0, 10).unwrap(),
+            None,
+            false,
+            &OutlineCache::new(),
+        )
+        .unwrap();
+        assert!(!out.contains("hidden"), "{out}");
+    }
+}

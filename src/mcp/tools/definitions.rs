@@ -24,8 +24,10 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. For cross-file tracing, pass comma-separated symbol names (max 5). Searches honor .tilthignore, .gitignore, .ignore, and Git excludes by default. Set gitignore=false for one call, or use TILTH_RESPECT_GITIGNORE=0 at startup, to bypass Git ignore rules.",
             "inputSchema": {
                 "type": "object",
-                "required": ["query"],
+                "oneOf": [{"required":["query"],"not":{"required":["queries"]}}, {"required":["queries"],"not":{"required":["query"]}}],
                 "properties": {
+                    "queries": {"type":"array","items":{"type":"string","minLength":1},"minItems":1,"maxItems":20,"description":"Literal queries in order; commas are not split. Mutually exclusive with query. Supports symbol/content/regex; shared budget."},
+                    "select": {"type":"string","enum":["files","definitions","signatures","count"],"description":"Compact projection before paging. Definitions/signatures require symbol kind. No source expansion."},
                     "query": {
                         "type": "string",
                         "description": "Symbol name, text string, or regex pattern to search for. e.g. 'resolve_dependencies' or 'ServeHTTP,Next' for comma-separated multi-symbol lookup (max 5)."
@@ -48,7 +50,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "expand": {
                         "type": "number",
                         "default": 2,
-                        "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines."
+                        "description": "Number of top matches to expand with full source code. Definitions show the full function/class body. Usages show ±10 context lines. With queries or select, omit expand or set it to 0; compact searches do not expand source."
                     },
                     "full": {
                         "type": "boolean",
