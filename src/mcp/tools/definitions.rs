@@ -330,7 +330,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
 
     tools.push(serde_json::json!({
         "name":"tilth_trace","annotations":{"readOnlyHint":true},
-        "description":"Trace bounded static syntactic calls resolved by name. Find a shortest discovered path to an optional destination or explore callers/callees. Reports observed heuristic bindings, ambiguity, unsupported extraction, parse failures and work/output caps. A missing path does not prove unreachability. Stateless; respects ignore rules. Limits:100000 directory entries,2000 source files,64MiB,30000 functions,50000 call sites;500KB per file.",
+        "description":"Trace bounded static syntactic calls resolved by name. Find a shortest discovered path to an optional destination or explore callers/callees. Reports observed heuristic bindings, ambiguity, unsupported extraction, parse failures and work/output caps. A missing path does not prove unreachability. Lisp package shadowing and macro-generated definitions are not fully resolved. Stateless; respects ignore rules. Limits:100000 directory entries,2000 source files,64MiB,30000 functions,50000 call sites;500KB per file.",
         "inputSchema":{"type":"object","required":["from"],"properties":{
             "from":{"type":"string","minLength":1,"description":"Function name, qualified name, name@line, or scope-relative file:line."},
             "to":{"type":"string","minLength":1,"description":"Optional destination in the chosen traversal direction."},

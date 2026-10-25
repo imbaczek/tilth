@@ -25,6 +25,7 @@ pub(crate) mod scala;
 pub(crate) mod swift;
 pub(crate) mod tsx;
 pub(crate) mod typescript;
+pub(crate) mod walk;
 
 use std::collections::HashMap;
 use std::path::Path;

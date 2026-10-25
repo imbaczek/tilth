@@ -48,8 +48,7 @@ type SpanIndex = HashMap<(u32, u32), Vec<SourceSpan>>;
 fn index_spans(parsed: &ParsedFile) -> SpanIndex {
     let lines: Vec<_> = parsed.content.lines().collect();
     let mut spans = SpanIndex::new();
-    let mut pending = vec![parsed.tree.root_node()];
-    while let Some(node) = pending.pop() {
+    for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
         let spec = crate::lang::spec::spec(parsed.lang);
         let name = if spec.definition_kinds.contains(&node.kind()) {
             (spec.definitions.extract_name)(node, &lines)
@@ -84,9 +83,6 @@ fn index_spans(parsed: &ParsedFile) -> SpanIndex {
                     bytes: (source_node.start_byte(), source_node.end_byte()),
                 });
         }
-        let mut cursor = node.walk();
-        let children: Vec<_> = node.named_children(&mut cursor).collect();
-        pending.extend(children.into_iter().rev());
     }
     spans
 }
@@ -119,4 +115,26 @@ pub(crate) fn collect(path: &Path, parsed: &std::sync::Arc<ParsedFile>) -> Vec<D
         &mut index_spans(parsed),
     );
     out
+}
+
+/// Full source header, unlike the abbreviated label used by structural outlines.
+pub(crate) fn signature_text(declaration: &Declaration) -> Option<String> {
+    let (start, source_end) = declaration.span?;
+    let end = declaration.entry.signature_end?;
+    let line_start = declaration
+        .parsed
+        .content
+        .split_inclusive('\n')
+        .take(end.line.saturating_sub(1) as usize)
+        .map(str::len)
+        .sum::<usize>();
+    let end = line_start.checked_add(end.column)?;
+    if end < start || end > source_end {
+        return None;
+    }
+    declaration
+        .parsed
+        .content
+        .get(start..end)
+        .map(|text| text.trim_end().to_owned())
 }

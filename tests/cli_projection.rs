@@ -152,3 +152,26 @@ fn file_scopes_and_same_line_signatures_keep_identity() {
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["query"], "bar");
 }
+
+#[test]
+fn signature_projections_keep_full_headers_and_report_parser_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let params = (0..30)
+        .map(|i| format!("argument{i}: i32"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.path().join("a.rs"),
+        format!("fn long({params}) {{ let implementation = 1; }}\nfn broken(\n"),
+    )
+    .unwrap();
+    let out = run(dir.path(), &["long", "--select", "signatures"]);
+    assert!(out.status.success());
+    let out = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        out.contains("argument29: i32")
+            && !out.contains("implementation")
+            && out.contains("parse errors"),
+        "{out}"
+    );
+}

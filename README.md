@@ -622,7 +622,7 @@ Search walks the whole tree, so time grows with the size of the repository.
 
 tilth is about 35,000 lines of Rust with no runtime dependencies.
 
-- **tree-sitter** parses 18 languages: Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir, Bash and Common Lisp. tilth uses it for definitions, callees, callers and outlines. Dockerfile and Make files are recognised but not parsed. Common Lisp supports definitions, outlines, signatures, docstrings and structural diffs for common defining forms; call graphs and macro expansion are not included. Ambiguous bare CLI queries such as `*state*` search for Lisp symbols when a matching Lisp definition exists; explicit file paths retain priority.
+- **tree-sitter** parses 18 languages: Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, C#, Swift, Kotlin, Elixir, Bash and Common Lisp. tilth uses it for definitions, callees, callers and outlines. Dockerfile and Make files are recognised but not parsed. Common Lisp supports definitions, outlines, signatures, docstrings and structural diffs for common defining forms; bounded static call traces are supported, with explicit limits for indirect calls and macro expansion. Ambiguous bare CLI queries such as `*state*` search for Lisp symbols when a matching Lisp definition exists; explicit file paths retain priority.
 - **ripgrep's crates** (`grep-regex`, `grep-searcher`) run content search.
 - The **ignore** crate walks directories in parallel with `.tilthignore` support and honors `.gitignore`, `.ignore` and Git exclude rules by default. It always skips common build and dependency folders such as `node_modules`, `target` and `.venv`.
 - `.tilthignore` is a custom ignore file that works like `.gitignore` but is always honored, even when gitignore rules are bypassed. Place it in any directory to exclude its contents from walks.
@@ -646,11 +646,6 @@ Earlier versions of this README carried a cost benchmark. It was measured on v0.
 
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/jahala)
 
-## License
-
-MIT
-
-
 ## Bounded call traces
 
 ```bash
@@ -669,7 +664,8 @@ Edges cite source call sites and are resolved by name, not by executing a progra
 or running its compiler. A missing path means **no path found within the requested
 depth**, not unreachable. Receiver dispatch, import aliases, external Rust module
 layouts, generated definitions, callbacks, generic method combination, macros,
-reader conditionals and evaluation phases can leave gaps or heuristic bindings.
+reader conditionals, package shadowing of unqualified Lisp operators, and evaluation
+phases can leave gaps or heuristic bindings.
 HTML/Vue template bindings, HTTP routes and cross-language runtime bridges are
 not inferred. Use content projections and batch slices for those sources.
 
@@ -701,3 +697,7 @@ Go, `--select files --kind content --query '@click'` on Vue files, and mixed
 HTML/Vue `read --slice` requests. Vue symbol reads explicitly report unsupported
 indexing. The SBCL definition-indexing corpus audit measures definition coverage;
 it does not establish call-edge or trace recall.
+
+## License
+
+MIT

@@ -150,3 +150,25 @@ fn go_grouped_declarations_resolve_each_name_once() {
         "{out}"
     );
 }
+
+#[test]
+fn long_signatures_return_complete_source_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let params = (0..30)
+        .map(|i| format!("argument{i} int"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    std::fs::write(
+        dir.path().join("a.go"),
+        format!("package sample\nfunc long({params}) int {{ panic(\"implementation\") }}\n"),
+    )
+    .unwrap();
+    let out = text(run(
+        dir.path(),
+        &["a.go", "--symbol", "long", "--mode", "signature"],
+    ));
+    assert!(
+        out.contains("argument29 int") && !out.contains("implementation") && !out.contains("..."),
+        "{out}"
+    );
+}

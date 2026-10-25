@@ -1,5 +1,5 @@
 //! Per-file line slices, merged before reading and bounded by a shared budget.
-use crate::{cache::OutlineCache, session::Session};
+use crate::session::Session;
 use serde_json::Value;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -27,12 +27,7 @@ fn range(text: &str) -> Result<(u32, u32), String> {
     Ok((start, end))
 }
 
-pub(super) fn read(
-    args: &Value,
-    cache: &OutlineCache,
-    session: &Session,
-    edit: bool,
-) -> Result<String, String> {
+pub(super) fn read(args: &Value, session: &Session, edit: bool) -> Result<String, String> {
     for key in [
         "path", "paths", "symbols", "section", "sections", "offset", "limit",
     ] {
@@ -114,7 +109,6 @@ pub(super) fn read(
             }
         }
     }
-    let _ = cache; // Range reads do not parse source.
     Ok(crate::listing::finish(
         &format!("{summary}\n{}", bodies.join("\n\n")),
         budget,
@@ -131,7 +125,6 @@ mod tests {
         let run = |slices: Value| {
             read(
                 &serde_json::json!({"root":dir.path(),"slices":slices}),
-                &OutlineCache::new(),
                 &Session::new(),
                 false,
             )
@@ -150,7 +143,6 @@ mod tests {
         }
         let out = read(
             &serde_json::json!({"slices":[{"path":"relative","sections":["1-1"]}]}),
-            &OutlineCache::new(),
             &Session::new(),
             false,
         );
@@ -163,7 +155,7 @@ mod tests {
         let path = dir.path().join("a.txt");
         std::fs::write(&path, "alpha\nbeta\n").unwrap();
         std::os::unix::fs::symlink(&path, dir.path().join("alias.txt")).unwrap();
-        let out=read(&serde_json::json!({"root":dir.path(),"slices":[{"path":"alias.txt","sections":["1-2"]},{"path":"a.txt","sections":["2-2"]}]}),&OutlineCache::new(),&Session::new(),false).unwrap();
+        let out=read(&serde_json::json!({"root":dir.path(),"slices":[{"path":"alias.txt","sections":["1-2"]},{"path":"a.txt","sections":["2-2"]}]}),&Session::new(),false).unwrap();
         assert_eq!(out.matches("beta").count(), 1, "{out}");
     }
 }

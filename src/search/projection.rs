@@ -5,7 +5,7 @@ use crate::{
     listing::Page,
     types::{CountEstimate, Match},
 };
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -45,6 +45,7 @@ pub(crate) fn run(
         return Err(invalid("definitions and signatures require kind=symbol"));
     }
     let mut bodies = Vec::new();
+    let mut signatures = HashMap::new();
     let mut seen = HashSet::new();
     for query in queries.iter().filter(|q| seen.insert(q.as_str())) {
         // Project before paging. Count needs no retained rows.
@@ -80,13 +81,19 @@ pub(crate) fn run(
         } else {
             &result.scope
         };
-        let rows: Vec<String> = if select == Some("files") {
-            let paths: Vec<_> = if let Some(ledger) = &result.file_ledger {
-                ledger.keys().collect()
-            } else {
-                result.matches.iter().map(|m| &m.path).collect()
-            };
-            paths
+        let noun = if select == Some("files") {
+            "files"
+        } else if matches!(select, Some("definitions" | "signatures")) {
+            "definitions"
+        } else {
+            "matches"
+        };
+        let (rows, total) = if select == Some("files") {
+            let paths: Vec<_> = result.file_ledger.as_ref().map_or_else(
+                || result.matches.iter().map(|m| &m.path).collect(),
+                |ledger| ledger.keys().collect(),
+            );
+            let rows: Vec<_> = paths
                 .into_iter()
                 .map(|path| {
                     path.strip_prefix(display_root)
@@ -96,45 +103,52 @@ pub(crate) fn run(
                 })
                 .collect::<BTreeSet<_>>()
                 .into_iter()
-                .collect()
+                .collect();
+            let total = rows.len();
+            let (start, end) = page.bounds(total);
+            (rows[start..end].to_vec(), total)
         } else {
-            result
+            let matches: Vec<_> = result
                 .matches
                 .iter()
                 .filter(|m| {
                     !matches!(select, Some("definitions" | "signatures")) || m.is_definition
                 })
+                .collect();
+            let total = if select.is_none() {
+                result.total_found
+            } else {
+                matches.len()
+            };
+            let (start, end) = page.bounds(total);
+            let rows = matches[start.min(matches.len())..end.min(matches.len())]
+                .iter()
                 .map(|m| {
                     let path = m.path.strip_prefix(display_root).unwrap_or(&m.path);
                     let text = if select == Some("signatures") {
-                        signature(m, cache)
+                        signature(m, cache, &mut signatures)
                     } else {
-                        m.text.trim().to_string()
+                        m.text.trim().to_owned()
                     };
-                    format!("{}:{} {}", path.display(), m.line, text)
+                    format!("{}:{} {text}", path.display(), m.line)
                 })
-                .collect()
+                .collect();
+            if matches!(select, Some("definitions" | "signatures"))
+                && matches[start.min(matches.len())..end.min(matches.len())]
+                    .iter()
+                    .any(|m| {
+                        cache
+                            .get_or_parse(&m.path)
+                            .is_some_and(|parsed| parsed.tree.root_node().has_error())
+                    })
+            {
+                header.push_str(
+                    "\n> Structural matches may be incomplete: a matching file has parse errors.",
+                );
+            }
+            (rows, total)
         };
-        let noun = if select == Some("files") {
-            "files"
-        } else if matches!(select, Some("definitions" | "signatures")) {
-            "definitions"
-        } else {
-            "matches"
-        };
-        let total = if select.is_none() {
-            result.total_found
-        } else {
-            rows.len()
-        };
-        let (start, end) = page.bounds(total);
-        let mut body = page.render_selected(
-            &header,
-            &rows[start.min(rows.len())..end.min(rows.len())],
-            total,
-            noun,
-            mcp,
-        );
+        let mut body = page.render_selected(&header, &rows, total, noun, mcp);
         if lower_bound {
             body = body
                 .lines()
@@ -149,34 +163,42 @@ pub(crate) fn run(
     Ok(crate::listing::finish(&bodies.join("\n\n---\n\n"), budget))
 }
 
-fn signature(m: &Match, cache: &OutlineCache) -> String {
-    fn find<'a>(
-        entries: &'a [crate::types::OutlineEntry],
-        line: u32,
-        name: Option<&str>,
-    ) -> Option<&'a crate::types::OutlineEntry> {
-        entries.iter().find_map(|e| {
-            if e.start_line == line && name.is_none_or(|name| e.name == name) {
-                Some(e)
-            } else {
-                find(&e.children, line, name)
-            }
-        })
-    }
+fn signature(
+    m: &Match,
+    cache: &OutlineCache,
+    catalog: &mut HashMap<PathBuf, Vec<crate::lang::declarations::Declaration>>,
+) -> String {
     let unavailable = || {
         format!(
             "{} [signature unavailable]",
             m.def_name.as_deref().unwrap_or("declaration")
         )
     };
-    let Some(parsed) = cache.get_or_parse(&m.path) else {
-        return unavailable();
-    };
-    let entries = crate::lang::outline::get_outline_entries(&parsed.content, parsed.lang);
-    let Some(entry) = find(&entries, m.line, m.def_name.as_deref()) else {
-        return unavailable();
-    };
-    entry.signature.clone().unwrap_or_else(unavailable)
+    let declarations = catalog.entry(m.path.clone()).or_insert_with(|| {
+        cache
+            .get_or_parse(&m.path)
+            .map(|parsed| crate::lang::declarations::collect(&m.path, &parsed))
+            .unwrap_or_default()
+    });
+    let candidates: Vec<_> = declarations
+        .iter()
+        .filter(|d| {
+            d.entry.start_line == m.line
+                && m.def_name
+                    .as_deref()
+                    .is_none_or(|name| d.entry.name == name)
+        })
+        .collect();
+    match candidates.as_slice() {
+        [declaration] => {
+            crate::lang::declarations::signature_text(declaration).unwrap_or_else(unavailable)
+        }
+        [] => unavailable(),
+        _ => format!(
+            "{} [signature ambiguous on this line; use a qualified symbol read]",
+            m.def_name.as_deref().unwrap_or("declaration")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -211,7 +233,10 @@ mod tests {
             Some("signatures"),
             Page::new(0, 1).unwrap(),
         );
-        assert!(out.contains("fn needle(x: i32,) -> i32"), "{out}");
+        assert!(
+            out.contains("fn needle(") && out.contains("x: i32") && out.contains("-> i32"),
+            "{out}"
+        );
         assert!(!out.contains("{ x }"), "{out}");
         assert!(out.contains("definitions 1-1 of 1"), "{out}");
         let out = run(

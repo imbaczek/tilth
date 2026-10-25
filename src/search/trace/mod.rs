@@ -86,6 +86,7 @@ impl Issues {
         out
     }
 }
+#[derive(Default)]
 struct Graph {
     nodes: Vec<Declaration>,
     edges: Vec<Edge>,
@@ -183,6 +184,20 @@ fn key(lang: Lang, name: &str) -> String {
 fn build(scope: &Path, cache: &OutlineCache, preferred: &str) -> Result<Graph, String> {
     build_limited(scope, cache, preferred, MAX_NODES, MAX_EDGES)
 }
+struct SourceChunk {
+    first: usize,
+    last: usize,
+    parsed: std::sync::Arc<crate::cache::ParsedFile>,
+}
+struct SourceIndex {
+    chunks: Vec<SourceChunk>,
+    cfg_files: HashSet<std::path::PathBuf>,
+}
+struct PendingCall {
+    owner: usize,
+    call: extract::Call,
+}
+
 fn build_limited(
     scope: &Path,
     cache: &OutlineCache,
@@ -190,27 +205,30 @@ fn build_limited(
     node_limit: usize,
     site_limit: usize,
 ) -> Result<Graph, String> {
+    let mut graph = Graph::default();
+    let paths = collect_source_paths(scope, &mut graph.issues)?;
+    let SourceIndex { chunks, cfg_files } = index_sources(paths, cache, &mut graph, node_limit);
+    let pending = collect_calls(chunks, &mut graph, scope, preferred, site_limit);
+    resolve_calls(&mut graph, pending, &cfg_files);
+    Ok(graph)
+}
+
+fn collect_source_paths(
+    scope: &Path,
+    issues: &mut Issues,
+) -> Result<Vec<std::path::PathBuf>, String> {
     std::fs::read_dir(scope).map_err(|e| format!("{}: {e}", scope.display()))?;
-    let mut graph = Graph {
-        nodes: Vec::new(),
-        edges: Vec::new(),
-        issues: Issues::default(),
-        node_issues: HashMap::new(),
-        language_issues: HashMap::new(),
-    };
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
     let mut builder = crate::search::base_walk_builder(scope);
     builder.sort_by_file_path(std::cmp::Ord::cmp);
     for (visited, entry) in builder.build().enumerate() {
         if visited == 100_000 {
-            graph
-                .issues
-                .add("directory-entry work limit reached (100000 entries)");
+            issues.add("directory-entry work limit reached (100000 entries)");
             break;
         }
         let Ok(entry) = entry else {
-            graph.issues.add("directory entries could not be read");
+            issues.add("directory entries could not be read");
             continue;
         };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
@@ -230,16 +248,22 @@ fn build_limited(
             continue;
         }
         if paths.len() == MAX_FILES {
-            graph
-                .issues
-                .add("source-file work limit reached (2000 files)");
+            issues.add("source-file work limit reached (2000 files)");
             break;
         }
         paths.push(path);
     }
     paths.sort();
+    Ok(paths)
+}
+
+fn index_sources(
+    paths: Vec<std::path::PathBuf>,
+    cache: &OutlineCache,
+    graph: &mut Graph,
+    node_limit: usize,
+) -> SourceIndex {
     let mut bytes = 0u64;
-    let mut pending = Vec::new();
     let mut chunks = Vec::new();
     let mut cfg_files = HashSet::new();
     for path in paths {
@@ -294,13 +318,34 @@ fn build_limited(
             ));
             break;
         }
-        chunks.push((first, graph.nodes.len(), parsed));
+        chunks.push(SourceChunk {
+            first,
+            last: graph.nodes.len(),
+            parsed,
+        });
     }
-    let preferred_ids = resolve(&graph, preferred, scope);
-    chunks.sort_by_key(|(first, last, _)| {
+
+    SourceIndex { chunks, cfg_files }
+}
+
+fn collect_calls(
+    mut chunks: Vec<SourceChunk>,
+    graph: &mut Graph,
+    scope: &Path,
+    preferred: &str,
+    site_limit: usize,
+) -> Vec<PendingCall> {
+    let mut pending = Vec::new();
+    let preferred_ids = resolve(graph, preferred, scope);
+    chunks.sort_by_key(|SourceChunk { first, last, .. }| {
         !preferred_ids.iter().any(|id| *first <= *id && *id < *last)
     });
-    for (first, last, parsed) in chunks {
+    for SourceChunk {
+        first,
+        last,
+        parsed,
+    } in chunks
+    {
         let (mut calls, problems) = extract::calls(&parsed);
         for problem in problems {
             if problem.contains("limit") {
@@ -355,7 +400,7 @@ fn build_limited(
                     .add(format!("call-site work limit reached ({site_limit} sites)"));
                 break;
             }
-            pending.push((owner, call));
+            pending.push(PendingCall { owner, call });
         }
         if pending.len() == site_limit {
             graph
@@ -364,6 +409,15 @@ fn build_limited(
             break;
         }
     }
+
+    pending
+}
+
+fn resolve_calls(
+    graph: &mut Graph,
+    pending: Vec<PendingCall>,
+    cfg_files: &HashSet<std::path::PathBuf>,
+) {
     let mut names: HashMap<(Lang, String), Vec<usize>> = HashMap::new();
     for (id, node) in graph.nodes.iter().enumerate() {
         names
@@ -378,7 +432,7 @@ fn build_limited(
         }
     }
     let mut seen_edges = HashSet::new();
-    for (owner, call) in pending {
+    for PendingCall { owner, call } in pending {
         let node = &graph.nodes[owner];
         let issues = graph.node_issues.entry(owner).or_default();
         for reason in &call.concerns {
@@ -503,7 +557,6 @@ fn build_limited(
     graph
         .edges
         .sort_by_key(|edge| (edge.from, edge.line, edge.to));
-    Ok(graph)
 }
 
 fn resolve(graph: &Graph, target: &str, scope: &Path) -> Vec<usize> {
@@ -571,6 +624,72 @@ pub(crate) fn run(
     render_graph(graph, &scope, request)
 }
 
+struct WalkResult {
+    selected: Vec<usize>,
+    expanded: HashSet<usize>,
+    found: bool,
+}
+fn walk_graph(
+    graph: &Graph,
+    start: usize,
+    target: Option<usize>,
+    reverse: bool,
+    depth_limit: usize,
+) -> WalkResult {
+    let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (id, edge) in graph.edges.iter().enumerate() {
+        adjacency
+            .entry(if reverse { edge.to } else { edge.from })
+            .or_default()
+            .push(id);
+    }
+    let mut queue = VecDeque::from([(start, 0)]);
+    let mut visited = HashSet::from([start]);
+    let mut parents = HashMap::new();
+    let mut selected = Vec::new();
+    let mut expanded = HashSet::new();
+    let mut found = target == Some(start);
+    while let Some((node, depth)) = queue.pop_front() {
+        if found || depth == depth_limit {
+            continue;
+        }
+        expanded.insert(node);
+        for id in adjacency.get(&node).into_iter().flatten() {
+            let edge = &graph.edges[*id];
+            let next = if reverse { edge.from } else { edge.to };
+            selected.push(*id);
+            if visited.insert(next) {
+                parents.insert(next, (node, *id));
+                queue.push_back((next, depth + 1));
+            }
+            if target == Some(next) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if let Some(target) = target {
+        if found {
+            selected.clear();
+            visited.clear();
+            let mut node = target;
+            visited.insert(node);
+            while node != start {
+                let (parent, edge) = parents[&node];
+                selected.push(edge);
+                node = parent;
+                visited.insert(node);
+            }
+            selected.reverse();
+        }
+    }
+    WalkResult {
+        selected,
+        expanded,
+        found,
+    }
+}
+
 fn render_graph(mut graph: Graph, scope: &Path, request: Request<'_>) -> Result<String, String> {
     let global_issues = graph.issues.clone();
     let start_ids = resolve(&graph, request.from, scope);
@@ -613,51 +732,13 @@ fn render_graph(mut graph: Graph, scope: &Path, request: Request<'_>) -> Result<
         }
     };
     let reverse = request.direction == "callers";
-    let mut adjacency: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (id, edge) in graph.edges.iter().enumerate() {
-        adjacency
-            .entry(if reverse { edge.to } else { edge.from })
-            .or_default()
-            .push(id);
-    }
-    let mut queue = VecDeque::from([(start, 0)]);
-    let mut visited = HashSet::from([start]);
-    let mut parents = HashMap::new();
-    let mut selected = Vec::new();
-    let mut expanded = HashSet::new();
-    let mut found = target == Some(start);
-    while let Some((node, depth)) = queue.pop_front() {
-        if found || depth == request.depth {
-            continue;
-        }
-        expanded.insert(node);
-        for id in adjacency.get(&node).into_iter().flatten() {
-            let edge = &graph.edges[*id];
-            let next = if reverse { edge.from } else { edge.to };
-            selected.push(*id);
-            if visited.insert(next) {
-                parents.insert(next, (node, *id));
-                queue.push_back((next, depth + 1));
-            }
-            if target == Some(next) {
-                found = true;
-                break;
-            }
-        }
-    }
-    if let Some(target) = target {
+    let WalkResult {
+        selected,
+        expanded,
+        found,
+    } = walk_graph(&graph, start, target, reverse, request.depth);
+    if target.is_some() {
         if found {
-            selected.clear();
-            visited.clear();
-            let mut node = target;
-            visited.insert(node);
-            while node != start {
-                let (parent, edge) = parents[&node];
-                selected.push(edge);
-                node = parent;
-                visited.insert(node);
-            }
-            selected.reverse();
             header.push_str("Path found in the static name graph.\n");
         } else {
             let _ = writeln!(

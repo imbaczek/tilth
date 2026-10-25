@@ -120,20 +120,13 @@ struct RustBindings(std::collections::HashMap<String, Vec<(usize, usize)>>);
 impl RustBindings {
     fn new(parsed: &ParsedFile) -> Self {
         fn names(node: tree_sitter::Node<'_>, source: &str) -> Vec<String> {
-            let mut pending = vec![node];
-            let mut out = Vec::new();
-            while let Some(node) = pending.pop() {
-                if matches!(node.kind(), "identifier" | "shorthand_field_identifier") {
-                    out.push(node.utf8_text(source.as_bytes()).unwrap_or("").to_owned());
-                }
-                let mut cursor = node.walk();
-                pending.extend(node.named_children(&mut cursor));
-            }
-            out
+            crate::lang::walk::named_descendants(node)
+                .filter(|node| matches!(node.kind(), "identifier" | "shorthand_field_identifier"))
+                .map(|node| node.utf8_text(source.as_bytes()).unwrap_or("").to_owned())
+                .collect()
         }
         let mut bindings = Self::default();
-        let mut pending = vec![parsed.tree.root_node()];
-        while let Some(node) = pending.pop() {
+        for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
             let mut add = |pattern: tree_sitter::Node<'_>, start, end| {
                 for name in names(pattern, &parsed.content) {
                     bindings.0.entry(name).or_default().push((start, end));
@@ -218,8 +211,6 @@ impl RustBindings {
                 }
                 _ => {}
             }
-            let mut cursor = node.walk();
-            pending.extend(node.named_children(&mut cursor));
         }
         for ranges in bindings.0.values_mut() {
             ranges.sort_unstable();
@@ -251,34 +242,11 @@ fn rust_uncaptured(
     problems: &mut Vec<String>,
     bindings: &RustBindings,
 ) {
-    let mut captured = std::collections::HashSet::new();
-    for call in calls.iter() {
-        let mut node = parsed
-            .tree
-            .root_node()
-            .descendant_for_byte_range(call.byte, call.byte + 1);
-        while let Some(current) = node {
-            if matches!(current.kind(), "call_expression" | "macro_invocation") {
-                captured.insert(current.start_byte());
-                break;
-            }
-            node = current.parent();
-        }
-    }
-    let mut pending = vec![parsed.tree.root_node()];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "attribute_item"
-            && node.utf8_text(parsed.content.as_bytes()).is_ok_and(|text| {
-                let path = text
-                    .trim_start_matches("#[")
-                    .trim_start_matches("#![")
-                    .trim_start();
-                path.starts_with("cfg(")
-                    || path.starts_with("cfg (")
-                    || path.starts_with("cfg_attr(")
-                    || path.starts_with("cfg_attr (")
-            })
-        {
+    let captured = captured_call_positions(parsed, calls, |kind| {
+        matches!(kind, "call_expression" | "macro_invocation")
+    });
+    for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
+        if is_cfg_attribute(node, &parsed.content) {
             problems.push("Rust conditional compilation is not evaluated".into());
         }
         if matches!(node.kind(), "call_expression" | "macro_invocation")
@@ -320,8 +288,6 @@ fn rust_uncaptured(
                 break;
             }
         }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
     }
 }
 
@@ -329,24 +295,10 @@ pub(super) fn has_rust_cfg(parsed: &ParsedFile) -> bool {
     if parsed.lang != Lang::Rust {
         return false;
     }
-    let mut pending = vec![parsed.tree.root_node()];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "attribute_item"
-            && node.utf8_text(parsed.content.as_bytes()).is_ok_and(|text| {
-                let path = text
-                    .trim_start_matches("#[")
-                    .trim_start_matches("#![")
-                    .trim_start();
-                path.starts_with("cfg(")
-                    || path.starts_with("cfg (")
-                    || path.starts_with("cfg_attr(")
-                    || path.starts_with("cfg_attr (")
-            })
-        {
+    for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
+        if is_cfg_attribute(node, &parsed.content) {
             return true;
         }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
     }
     false
 }
@@ -366,6 +318,37 @@ fn uncovered_call_syntax(parsed: &ParsedFile, calls: &[Call]) -> bool {
                 | "macro_invocation"
         )
     };
+    let captured = captured_call_positions(parsed, calls, is_call);
+    for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
+        if is_call(node.kind()) && !captured.contains(&node.start_byte()) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_cfg_attribute(node: tree_sitter::Node<'_>, source: &str) -> bool {
+    matches!(node.kind(), "attribute_item" | "inner_attribute_item")
+        && node.utf8_text(source.as_bytes()).is_ok_and(|text| {
+            let path = text
+                .trim_start_matches('#')
+                .trim_start()
+                .trim_start_matches('!')
+                .trim_start_matches('[')
+                .trim_start();
+            matches!(
+                path.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .next(),
+                Some("cfg" | "cfg_attr")
+            )
+        })
+}
+
+fn captured_call_positions(
+    parsed: &ParsedFile,
+    calls: &[Call],
+    is_call: impl Fn(&str) -> bool,
+) -> std::collections::HashSet<usize> {
     let mut captured = std::collections::HashSet::new();
     for call in calls {
         let mut current = parsed
@@ -380,13 +363,41 @@ fn uncovered_call_syntax(parsed: &ParsedFile, calls: &[Call]) -> bool {
             current = node.parent();
         }
     }
-    let mut pending = vec![parsed.tree.root_node()];
-    while let Some(node) = pending.pop() {
-        if is_call(node.kind()) && !captured.contains(&node.start_byte()) {
-            return true;
+    captured
+}
+
+#[cfg(test)]
+mod polish_tests {
+    use super::*;
+    #[test]
+    fn binding_index_preserves_patterns_and_imports_under_source_order_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        let source="fn callback() {}\nfn pattern() { if let Some(callback)=None::<fn()> { callback(); } }\nfn imported() { use other::callback; callback(); }\n";
+        std::fs::write(&path, source).unwrap();
+        let cache = crate::cache::OutlineCache::new();
+        let parsed = cache.get_or_parse(&path).unwrap();
+        let mut old = Vec::new();
+        let mut pending = vec![parsed.tree.root_node()];
+        while let Some(node) = pending.pop() {
+            old.push(node.id());
+            let mut cursor = node.walk();
+            pending.extend(node.named_children(&mut cursor));
         }
-        let mut cursor = node.walk();
-        pending.extend(node.named_children(&mut cursor));
+        let new: Vec<_> = crate::lang::walk::named_descendants(parsed.tree.root_node())
+            .map(|node| node.id())
+            .collect();
+        assert_eq!(
+            old.iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            new.iter().copied().collect(),
+            "AST walk changed coverage"
+        );
+        let bindings = RustBindings::new(&parsed);
+        let byte = source.find("callback();").unwrap();
+        assert!(bindings.contains("callback", byte), "{:?}", bindings.0);
+        let byte = source.rfind("callback();").unwrap();
+        assert!(bindings.contains("callback", byte), "{:?}", bindings.0);
     }
-    false
 }

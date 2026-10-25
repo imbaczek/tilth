@@ -11,7 +11,6 @@ pub(super) fn read(
     cache: &OutlineCache,
     session: &Session,
     edit: bool,
-    mcp: bool,
 ) -> Result<String, String> {
     for key in ["section", "sections", "slices", "offset", "limit"] {
         if args.get(key).is_some() {
@@ -129,9 +128,7 @@ pub(super) fn read(
                     continue;
                 }
                 let body = if mode == "signature" {
-                    d.entry
-                        .signature
-                        .clone()
+                    crate::lang::declarations::signature_text(d)
                         .unwrap_or_else(|| format!("{} [signature unavailable]", d.entry.name))
                 } else if !edit {
                     exact_body(d).unwrap_or_else(|| {
@@ -169,7 +166,6 @@ pub(super) fn read(
             }
         }
     }
-    let _ = mcp; // Symbol reads have no positional pagination.
     Ok(crate::listing::finish(
         &format!("{summary}\n{}", bodies.join("\n\n")),
         budget,
