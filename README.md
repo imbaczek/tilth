@@ -125,7 +125,7 @@ tilth 'retention,slot-wal' --scope src/storage/wal.lisp
 tilth needle --scope 'src/**/*.rs'
 ```
 
-Globs select matching files and directories, honor ignore rules, and never widen an unmatched selection to the whole project. Expansion is limited to 100,000 visited entries and 1,000 matching paths; use a narrower scope if a limit is reached. File scopes honor ignore rules too; `--no-respect-gitignore` bypasses Git ignores. An additional `--glob` narrows each resolved scope (relative to its directory, or a selected file's parent). Missing scopes suggest up to five similar filenames with normalized Levenshtein similarity of at least 0.8, within the response budget. Suggestions do not automatically select a replacement.
+Globs select matching files and directories, honor ignore rules, and never widen an unmatched selection to the whole project. Expansion is limited to 100,000 visited entries and 1,000 matching paths; use a narrower scope if a limit is reached. File scopes honor ignore rules too; `--no-respect-gitignore` bypasses Git ignores. For symbol/text/regex/callers results, an additional `--glob` narrows each resolved scope (relative to its directory, or a selected file's parent). Missing scopes suggest up to five similar filenames with normalized Levenshtein similarity of at least 0.8, or nearby directory hints, within the response budget. Suggestions do not automatically select a replacement.
 
 Symbol/content/regex searches combine and deduplicate all requested scopes before selecting a page. Comma-separated symbol targets each get their own page. Caller searches page each resolved scope independently in both CLI and MCP.
 
@@ -152,7 +152,7 @@ Each symbol gets its own block of results and its own offset/limit page. The exp
 
 ### Multiple scopes
 
-Pass `--scope` more than once on the command line, or use `scopes` in MCP `tilth_search`, to search several directories together. A relative query that names a file in any scope reads the matching file(s) and does not search the other scopes for that query as text. If no scope contains the file, tilth falls back to searching as usual.
+Pass `--scope` more than once on the command line, or use `scopes` in MCP `tilth_search`, to search directories, files, and glob selections together. A relative query that names a file under a directory scope reads the matching file(s) and does not search the other scopes for that query as text. If no scope contains the file, tilth falls back to searching as usual.
 
 ### Callers
 
@@ -175,9 +175,9 @@ Caller previews show up to 10 ranked call sites, or 100 with `--full`. On the CL
 tilth isTrustedProxy --callers --full --offset 100 --limit 100 --scope .
 ```
 
-Each CLI scope is paginated independently. The output reports the range, total and next offset. Keep the query, scopes and filters unchanged between pages; edits to the source can change the ranking. `--budget` still caps the rendered output. If it truncates a page, reduce `--limit` and retry the same offset before advancing.
+Each resolved scope is paginated independently in CLI and MCP. The output reports the range, total and next offset. Keep the query, scopes and filters unchanged between pages; edits to the source can change the ranking. `--budget` still caps the rendered output. If it truncates a page, reduce `--limit` and retry the same offset before advancing.
 
-In MCP mode, use `kind: "callers"` on `tilth_search` with the same zero-based `offset` and positive `limit` parameters. With comma-separated targets, the page applies independently to each target. An explicit `limit` overrides the default 10-result page (100 with `full: true`). Continuation hints use JSON arguments to merge into the original request. MCP caller searches accept one scope; multi-scope `scopes` are supported for symbol/content/regex searches.
+In MCP mode, use `kind: "callers"` on `tilth_search` with the same zero-based `offset` and positive `limit` parameters. With comma-separated targets, the page applies independently to each target. An explicit `limit` overrides the default 10-result page (100 with `full: true`). Continuation hints use JSON arguments to merge into the original request. MCP caller searches accept file, directory, and glob scopes, including `scopes` arrays. Pagination applies independently to each resolved scope and each target.
 
 ```json
 {"query":"isTrustedProxy","kind":"callers","full":true,"offset":100,"limit":100}
@@ -487,7 +487,7 @@ Offsets are zero-based nonnegative integers; limits are positive integers. Suppl
 | View | One page entry | Default page size |
 |------|----------------|-------------------|
 | Symbol/content/regex search | Ranked match, per symbol target, after merging and deduplicating scopes | 10; 100 with `--full` / `full: true` |
-| Caller search | Call site, per target; each CLI scope separately | 10; 100 with `--full` / `full: true` |
+| Caller search | Call site, per target and resolved scope (CLI and MCP) | 10; 100 with `--full` / `full: true` |
 | Directory read | Immediate child, sorted by name | 50, including with `--full` |
 | Code `auto` / code `signature` read | Declaration in source order, with nested-owner context | 50 |
 | Markdown `auto` read | Heading in document order, with global TOC addresses | 50 |

@@ -568,7 +568,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.trim_end().len(),
-            1936,
+            1986,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS
@@ -587,7 +587,7 @@ mod tests {
             "require-root path discipline must lead the file-I/O guidance"
         );
         assert!(
-            SERVER_INSTRUCTIONS.contains("Search scopes accept directories, files, and file globs"),
+            SERVER_INSTRUCTIONS.contains("Search scopes accept directories, files, and globs"),
             "search scope capabilities must stay in the PATHS guidance"
         );
         // De-dup (R1) moved per-tool usage into the schemas. Lock that the

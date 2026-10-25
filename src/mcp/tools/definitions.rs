@@ -32,7 +32,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "scope": {
                         "type": "string",
-                        "description": "Directory, file, or glob of paths to search. Omit for the whole project. Relative scopes require an absolute root. Missing scopes report similar paths without widening the search."
+                        "description": "Directory, file, or glob of files/directories to search. Omit for the whole project. Relative scopes require an absolute root. Glob expansion honors ignore rules and is limited to 100,000 visited entries and 1,000 matching paths across the request. Missing scopes report up to five similar filenames (normalized Levenshtein similarity >=0.8) or directory hints, within budget, without choosing a replacement or widening the search. Valid scopes can still return results alongside failed scopes."
                     },
                     "scopes": {
                         "type": "array",
@@ -43,7 +43,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "string",
                         "enum": ["symbol", "content", "regex", "callers"],
                         "default": "symbol",
-                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find ranked call sites. Every kind supports offset/limit pagination per target."
+                        "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find ranked call sites. Every kind supports offset/limit pagination per target; callers additionally page each resolved scope independently."
                     },
                     "expand": {
                         "type": "number",
@@ -59,12 +59,12 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "type": "integer",
                         "minimum": 0,
                         "default": 0,
-                        "description": "Skip N ranked matches per target (zero-based), after combining scopes and deduplicating. Applies to every search kind. Keep query, scope, context and filters unchanged between pages."
+                        "description": "Skip N ranked matches per target (zero-based), after combining scopes and deduplicating for symbol/content/regex. Callers apply the offset independently to each target and resolved scope. Applies to every search kind. Keep query, scope, context and filters unchanged between pages."
                     },
                     "limit": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Ranked matches per page per target. Applies to every search kind. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
+                        "description": "Ranked matches per page per target; for callers, per target and resolved scope. Applies to every search kind. Defaults to 10, or 100 with full:true; an explicit limit overrides that default. If budget truncates a page, retry the same offset with a smaller limit."
                     },
                     "context": {
                         "type": "string",
@@ -76,7 +76,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "glob": {
                         "type": "string",
-                        "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\"."
+                        "description": "File pattern filter. Whitelist: \"*.rs\" (only Rust files). Exclude: \"!*.test.ts\" (skip test files). Brace expansion: \"*.{go,rs}\" (Go and Rust). Path patterns: \"src/**/*.ts\". For symbol/content/regex/callers results, narrows each resolved scope relative to its directory, or a selected file's parent; intersects with scope selections and honors ignore rules."
                     },
                     "root": {
                         "type": "string",

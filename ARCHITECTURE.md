@@ -324,6 +324,23 @@ cached tree-sitter `Query` objects live in `callee_query.rs`.
 
 ### Walker and ignore policy (`mod.rs`)
 
+CLI and MCP search resolve directory, file, and glob scopes through
+`search_scopes::expand`. Glob expansion shares limits of 100,000 visited entries
+and 1,000 matching paths across the request, honors ignore rules, sorts matches,
+and deduplicates canonical paths. Unmatched globs remain failed scopes so the
+normal reducer can preserve successful results from other scopes. Missing scopes
+receive bounded directory hints or filename hints with normalized Levenshtein
+similarity ≥0.8; errors and partial-result hints share the output budget.
+
+File searches walk the selected file's parent with an exact-path predicate,
+composed with the optional `glob` filter. That filter is relative to each resolved
+directory or selected file's parent. File scopes honor parent ignore rules.
+Directory scopes retain the explicit traversal-root behavior described below.
+MCP callers run each resolved scope separately and combine labeled pages through
+the same MCP navigation and budget formatter used for single-scope callers.
+List, deps, grok, map, and MCP startup keep directory-only scope validation;
+diff retains file and directory scopes.
+
 `walker(scope, glob)` builds an `ignore::WalkParallel` with tilth's
 opinionated defaults:
 
@@ -765,8 +782,8 @@ Explicit limits override defaults; unpaged previews keep their existing behavior
 
 - `search/paging.rs` slices ranked symbol/content/regex matches after merging
   and deduplicating scopes. Each comma-separated symbol gets its own page.
-  Callers are filtered/ranked first; CLI scopes page independently, while MCP
-  callers accept one scope. Incomplete scope searches suppress navigation.
+  Callers are filtered/ranked first; CLI and MCP caller scopes page independently.
+  Incomplete scope searches suppress navigation.
 - `read/paging.rs` forces uncapped code declarations or Markdown headings in
   auto mode, even for small files. Full mode pages physical lines; stripped
   mode pages retained lines; signature mode pages declarations. Other non-Markdown

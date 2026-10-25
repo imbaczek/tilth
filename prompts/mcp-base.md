@@ -1,8 +1,8 @@
 tilth — code intelligence MCP server. Replaces grep, cat, find, ls with AST-aware equivalents.
 
-PATHS: DO NOT pass a relative path or scope without also setting root (absolute) — the server cannot see your shell cwd, so bare relative paths are refused. Absolute paths always work; omitting path/scope searches the project the server was launched in. Search scopes accept directories, files, and file globs. Other tools require directory scopes.
+PATHS: DO NOT pass a relative path or scope without also setting root (absolute) — the server cannot see your shell cwd, so bare relative paths are refused. Absolute paths always work; omitting path/scope searches the project the server was launched in. Search scopes accept directories, files, and globs. List, deps, and grok require directory scopes; diff accepts files or directories.
 
-With multiple scopes, a relative query that resolves to a file in any scope reads the matching file(s). It does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
+With multiple scopes, a relative query that resolves to a file under a directory scope reads the matching file(s). It does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
 
 To explore code, always search first. tilth_search finds definitions, usages, and file locations in one call.
 Usage: tilth_search(query: "handleRequest").

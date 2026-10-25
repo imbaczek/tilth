@@ -40,7 +40,15 @@ struct Cli {
 
 #[derive(clap::Args)]
 struct SearchOptions {
-    /// Directory, file, or glob to search within. Can be repeated to combine scopes.
+    /// Directory, file, or quoted glob to search within. Repeat to combine scopes.
+    ///
+    /// Scope globs select files and directories, honor ignore rules, and are limited
+    /// to 100,000 visited entries and 1,000 matching paths across the request.
+    /// Missing scopes suggest up to five filenames with normalized Levenshtein
+    /// similarity >=0.8, or nearby directory hints, within --budget. Suggestions
+    /// do not replace the scope. Valid scopes can return results alongside failed
+    /// scopes. Callers page each resolved
+    /// scope independently. Map, deps, and MCP startup require directory scopes.
     #[arg(long)]
     scope: Vec<PathBuf>,
 
@@ -88,6 +96,10 @@ struct SearchOptions {
     expand: Option<usize>,
 
     /// File pattern filter (e.g. "*.rs", "!*.test.ts", "*.{go,rs}").
+    ///
+    /// For symbol/text/regex/callers results, narrows each resolved scope
+    /// relative to its directory or a selected file's parent. Intersects with
+    /// file/glob scopes and honors ignore rules.
     #[arg(long)]
     glob: Option<String>,
 
@@ -552,7 +564,9 @@ fn main() {
     let query = if let Some(q) = cli.query {
         q
     } else {
-        tilth::diagnostic!("usage: tilth <query> [--scope DIR] [--section N-M] [--budget N]");
+        tilth::diagnostic!(
+            "usage: tilth <query> [--scope PATH_OR_GLOB] [--section N-M] [--budget N]"
+        );
         process::exit(3);
     };
 

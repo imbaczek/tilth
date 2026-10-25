@@ -45,11 +45,17 @@ and auto/full mode. Batches and disjoint sections are limited to 20 entries.
 
 ## Search
 
-With multiple `--scope` arguments, a relative query that resolves to a file in any scope reads the matching file(s); it does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
+Search scopes accept directories, files, and quoted globs of files or directories. Repeat `--scope` to combine selections. Globs honor ignore rules; expansion stops with an error beyond 100,000 visited entries or 1,000 matching paths across the request. Narrow the scope when a limit is reached. Missing selections report errors and up to five similar filenames (normalized Levenshtein similarity ≥0.8) or nearby directory hints, within the response budget; suggestions do not select a replacement or widen the search. Valid scopes can still return results alongside failed scopes.
+
+For symbol/text/regex/callers results, an additional `--glob` filters each resolved scope relative to its directory, or a selected file's parent. File scopes honor ignore rules too. MCP `tilth_search` accepts the same selections in `scope` or `scopes`, with an absolute `root` required for relative scopes. `tilth_list`, deps, grok, map, and MCP startup require directory scopes; diff accepts file or directory scopes.
+
+With multiple `--scope` arguments, a relative query that resolves to a file under a directory scope reads the matching file(s); it does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
 
 ```bash
 tilth <symbol> --scope <dir>                # definitions + usages
 tilth <symbol> --scope src --scope tests    # search multiple scopes
+tilth "retention,slot-wal" --scope src/storage/wal.lisp # selected file
+tilth <symbol> --scope 'src/**/*.rs'         # quoted scope glob
 tilth "Foo,Bar,Baz" --scope <dir>           # multi-symbol (max 5)
 tilth <symbol> --expand                     # inline source for top 2 matches
 tilth <symbol> --expand=5                   # inline source for top 5
@@ -149,7 +155,8 @@ Offsets are zero-based nonnegative integers; limits are positive integers. Suppl
 
 | View | Page unit | Default size |
 |------|-----------|--------------|
-| Symbol/content/regex or callers | Ranked match/call site per target | 10; 100 with full |
+| Symbol/content/regex | Ranked match per target, after merging scopes | 10; 100 with full |
+| Callers | Call site per target and resolved scope (CLI and MCP) | 10; 100 with full |
 | Directory / CLI glob / MCP list / CLI map | Child / matching file / matching file / file | 50 |
 | Code auto or code signature | Source-ordered declaration | 50 |
 | Markdown auto | Heading, with global TOC address | 50 |
@@ -171,7 +178,7 @@ tilth read src/main.rs src/lib.rs --offset 25 --limit 25 --budget 4000
 
 MCP `tilth_read` supports the same paging fields with either `path` or batch `paths`. Batches and CLI multi-path reads apply the same page independently to each file and share the final budget. Section selection still requires one file and auto/full mode; multiple ranges keep their supplied order and overlaps, with offsets into the concatenated selected lines.
 
-Symbol/content/regex searches combine and deduplicate scopes before slicing; comma-separated targets each get their own page. CLI callers page each scope independently; MCP callers accept one scope only. CLI glob/map pages are also per scope. Keep query/target, root, scopes, filters, modes, source, and ignore settings unchanged between pages.
+Symbol/content/regex searches combine and deduplicate scopes before slicing; comma-separated targets each get their own page. CLI and MCP callers page each resolved scope independently. CLI glob/map pages are also per scope. Keep query/target, root, scopes, filters, modes, source, and ignore settings unchanged between pages.
 
 `--budget` (MCP: `budget`) controls output size independently of entry count. For unpaged outlines over 500 KB, an explicit budget replaces the default 100-entry cap; explicit pages already bypass that cap. An explicit limit overrides search's 10/100 default and other views' 50-entry default. If the page or its navigation is omitted, retry the same offset with a smaller limit or larger budget before advancing. Failed-scope ranked searches report lower bounds and withhold continuation. Offsets beyond the total yield an empty terminal page.
 
@@ -179,6 +186,8 @@ MCP next-page JSON is an argument patch to merge into the original request; reta
 
 ```text
 tilth_search({query: "TODO: fix", kind: "content", root: "/project", offset: 25, limit: 25})
+tilth_search({query: "needle", root: "/project", scope: "src/main.rs"})
+tilth_search({query: "needle", root: "/project", scope: "src/**/*.rs"})
 tilth_read({root: "/project", paths: ["src/main.rs", "src/lib.rs"], mode: "signature", offset: 25, limit: 25})
 tilth_list({patterns: ["*.rs"], scope: "/project/src", offset: 50, limit: 50})
 tilth_deps({path: "src/lib.rs", root: "/project", offset: 20, limit: 20})

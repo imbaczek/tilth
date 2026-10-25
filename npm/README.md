@@ -7,6 +7,8 @@ This package downloads the prebuilt tilth binary for your platform and runs it.
 ```bash
 npx tilth read <path>                  # read a file, as an outline if it is large
 npx tilth <symbol> --scope <dir>  # definitions first, then usages
+npx tilth <symbol> --scope src/main.rs # search one file
+npx tilth <symbol> --scope 'src/**/*.rs' # search a quoted scope glob
 npx tilth <symbol> --callers      # ranked call sites of a symbol
 npx tilth search <symbol> --offset 10 --limit 10  # next ranked matches
 npx tilth grok <symbol> --section callers --offset 50 --limit 50
