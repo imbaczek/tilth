@@ -290,8 +290,24 @@ enum Command {
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
     },
-    /// Show the project fingerprint (what MCP init would inject).
-    Overview,
+    /// Show a project fingerprint; use -r to include deeply nested sources.
+    Overview {
+        /// Directories to summarize (defaults to the current directory).
+        #[arg(conflicts_with = "scope")]
+        directories: Vec<PathBuf>,
+        /// Directories to summarize; alternative to positional directories.
+        #[arg(long, conflicts_with = "directories")]
+        scope: Vec<PathBuf>,
+        /// Walk all source directories instead of stopping at depth two.
+        #[arg(short, long)]
+        recursive: bool,
+        /// Skip N source directories, ordered by depth then path, per project.
+        #[arg(long)]
+        offset: Option<usize>,
+        /// Source directories per page (default 10), per project.
+        #[arg(long)]
+        limit: Option<std::num::NonZeroUsize>,
+    },
     /// Trace bounded static calls, with explicit heuristic and completeness limits.
     Trace {
         from: String,
@@ -453,9 +469,49 @@ fn main() {
                     process::exit(1);
                 }
             }
-            Command::Overview => {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                let output = tilth::overview::fingerprint(&cwd);
+            Command::Overview {
+                directories,
+                scope,
+                recursive,
+                offset,
+                limit,
+            } => {
+                if !directories.is_empty() && !cli.search.scope.is_empty() {
+                    tilth::diagnostic!(
+                        "positional overview directories cannot be mixed with --scope"
+                    );
+                    process::exit(2);
+                }
+                let mut scope = scope;
+                scope.extend(cli.search.scope);
+                let roots = if directories.is_empty() {
+                    scope
+                } else {
+                    directories
+                };
+                let roots = if roots.is_empty() {
+                    vec![PathBuf::from(".")]
+                } else {
+                    roots
+                };
+                let offset = offset.or(cli.search.offset).unwrap_or(0);
+                let limit = limit
+                    .or(cli.search.limit)
+                    .map_or(10, std::num::NonZeroUsize::get);
+                let mut outputs = Vec::new();
+                for root in &roots {
+                    if !root.is_dir() {
+                        tilth::diagnostic!("overview scope is not a directory: {}", root.display());
+                        process::exit(1);
+                    }
+                    let summary = tilth::overview::fingerprint_page(root, recursive, offset, limit);
+                    outputs.push(if roots.len() > 1 {
+                        format!("## {}\n{summary}", root.display())
+                    } else {
+                        summary
+                    });
+                }
+                let output = outputs.join("\n\n");
                 if output.is_empty() {
                     tilth::diagnostic!("No project fingerprint could be generated.");
                     process::exit(1);

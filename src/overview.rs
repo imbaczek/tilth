@@ -12,7 +12,6 @@ use serde::Deserialize;
 
 use crate::lang::detect_file_type;
 use crate::read::imports::is_import_line;
-use crate::search::SKIP_DIRS;
 use crate::types::{FileType, Lang};
 
 /// Compute a project fingerprint for MCP initialization.
@@ -20,8 +19,23 @@ use crate::types::{FileType, Lang};
 /// Returns empty string on any failure (no error propagation).
 #[must_use]
 pub fn fingerprint(root: &Path) -> String {
+    fingerprint_with_recursion(root, true)
+}
+
+/// Compute a fingerprint with either a recursive or depth-two source walk.
+#[must_use]
+pub fn fingerprint_with_recursion(root: &Path, recursive: bool) -> String {
+    fingerprint_page(root, recursive, 0, 10)
+}
+
+/// Compute a fingerprint with a depth-ordered directory page.
+/// Offset and limit apply to directories, independently for each project root.
+#[must_use]
+pub fn fingerprint_page(root: &Path, recursive: bool, offset: usize, limit: usize) -> String {
     let start = Instant::now();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| fingerprint_inner(root)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        fingerprint_inner(root, recursive, offset, limit)
+    }));
     let elapsed = start.elapsed();
     if elapsed.as_millis() > 250 {
         crate::diagnostic!(
@@ -32,17 +46,19 @@ pub fn fingerprint(root: &Path) -> String {
     result.unwrap_or_default()
 }
 
-fn fingerprint_inner(root: &Path) -> String {
+fn fingerprint_inner(root: &Path, recursive: bool, offset: usize, limit: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
-
-    // Walk files (depth 2) — collect language counts, modules, entry points
-    let walk = walk_files(root);
+    let walk = walk_files(root, recursive);
 
     // Determine primary language
     let primary_lang = walk
         .lang_counts
         .iter()
-        .max_by_key(|(_, count)| *count)
+        .max_by(|(left_lang, left_count), (right_lang, right_count)| {
+            left_count
+                .cmp(right_count)
+                .then_with(|| lang_display_name(**left_lang).cmp(lang_display_name(**right_lang)))
+        })
         .map(|(lang, _)| *lang);
 
     let lang_name = primary_lang.map_or("Unknown", lang_display_name);
@@ -51,111 +67,34 @@ fn fingerprint_inner(root: &Path) -> String {
         .copied()
         .unwrap_or_else(|| walk.lang_counts.values().sum::<usize>());
 
-    // Modules: dirs with >=2 files of the primary language, with common prefix stripped.
-    // Keys in module_lang_counts may be "dir" or "dir/subdir" (for deeply nested projects).
-    let modules: Vec<String> = {
-        // Collect dirs with >=2 primary-language files, sorted by file count descending
-        let mut mods: Vec<(String, usize)> = walk
-            .module_lang_counts
-            .iter()
-            .filter_map(|(name, lang_map)| {
-                let count = primary_lang
-                    .and_then(|l| lang_map.get(&l))
-                    .copied()
-                    .unwrap_or(0);
-                if count >= 2 {
-                    Some((name.clone(), count))
-                } else {
-                    None
-                }
-            })
-            .collect();
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1)); // most files first
+    let mut directories: Vec<_> = walk.directory_lang_counts.keys().collect();
+    directories.sort_by_key(|dir| (directory_depth(dir), dir.as_str()));
+    let directory_count = directories.len();
+    let page: Vec<_> = directories.into_iter().skip(offset).take(limit).collect();
 
-        // If all modules (or at least most) share a common top-level prefix
-        // (e.g., all are "src/..."), strip it so we display short names
-        // ("diff/" not "src/diff/"). Also exclude the bare prefix entry itself.
-        if mods.len() >= 2 {
-            let prefix = common_dir_prefix(&mods);
-            if !prefix.is_empty() {
-                // The prefix without trailing slash (e.g., "src")
-                let prefix_bare = prefix.trim_end_matches('/');
-                mods = mods
-                    .into_iter()
-                    .filter_map(|(name, count)| {
-                        if name == prefix_bare {
-                            // Drop the bare prefix itself (it's the container, not a module)
-                            None
-                        } else if let Some(stripped) = name.strip_prefix(&prefix) {
-                            let s = stripped.trim_start_matches('/');
-                            if s.is_empty() {
-                                None
-                            } else {
-                                Some((s.to_string(), count))
-                            }
-                        } else {
-                            Some((name, count))
-                        }
-                    })
-                    .collect();
-            }
-        }
-        // Filter out well-known non-source directories
-        let non_source = [
-            "test",
-            "tests",
-            "__tests__",
-            "spec",
-            "specs",
-            "doc",
-            "docs",
-            "docs_src",
-            "documentation",
-            "example",
-            "examples",
-            "sample",
-            "samples",
-            "script",
-            "scripts",
-            "tools",
-            "fixtures",
-            "benchmark",
-            "benchmarks",
-            "bench",
-            ".github",
-            ".vscode",
-            ".idea",
-            "vendor",
-            "node_modules",
-            "target",
-            "dist",
-            "build",
-        ];
-        mods.retain(|(name, _)| {
-            let lower = name.to_lowercase();
-            // Check if ANY path component is a non-source dir
-            !lower.split('/').any(|part| non_source.contains(&part))
-        });
-        // Sort by file count descending, truncate to 10, extract names
-        mods.sort_by_key(|b| std::cmp::Reverse(b.1));
-        mods.truncate(10);
-        mods.into_iter().map(|(name, _)| name).collect()
-    };
-
-    // Header line
-    let dir_count = modules.len();
     lines.push(format!(
-        "[tilth] {lang_name} project — {total_files} source files, {dir_count} directories"
+        "[tilth] {lang_name} project — {total_files} source files, {directory_count} directories"
     ));
-
-    // Directories (cap at 10, sorted by file count descending)
-    if !modules.is_empty() {
-        let mut dirs = modules;
-        dirs.truncate(10);
-        let display: Vec<String> = dirs.iter().map(|m| format!("{m}/")).collect();
+    if !page.is_empty() {
+        let display: Vec<_> = page.iter().map(|dir| format!("{dir}/")).collect();
         lines.push(format!("  dirs: {}", display.join(" ")));
     }
-
+    if offset > 0 || page.len() < directory_count {
+        lines.push(format!(
+            "  directory page: {} shown of {directory_count} (offset {offset}, limit {limit})",
+            page.len()
+        ));
+        let next_offset = offset.saturating_add(page.len());
+        if !page.is_empty() && next_offset < directory_count {
+            lines.push(format!(
+                "  next page: --offset {next_offset} --limit {limit}"
+            ));
+        }
+    }
+    append_secondary_languages(&mut lines, &walk, primary_lang);
+    if walk.truncated {
+        lines.push("  source walk capped; counts and directories are partial".into());
+    }
     // Manifest — name, version, deps
     if let Some(manifest) = find_manifest(root) {
         if let Some(info) = parse_manifest(root, &manifest) {
@@ -207,27 +146,59 @@ fn fingerprint_inner(root: &Path) -> String {
     lines.join("\n")
 }
 
-// ---------------------------------------------------------------------------
-// Common dir prefix helper
-// ---------------------------------------------------------------------------
-
-/// If all module names (which may be "a/b" style) share the same first path
-/// component, return that component followed by "/". Otherwise return "".
-fn common_dir_prefix(mods: &[(String, usize)]) -> String {
-    if mods.is_empty() {
-        return String::new();
-    }
-    // Extract the first path component from each name
-    let first_components: Vec<&str> = mods
+fn append_secondary_languages(
+    lines: &mut Vec<String>,
+    walk: &WalkResult,
+    primary_lang: Option<Lang>,
+) {
+    // Language totals and their common source roots remain stable across directory pages.
+    let mut secondary: Vec<_> = walk
+        .lang_counts
         .iter()
-        .map(|(n, _)| n.split('/').next().unwrap_or(n))
+        .filter(|(lang, _)| Some(**lang) != primary_lang)
         .collect();
-    let first = first_components[0];
-    if first_components.iter().all(|c| *c == first) && mods.iter().any(|(n, _)| n.contains('/')) {
-        // All share the same first component and at least some have a subdir
-        format!("{first}/")
+    secondary.sort_by_key(|(lang, _)| lang_display_name(**lang));
+    for (lang, count) in secondary {
+        let directories: Vec<_> = walk
+            .directory_lang_counts
+            .iter()
+            .filter(|(_, counts)| counts.contains_key(lang))
+            .map(|(dir, _)| dir.as_str())
+            .collect();
+        let root = common_source_root(&directories);
+        let location = root.map_or_else(String::new, |root| format!(" (under {root}/)"));
+        lines.push(format!(
+            "  {}: {count} source files{location}",
+            lang_display_name(*lang)
+        ));
+    }
+}
+
+fn common_source_root(directories: &[&str]) -> Option<String> {
+    let (first, rest) = directories.split_first()?;
+    if *first == "." {
+        return None;
+    }
+    let mut prefix: Vec<_> = first.split('/').collect();
+    for directory in rest {
+        let shared = prefix
+            .iter()
+            .zip(directory.split('/'))
+            .take_while(|(left, right)| **left == *right)
+            .count();
+        prefix.truncate(shared);
+        if prefix.is_empty() {
+            return None;
+        }
+    }
+    Some(prefix.join("/"))
+}
+
+fn directory_depth(dir: &str) -> usize {
+    if dir == "." {
+        0
     } else {
-        String::new()
+        dir.split('/').count()
     }
 }
 
@@ -240,13 +211,13 @@ fn lang_display_name(lang: Lang) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
-// File walk (depth 2)
+// Source walk
 // ---------------------------------------------------------------------------
 
 struct WalkResult {
     lang_counts: HashMap<Lang, usize>,
-    /// Top-level dirs → per-language file counts
-    module_lang_counts: HashMap<String, HashMap<Lang, usize>>,
+    /// Source parent directories → per-language file counts
+    directory_lang_counts: HashMap<String, HashMap<Lang, usize>>,
     /// Code files found: (path relative to root, size in bytes)
     code_files: Vec<(String, u64)>,
     /// Whether specific test dirs exist
@@ -254,147 +225,74 @@ struct WalkResult {
     has_test_dir: bool,
     has_dunder_tests: bool,
     has_spec_dir: bool,
+    truncated: bool,
 }
 
-fn walk_files(root: &Path) -> WalkResult {
-    let mut lang_counts: HashMap<Lang, usize> = HashMap::new();
-    let mut module_lang_counts: HashMap<String, HashMap<Lang, usize>> = HashMap::new();
-    let mut code_files: Vec<(String, u64)> = Vec::new();
-    let mut has_tests_dir = false;
-    let mut has_test_dir = false;
-    let mut has_dunder_tests = false;
-    let mut has_spec_dir = false;
-
-    // Walk depth 0 (root itself)
-    walk_dir(
-        root,
-        root,
-        0,
-        2,
-        &mut lang_counts,
-        &mut module_lang_counts,
-        &mut code_files,
-        &mut has_tests_dir,
-        &mut has_test_dir,
-        &mut has_dunder_tests,
-        &mut has_spec_dir,
-    );
-
-    WalkResult {
-        lang_counts,
-        module_lang_counts,
-        code_files,
-        has_tests_dir,
-        has_test_dir,
-        has_dunder_tests,
-        has_spec_dir,
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn walk_dir(
-    dir: &Path,
-    root: &Path,
-    depth: usize,
-    max_depth: usize,
-    lang_counts: &mut HashMap<Lang, usize>,
-    module_lang_counts: &mut HashMap<String, HashMap<Lang, usize>>,
-    code_files: &mut Vec<(String, u64)>,
-    has_tests_dir: &mut bool,
-    has_test_dir: &mut bool,
-    has_dunder_tests: &mut bool,
-    has_spec_dir: &mut bool,
-) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+fn walk_files(root: &Path, recursive: bool) -> WalkResult {
+    let mut result = WalkResult {
+        lang_counts: HashMap::new(),
+        directory_lang_counts: HashMap::new(),
+        code_files: Vec::new(),
+        has_tests_dir: false,
+        has_test_dir: false,
+        has_dunder_tests: false,
+        has_spec_dir: false,
+        truncated: false,
     };
-
-    for entry in entries.flatten() {
+    let start = Instant::now();
+    let mut builder = crate::search::base_walk_builder(root);
+    builder.follow_links(false);
+    if !recursive {
+        builder.max_depth(Some(3));
+    }
+    for (visited, entry) in builder.build().enumerate() {
+        if visited >= 100_000 || start.elapsed() >= Duration::from_millis(150) {
+            result.truncated = true;
+            break;
+        }
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        let Some(kind) = entry.file_type() else {
             continue;
         };
-
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-
-        if ft.is_dir() {
-            if SKIP_DIRS.contains(&name) {
-                continue;
-            }
-
-            // Track test directories at any depth
-            match name {
-                "tests" => *has_tests_dir = true,
-                "test" => *has_test_dir = true,
-                "__tests__" => *has_dunder_tests = true,
-                "spec" => *has_spec_dir = true,
+        if kind.is_dir() {
+            match entry.file_name().to_str() {
+                Some("tests") => result.has_tests_dir = true,
+                Some("test") => result.has_test_dir = true,
+                Some("__tests__") => result.has_dunder_tests = true,
+                Some("spec") => result.has_spec_dir = true,
                 _ => {}
             }
-
-            if depth < max_depth {
-                walk_dir(
-                    &path,
-                    root,
-                    depth + 1,
-                    max_depth,
-                    lang_counts,
-                    module_lang_counts,
-                    code_files,
-                    has_tests_dir,
-                    has_test_dir,
-                    has_dunder_tests,
-                    has_spec_dir,
-                );
-            }
-        } else if ft.is_file() {
-            if let FileType::Code(lang) = detect_file_type(&path) {
-                *lang_counts.entry(lang).or_insert(0) += 1;
-
-                // Track size for hot files
-                let size = entry.metadata().map_or(0, |m| m.len());
-                if let Ok(rel) = path.strip_prefix(root) {
-                    let rel_str = rel.to_string_lossy().to_string();
-
-                    code_files.push((rel_str, size));
-
-                    // Track module — use up to 2 path components as the key,
-                    // but only for files nested at least one level deep.
-                    // e.g. src/diff/mod.rs → key "src/diff", lib.rs → skipped
-                    {
-                        let mut comps = rel.components();
-                        if let Some(c1) = comps.next() {
-                            let remaining: Vec<_> = comps.collect();
-                            if !remaining.is_empty() {
-                                let key = if remaining.len() >= 2 {
-                                    // File is at depth 3+: use first two components
-                                    format!(
-                                        "{}/{}",
-                                        c1.as_os_str().to_string_lossy(),
-                                        remaining[0].as_os_str().to_string_lossy()
-                                    )
-                                } else {
-                                    // File is at depth 2: use first component only
-                                    c1.as_os_str().to_string_lossy().to_string()
-                                };
-                                *module_lang_counts
-                                    .entry(key)
-                                    .or_default()
-                                    .entry(lang)
-                                    .or_insert(0) += 1;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Check test file patterns
-            if name.contains(".test.") || name.contains(".spec.") {
-                // These contribute to test style but we detect in test_style()
+            continue;
+        }
+        if !kind.is_file() {
+            continue;
+        }
+        if let FileType::Code(lang) = detect_file_type(path) {
+            *result.lang_counts.entry(lang).or_insert(0) += 1;
+            if let Ok(rel) = path.strip_prefix(root) {
+                result.code_files.push((
+                    rel.to_string_lossy().into_owned(),
+                    entry.metadata().map_or(0, |m| m.len()),
+                ));
+                let parent = rel.parent().unwrap_or_else(|| Path::new(""));
+                let key = if parent.as_os_str().is_empty() {
+                    ".".to_owned()
+                } else {
+                    parent
+                        .to_string_lossy()
+                        .replace(std::path::MAIN_SEPARATOR, "/")
+                };
+                *result
+                    .directory_lang_counts
+                    .entry(key)
+                    .or_default()
+                    .entry(lang)
+                    .or_insert(0) += 1;
             }
         }
     }
+    result
 }
 
 // ---------------------------------------------------------------------------

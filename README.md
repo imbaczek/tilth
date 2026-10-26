@@ -503,6 +503,11 @@ tilth <symbol> --expand=5         # inline source for top 5 matches
 tilth <symbol> --full             # preview up to 100 matches instead of 10
 tilth <symbol> --offset 100 --limit 25 # ranked matches beyond the preview
 tilth <symbol> --callers          # find call sites (structural)
+tilth overview                   # project fingerprint; first 10 source directories, shallowest first
+tilth overview ../postgres -r     # recursive fingerprint, including secondary languages
+tilth overview --scope src -r    # equivalent to: tilth overview src -r
+tilth overview dir1 dir2 -r       # one fingerprint per directory
+tilth overview ../postgres -r --offset 10 --limit 10 # next directory page
 tilth grok <symbol>               # overview of one symbol
 tilth grok <symbol> --section callers --limit 25 # one relationship page
 tilth <path> --deps               # what a file uses, and what uses it
