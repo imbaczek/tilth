@@ -367,3 +367,53 @@ fn rust_self_methods_keep_receiver_uncertainty_but_find_the_path() {
         "{out}"
     );
 }
+
+#[test]
+fn mixed_language_file_cap_keeps_lisp_and_reports_external_callees() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = dir.path().join("a-c");
+    let lisp = dir.path().join("z-lisp");
+    std::fs::create_dir(&c).unwrap();
+    std::fs::create_dir(&lisp).unwrap();
+    for i in 0..2001 {
+        std::fs::write(
+            c.join(format!("{i:04}.c")),
+            "int unrelated(void) { return external_c(); }\n",
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        lisp.join("backend.lisp"),
+        "(defun set-backend-state (state) (sb-thread:condition-broadcast state))\n(defun caller () (set-backend-state :ready))\n",
+    ).unwrap();
+    let out = text(run(dir.path(), &["set-backend-state"]));
+    assert!(out.contains("Start: set-backend-state"), "{out}");
+    assert!(out.contains("source-file work limit"), "{out}");
+    assert!(
+        out.contains("unresolved calls") && out.contains("sb-thread:condition-broadcast"),
+        "{out}"
+    );
+    assert!(out.contains("--direction callers"), "{out}");
+    let out = text(run(
+        dir.path(),
+        &["set-backend-state", "--direction", "callers"],
+    ));
+    assert!(
+        out.contains("caller  z-lisp/backend.lisp:2 -> set-backend-state"),
+        "{out}"
+    );
+    assert!(!out.contains("external_c"), "{out}");
+}
+
+#[test]
+fn unresolved_callees_are_visible_among_many_lisp_limitations() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("backend.lisp"),
+        "(defun start () (external-op))\n(defun noise () (loop for x in xs collect (foo x)) (lambda () 1) ((computed) 1) (eval-when (:execute) (foo)) (setf (slot x) 1) (handler-case (foo) (error () (bar))) (flet ((local () 1)) (local)) \u{0060}(foo) #+sbcl (foo) (with-open-file (s p) (foo s)) (with-slots (x) obj (foo x)))\n"
+    ).unwrap();
+    let out = text(run(dir.path(), &["start"]));
+    assert!(
+        out.contains("unresolved calls") && out.contains("external-op"),
+        "{out}"
+    );
+}

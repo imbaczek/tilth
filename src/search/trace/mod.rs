@@ -64,7 +64,13 @@ impl Issues {
         }
         let mut out = String::from("> Results may be incomplete or contain heuristic bindings:\n");
         let mut reasons: Vec<_> = self.counts.iter().collect();
-        reasons.sort_by_key(|(reason, _)| (!reason.contains("limit"), reason.as_str()));
+        reasons.sort_by_key(|(reason, _)| {
+            (
+                !reason.contains("limit"),
+                !reason.starts_with("unresolved calls"),
+                reason.as_str(),
+            )
+        });
         for (reason, count) in reasons.into_iter().take(10) {
             let _ = write!(out, "> - {reason} ({count})");
             if let Some(examples) = self.examples.get(reason) {
@@ -247,13 +253,42 @@ fn collect_source_paths(
         if !seen.insert(path.clone()) {
             continue;
         }
-        if paths.len() == MAX_FILES {
-            issues.add("source-file work limit reached (2000 files)");
-            break;
-        }
         paths.push(path);
     }
+    // Walk the bounded directory set before applying the parsing cap. Taking a
+    // lexical prefix lets a large language corpus exclude every other language.
     paths.sort();
+    let total = paths.len();
+    let mut languages: Vec<(Lang, VecDeque<std::path::PathBuf>)> = Vec::new();
+    for path in paths {
+        let FileType::Code(lang) = crate::lang::detect_file_type(&path) else {
+            continue;
+        };
+        if let Some((_, files)) = languages.iter_mut().find(|(kind, _)| *kind == lang) {
+            files.push_back(path);
+        } else {
+            languages.push((lang, VecDeque::from([path])));
+        }
+    }
+    let mut paths = Vec::new();
+    loop {
+        let mut added = false;
+        for (_, files) in &mut languages {
+            if let Some(path) = files.pop_front() {
+                paths.push(path);
+                added = true;
+                if paths.len() == MAX_FILES {
+                    if total > MAX_FILES {
+                        issues.add("source-file work limit reached (2000 files)");
+                    }
+                    return Ok(paths);
+                }
+            }
+        }
+        if !added {
+            break;
+        }
+    }
     Ok(paths)
 }
 
@@ -765,7 +800,9 @@ fn render_graph(mut graph: Graph, scope: &Path, request: Request<'_>) -> Result<
         }
     } else {
         for (owner, issues) in &graph.node_issues {
-            if reverse || expanded.contains(owner) {
+            if (reverse && graph.nodes[*owner].parsed.lang == graph.nodes[start].parsed.lang)
+                || expanded.contains(owner)
+            {
                 graph.issues.merge(issues);
             }
         }
@@ -774,6 +811,11 @@ fn render_graph(mut graph: Graph, scope: &Path, request: Request<'_>) -> Result<
     let mut body = format!("\nStart: {}\n", label(&graph, start, scope));
     if selected.is_empty() {
         body.push_str("No indexed direct edges in this result.\n");
+        if !reverse && target.is_none() {
+            body.push_str(
+                "Callees require definitions in scope. To find uses of this function, use --direction callers.\n",
+            );
+        }
     }
     for id in selected {
         let edge = &graph.edges[id];
