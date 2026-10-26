@@ -36,6 +36,21 @@ pub fn read_for_cli(args: &Value, edit_mode: bool) -> Result<String, String> {
     )
 }
 
+/// Read with structured conditional-view metadata. Text-only callers can keep
+/// using `read_for_cli`; this entry point also supports explicit-read JSON.
+pub fn read_response_for_cli(
+    args: &Value,
+    edit_mode: bool,
+) -> Result<crate::read::tags::ReadResponse, String> {
+    tools::read_response(
+        args,
+        &OutlineCache::new(),
+        &Session::new(),
+        edit_mode,
+        false,
+    )
+}
+
 /// Trace static calls with the same validation and budget as MCP.
 pub fn trace_for_cli(args: &Value) -> Result<String, String> {
     tools::tool_trace(args, &OutlineCache::new())
@@ -399,13 +414,30 @@ fn run_tool_with_timeout(
     tool_name: &str,
     args: &Value,
     timeout: std::time::Duration,
-) -> Result<String, String> {
+) -> Result<(String, Option<Value>), String> {
     let services_worker = services.clone();
     let tool_name_owned = tool_name.to_string();
     let args_owned = args.clone();
 
     let outcome = spawn_with_timeout(services.tracker(), timeout, move || {
-        dispatch_tool(&tool_name_owned, &args_owned, &services_worker)
+        if tool_name_owned == "tilth_read" {
+            if let Some(value) = args_owned.get("gitignore") {
+                value.as_bool().ok_or("gitignore must be a boolean")?;
+            }
+            tools::read_response(
+                &args_owned,
+                services_worker.cache(),
+                services_worker.session(),
+                services_worker.edit_mode(),
+                true,
+            )
+            .map(|response| {
+                let metadata = response.tag.as_ref().map(|_| response.metadata());
+                (response.text(), metadata)
+            })
+        } else {
+            dispatch_tool(&tool_name_owned, &args_owned, &services_worker).map(|text| (text, None))
+        }
     });
 
     match outcome {
@@ -420,14 +452,20 @@ fn run_tool_with_timeout(
     }
 }
 
-fn build_tool_response(id: Option<Value>, result: Result<String, String>) -> JsonRpcResponse {
-    let (text, is_error) = match result {
-        Ok(output) => (output, false),
-        Err(e) => (e, true),
+fn build_tool_response(
+    id: Option<Value>,
+    result: Result<(String, Option<Value>), String>,
+) -> JsonRpcResponse {
+    let (text, metadata, is_error) = match result {
+        Ok((output, metadata)) => (output, metadata, false),
+        Err(e) => (e, None, true),
     };
     let mut payload = serde_json::json!({
         "content": [{ "type": "text", "text": text }]
     });
+    if let Some(metadata) = metadata {
+        payload["structuredContent"] = metadata;
+    }
     if is_error {
         payload["isError"] = Value::Bool(true);
     }

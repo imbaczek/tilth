@@ -103,6 +103,18 @@ physical source lines and safe edit anchors.
 MCP uses `symbols: ["parse_query", "Parser::parse_statement"]` with `path` or
 `paths`. This is a stateless selection, not a record of previously seen code.
 
+For planned repeated reads, request a stateless view tag and supply it later:
+
+```bash
+tilth read src/parser.rs --tag always
+tilth read src/parser.rs --if-tag 'r1: ...five returned words...'
+```
+
+A match returns `View unchanged.`; a miss returns content and a new tag.
+Tags are opt-in and validate the returned view, including any truncation,
+not the whole file. See [conditional reads](CONDITIONAL_READS.md) for MCP,
+JSON, emission policies, protocol details and reproducible token measurements.
+
 Read different line ranges from several files under one budget:
 
 ```bash

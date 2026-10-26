@@ -12,7 +12,7 @@ pub(crate) fn read_file_page(
     page: Page,
     mcp: bool,
 ) -> Result<String, TilthError> {
-    let bytes = std::fs::read(path).map_err(|source| match source.kind() {
+    let bytes = super::source::bytes(path).map_err(|source| match source.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.into(),
             suggestion: None,

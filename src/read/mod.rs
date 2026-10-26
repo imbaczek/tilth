@@ -1,13 +1,13 @@
 pub mod imports;
 pub mod outline;
 mod paging;
+pub(crate) mod source;
+pub mod tags;
 pub(crate) use paging::read_file_page;
 
 use std::fmt::Write;
 use std::fs;
 use std::path::Path;
-
-use memmap2::Mmap;
 
 use crate::cache::OutlineCache;
 use crate::error::TilthError;
@@ -86,7 +86,16 @@ pub(crate) fn read_file_with_budget(
         );
     }
 
-    let byte_len = meta.len();
+    let byte_len = if source::active() {
+        source::bytes(path)
+            .map_err(|source| TilthError::IoError {
+                path: path.into(),
+                source,
+            })?
+            .len() as u64
+    } else {
+        meta.len()
+    };
 
     // Empty check before mmap — mmap on 0-byte file may fail on some platforms
     if byte_len == 0 {
@@ -99,13 +108,9 @@ pub(crate) fn read_file_with_budget(
     }
 
     // Binary detection
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
+    let mmap = source::map(path).map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
+        source,
     })?;
     let buf = &mmap[..];
 
@@ -230,7 +235,7 @@ pub(crate) fn read_markdown_outline_page(
             reason: "offset and limit require a directory or a Markdown file outline".into(),
         });
     }
-    let buf = fs::read(path).map_err(|source| TilthError::IoError {
+    let buf = source::bytes(path).map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
         source,
     })?;
@@ -256,6 +261,10 @@ pub(crate) fn read_markdown_outline_page(
 /// Would this file produce an outline (rather than full content) in default read mode?
 /// Used by the MCP layer to decide whether to append related-file hints.
 pub fn would_outline(path: &Path) -> bool {
+    if source::active() {
+        return source::bytes(path)
+            .is_ok_and(|b| estimate_tokens(b.len() as u64) > TOKEN_THRESHOLD);
+    }
     std::fs::metadata(path).is_ok_and(|m| !m.is_dir() && estimate_tokens(m.len()) > TOKEN_THRESHOLD)
 }
 
@@ -611,13 +620,9 @@ fn collect_blocks(
         });
     }
 
-    let file = fs::File::open(path).map_err(|e| TilthError::IoError {
+    let mmap = source::map(path).map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
-        source: e,
-    })?;
-    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
+        source,
     })?;
     let buf = &mmap[..];
 

@@ -94,6 +94,14 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "tag": {
+                        "type":"string", "enum":["auto","always","never"],
+                        "description":"View-tag emission policy. Omitted: never. always emits a five-word 65-bit tag; experimental auto emits at >=1000 estimated tokens. if_tag implies issuance; explicit never conflicts with if_tag."
+                    },
+                    "if_tag": {
+                        "type":"string", "maxLength":256,
+                        "description":"Previously returned r1: five-word tag. Match returns View unchanged (success); miss returns current view and new tag. Validates only the final budgeted view, including locations; not unseen file content. Omit to force content."
+                    },
                     "path": {
                         "type": "string",
                         "description": "Absolute or relative file path to read. A relative path requires an absolute `root`; the server cannot see your shell cwd."

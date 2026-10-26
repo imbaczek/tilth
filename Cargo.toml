@@ -79,6 +79,9 @@ fastbloom = "0.17"
 # MCP protocol (JSON-RPC over stdio)
 # (handled manually — no framework needed)
 
+# Stable noncryptographic conditional-read validators (MurmurHash3 x64_128).
+murmur3 = "0.5"
+
 # String similarity (char-aware Levenshtein for filename / heading suggestions)
 strsim = "0.11"
 

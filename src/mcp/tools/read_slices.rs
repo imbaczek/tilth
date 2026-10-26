@@ -105,6 +105,7 @@ pub(super) fn read(args: &Value, session: &Session, edit: bool) -> Result<String
                 bodies.push(body);
             }
             Err(error) => {
+                crate::read::source::mark_incomplete();
                 let _ = writeln!(summary, "- {}: error: {error}", path.display());
             }
         }

@@ -32,7 +32,7 @@ pub(crate) fn dependency_import_sources(content: &str, lang: Lang) -> Vec<String
 /// Extract import sources from a code file and resolve them to existing local file paths.
 /// Returns empty Vec for non-code files, files with no imports, or when all imports are external.
 pub fn resolve_related_files(file_path: &Path) -> Vec<PathBuf> {
-    let Ok(content) = fs::read_to_string(file_path) else {
+    let Some(content) = import_text(file_path) else {
         return Vec::new();
     };
     resolve_related_files_with_content(file_path, &content)
@@ -424,11 +424,24 @@ fn collect_commonjs_sources(
     }
 }
 
+// Optional hints may omit unavailable inputs for ordinary reads. Conditional
+// reads must retain that failure out of band, even if a budget hides the hint.
+fn import_text(path: &Path) -> Option<String> {
+    crate::read::source::text(path)
+        .inspect_err(|_| crate::read::source::mark_incomplete())
+        .ok()
+}
+
 type CachedImports = (SystemTime, u64, Arc<Vec<(String, bool)>>);
 static JS_IMPORT_CACHE: OnceLock<dashmap::DashMap<PathBuf, CachedImports>> = OnceLock::new();
 
 /// Avoid reparsing unchanged files on repeated dependency and grok queries.
 pub(crate) fn js_module_sources_from_file(path: &Path, lang: Lang) -> Vec<(String, bool)> {
+    if crate::read::source::active() {
+        return import_text(path)
+            .map(|text| js_module_sources(&text, lang))
+            .unwrap_or_default();
+    }
     let Ok(metadata) = fs::metadata(path) else {
         return Vec::new();
     };
@@ -463,6 +476,13 @@ type CachedConfig = (SystemTime, u64, Arc<serde_json::Value>);
 static TSCONFIG_CACHE: OnceLock<dashmap::DashMap<PathBuf, CachedConfig>> = OnceLock::new();
 
 fn tsconfig_json(path: &Path) -> Option<Arc<serde_json::Value>> {
+    if crate::read::source::active() {
+        let raw = import_text(path)?;
+        return serde_json::from_str(&strip_json_comments(&raw))
+            .inspect_err(|_| crate::read::source::mark_incomplete())
+            .ok()
+            .map(Arc::new);
+    }
     let metadata = fs::metadata(path).ok()?;
     let modified = metadata.modified().ok()?;
     let cache = TSCONFIG_CACHE.get_or_init(dashmap::DashMap::new);

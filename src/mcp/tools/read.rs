@@ -28,6 +28,127 @@ pub(in crate::mcp) fn read_with_navigation(
     edit_mode: bool,
     mcp_navigation: bool,
 ) -> Result<String, String> {
+    read_response(args, cache, session, edit_mode, mcp_navigation).map(|r| r.text())
+}
+
+pub(in crate::mcp) fn read_response(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+    mcp_navigation: bool,
+) -> Result<crate::read::tags::ReadResponse, String> {
+    use crate::read::tags::{self, ReadResponse};
+    let options = tags::TagOptions::parse(args)?;
+    if !options.enabled {
+        return render_read(args, cache, session, edit_mode, mcp_navigation)
+            .map(ReadResponse::plain);
+    }
+    let budget = match args.get("budget") {
+        None | Some(Value::Null) => crate::budget::DEFAULT_BUDGET,
+        Some(v) => v.as_u64().ok_or("budget must be a nonnegative integer")?,
+    };
+    if budget <= tags::TAG_ENVELOPE_TOKENS {
+        return Err(format!(
+            "tagged reads require budget > {}",
+            tags::TAG_ENVELOPE_TOKENS
+        ));
+    }
+    let identity = read_identity(args, edit_mode, mcp_navigation)?;
+    let (rendered, complete) = crate::read::source::with_snapshot(|| {
+        render_read(
+            args,
+            &OutlineCache::new(),
+            session,
+            edit_mode,
+            mcp_navigation,
+        )
+    });
+    let output = rendered?;
+    if !complete {
+        return Ok(ReadResponse::plain(output));
+    }
+    let content_budget = budget - tags::TAG_ENVELOPE_TOKENS;
+    let view = if args.get("offset").is_some() || args.get("limit").is_some() {
+        crate::listing::finish(&output, Some(content_budget))
+    } else {
+        crate::budget::apply(&output, content_budget)
+    };
+    if options.auto
+        && crate::types::estimate_tokens(view.len() as u64) < tags::AUTO_EMISSION_MIN_TOKENS
+    {
+        return Ok(ReadResponse::plain(output));
+    }
+    let tag = tags::encode(&identity, &view);
+    let unchanged = options.condition == Some(tag.as_str());
+    Ok(ReadResponse {
+        output: if unchanged {
+            "View unchanged.".into()
+        } else {
+            view
+        },
+        tag: Some(tag),
+        unchanged,
+    })
+}
+
+fn resolve_identity_path(value: &mut Value, root: Option<&Path>) -> Result<(), String> {
+    let raw = value.as_str().ok_or("read paths must be strings")?;
+    *value = Value::String(
+        super::resolve_read_path(Path::new(raw), root)?
+            .to_string_lossy()
+            .into(),
+    );
+    Ok(())
+}
+
+fn read_identity(args: &Value, edit: bool, mcp: bool) -> Result<Value, String> {
+    let root = args.get("root").and_then(Value::as_str).map(Path::new);
+    let mut identity = serde_json::Map::new();
+    // Only view-affecting controls participate; tag policy and the supplied
+    // condition cannot change the identity. Preserve explicit paging presence.
+    for key in [
+        "path", "paths", "slices", "symbols", "section", "sections", "offset", "limit", "budget",
+    ] {
+        if let Some(value) = args.get(key).filter(|v| !v.is_null()) {
+            identity.insert(key.into(), value.clone());
+        }
+    }
+
+    if let Some(value) = identity.get_mut("path") {
+        resolve_identity_path(value, root)?;
+    }
+    if let Some(value) = identity.get_mut("paths") {
+        for value in value.as_array_mut().ok_or("paths must be an array")? {
+            resolve_identity_path(value, root)?;
+        }
+    }
+    if let Some(value) = identity.get_mut("slices") {
+        for slice in value.as_array_mut().ok_or("slices must be an array")? {
+            resolve_identity_path(slice.get_mut("path").ok_or("slice requires path")?, root)?;
+        }
+    }
+    let mode = args.get("mode").and_then(Value::as_str).unwrap_or("auto");
+    let effective = if matches!(mode, "signature" | "stripped") {
+        mode
+    } else if mode == "full" || args.get("full").and_then(Value::as_bool) == Some(true) {
+        "full"
+    } else {
+        mode
+    };
+    identity.insert("mode".into(), Value::String(effective.into()));
+    identity.insert("edit".into(), Value::Bool(edit));
+    identity.insert("mcp_navigation".into(), Value::Bool(mcp));
+    Ok(Value::Object(identity))
+}
+
+fn render_read(
+    args: &Value,
+    cache: &OutlineCache,
+    session: &Session,
+    edit_mode: bool,
+    mcp_navigation: bool,
+) -> Result<String, String> {
     if args.get("slices").is_some() {
         return super::read_slices::read(args, session, edit_mode);
     }
@@ -76,6 +197,9 @@ pub(in crate::mcp) fn read_with_navigation(
         if args.get("section").is_some() || args.get("sections").is_some() {
             return Err("section/sections require a single path, not paths".into());
         }
+        if paths_arr.is_empty() {
+            crate::read::source::mark_incomplete();
+        }
         if paths_arr.len() > 20 {
             return Err(format!(
                 "batch read limited to 20 files (got {})",
@@ -96,6 +220,7 @@ pub(in crate::mcp) fn read_with_navigation(
         for (i, p) in paths_arr.iter().enumerate() {
             // Check deadline before each file
             if std::time::Instant::now() > deadline {
+                crate::read::source::mark_incomplete();
                 results.push(format!(
                     "# batch read stopped — deadline exceeded after {}/{} files. \
                      Reduce batch size or set TILTH_BATCH_TIMEOUT=<seconds>.",
@@ -109,6 +234,9 @@ pub(in crate::mcp) fn read_with_navigation(
             let path = super::resolve_read_path(&PathBuf::from(path_str), root)?;
             session.record_read(&path);
             let read = if path.is_dir() {
+                // Directory walkers currently tolerate per-entry I/O failures;
+                // do not issue a validator for an unverified partial listing.
+                crate::read::source::mark_incomplete();
                 if force_signature || force_stripped {
                     Err(TilthError::InvalidQuery {
                         query: path.display().to_string(),
@@ -130,7 +258,10 @@ pub(in crate::mcp) fn read_with_navigation(
             };
             match read {
                 Ok(output) => results.push(output),
-                Err(e) => results.push(format!("# {} — error: {}", path.display(), e)),
+                Err(e) => {
+                    crate::read::source::mark_incomplete();
+                    results.push(format!("# {} — error: {}", path.display(), e));
+                }
             }
         }
         let combined = results.join("\n\n");
@@ -164,6 +295,7 @@ pub(in crate::mcp) fn read_with_navigation(
     }
 
     if path.is_dir() {
+        crate::read::source::mark_incomplete();
         if section.is_some() || sections_arr.is_some() || force_signature || force_stripped {
             return Err(
                 "directory listings do not support section/sections or signature/stripped modes"
@@ -269,7 +401,7 @@ fn read_signature_file_page(
     page: Option<crate::listing::Page>,
     mcp: bool,
 ) -> Result<(String, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+    let content = crate::read::source::text(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: None,
@@ -281,10 +413,6 @@ fn read_signature_file_page(
             path: path.to_path_buf(),
             source: e,
         },
-    })?;
-    let meta = std::fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
     })?;
     let line_count = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
@@ -299,7 +427,8 @@ fn read_signature_file_page(
 
     // Build the signature header only on the code path — the non-code fallback
     // above returns the normal read and never uses it.
-    let header = crate::format::file_header(path, meta.len(), line_count, ViewMode::Signature);
+    let header =
+        crate::format::file_header(path, content.len() as u64, line_count, ViewMode::Signature);
     let entries = get_outline_entries(&content, lang);
     let lines: Vec<&str> = content.lines().collect();
     if let Some(page) = page {
@@ -396,7 +525,7 @@ fn read_page_view(
 // call. Wiring a structured cache is a separate change. The param is still used by
 // the non-code fallback (read_file), so it keeps its real name.
 fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32, u32), TilthError> {
-    let content = std::fs::read_to_string(path).map_err(|e| match e.kind() {
+    let content = crate::read::source::text(path).map_err(|e| match e.kind() {
         std::io::ErrorKind::NotFound => TilthError::NotFound {
             path: path.to_path_buf(),
             suggestion: None,
@@ -408,10 +537,6 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
             path: path.to_path_buf(),
             source: e,
         },
-    })?;
-    let meta = std::fs::metadata(path).map_err(|e| TilthError::IoError {
-        path: path.to_path_buf(),
-        source: e,
     })?;
     let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
 
@@ -434,7 +559,8 @@ fn read_stripped_file(path: &Path, cache: &OutlineCache) -> Result<(String, u32,
     }
 
     let stripped = total_lines.saturating_sub(kept);
-    let header = crate::format::file_header(path, meta.len(), total_lines, ViewMode::Stripped);
+    let header =
+        crate::format::file_header(path, content.len() as u64, total_lines, ViewMode::Stripped);
     let note = format!(
         "// stripped {stripped} of {total_lines} lines (plain comments, debug logs, blank collapse) — non-editable view"
     );
@@ -1232,3 +1358,7 @@ mod tolerant_paging_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "read_tags_tests.rs"]
+mod conditional_tests;

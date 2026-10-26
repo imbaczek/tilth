@@ -69,12 +69,18 @@ pub(super) fn read(
             continue;
         }
         session.record_read(&path);
-        match cache.get_or_parse(&path) {
-            Some(parsed)=> {
-                if parsed.tree.root_node().has_error() { notices.push(format!("{}: parse errors; symbol results may be incomplete",path.display())); }
-                declarations.extend(crate::lang::declarations::collect(&path,&parsed));
+        if let Some(parsed) = cache.get_or_parse(&path) {
+            if parsed.tree.root_node().has_error() {
+                crate::read::source::mark_incomplete();
+                notices.push(format!(
+                    "{}: parse errors; symbol results may be incomplete",
+                    path.display()
+                ));
             }
-            None=>notices.push(format!("{}: cannot index symbols (missing/unreadable file, unsupported language, or file exceeds 500 KB)",path.display())),
+            declarations.extend(crate::lang::declarations::collect(&path, &parsed));
+        } else {
+            crate::read::source::mark_incomplete();
+            notices.push(format!("{}: cannot index symbols (missing/unreadable file, unsupported language, or file exceeds 500 KB)",path.display()));
         }
     }
     let mut summary = String::from("# Symbol reads\n");
@@ -107,6 +113,7 @@ pub(super) fn read(
             .collect();
         match matches.as_slice() {
             [] => {
+                crate::read::source::mark_incomplete();
                 let _ = writeln!(summary, "- {symbol}: not found in indexed declarations");
             }
             [d] => {
@@ -128,10 +135,13 @@ pub(super) fn read(
                     continue;
                 }
                 let body = if mode == "signature" {
-                    crate::lang::declarations::signature_text(d)
-                        .unwrap_or_else(|| format!("{} [signature unavailable]", d.entry.name))
+                    crate::lang::declarations::signature_text(d).unwrap_or_else(|| {
+                        crate::read::source::mark_incomplete();
+                        format!("{} [signature unavailable]", d.entry.name)
+                    })
                 } else if !edit {
                     exact_body(d).unwrap_or_else(|| {
+                        crate::read::source::mark_incomplete();
                         format!("[exact source unavailable for {}]", d.qualified)
                     })
                 } else {
@@ -153,6 +163,7 @@ pub(super) fn read(
                 ));
             }
             _ => {
+                crate::read::source::mark_incomplete();
                 let _=writeln!(summary,"- {symbol}: ambiguous ({} definitions); use a qualified name, narrower files, or name@line",matches.len());
                 for d in matches {
                     let _ = writeln!(

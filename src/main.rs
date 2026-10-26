@@ -222,6 +222,15 @@ enum Command {
         /// Emit hash anchors; also accepted before read.
         #[arg(long)]
         edit: bool,
+        /// View-tag emission policy (opt-in). Auto is experimental, >=1000 estimated tokens.
+        #[arg(long, value_parser=["auto","always","never"])]
+        tag: Option<String>,
+        /// Return View unchanged when this quoted five-word view tag matches.
+        #[arg(long)]
+        if_tag: Option<String>,
+        /// Machine-readable read status, tag and output.
+        #[arg(long)]
+        json: bool,
     },
     /// Search for a file, symbol, glob pattern, or text.
     Search {
@@ -403,6 +412,9 @@ fn main() {
                 offset,
                 limit,
                 edit,
+                tag,
+                if_tag,
+                json,
             } => {
                 if let Some(parent_section) = cli.search.section {
                     section.insert(0, parent_section);
@@ -454,8 +466,20 @@ fn main() {
                 } else if !section.is_empty() {
                     args["sections"] = serde_json::json!(section);
                 }
-                match tilth::mcp::read_for_cli(&args, edit || cli.edit) {
-                    Ok(output) => emit_output(&output, io::stdout().is_terminal()),
+                if let Some(tag) = tag {
+                    args["tag"] = tag.into();
+                }
+                if let Some(tag) = if_tag {
+                    args["if_tag"] = tag.into();
+                }
+                match tilth::mcp::read_response_for_cli(&args, edit || cli.edit) {
+                    Ok(response) => {
+                        if json || cli.search.json {
+                            println!("{}", response.json());
+                        } else {
+                            emit_output(&response.text(), io::stdout().is_terminal());
+                        }
+                    }
                     Err(error) => {
                         tilth::diagnostic!("read error: {error}");
                         process::exit(1);
