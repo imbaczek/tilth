@@ -43,6 +43,43 @@ Views are `auto` (default), `full`, `signature`, and `stripped`. `--full` is an 
 for full content; signature/stripped take precedence. Sections require one file
 and auto/full mode. Batches and disjoint sections are limited to 20 entries.
 
+### Exact symbol reads and merged file slices
+
+```bash
+tilth read src/main.rs --symbol main --symbol SearchOptions::validate
+tilth read src/main.rs src/lib.rs --symbol 'parse@42' --mode signature
+tilth read --slice src/main.rs:1-20 --slice src/main.rs:15-30 --slice src/lib.rs:40-60 --budget 2000
+```
+
+Repeat `--symbol` for 1–20 exact names, qualified names, or `name@line` selectors.
+Every selector searches all supplied files; files and selectors are not paired by
+position. Results preserve selector order, report missing or ambiguous names, and
+emit each declaration body once. Use qualified candidates to disambiguate names
+or declarations sharing a line. Ordinary reads use exact declaration spans;
+signature mode shares the complete header extraction used by search projections.
+Symbol reads accept auto/full/signature and a shared budget, but exclude sections,
+slices, paging, and stripped mode. Edit mode requires auto/full and emits complete
+physical lines with hash anchors. Unsupported, unreadable, oversized (over 500 KB),
+or partially parsed files report indexing limitations.
+
+Repeat `--slice path:start-end` for up to 20 numeric ranges total. Files retain
+first-seen order; repeated paths and aliases of the same physical file are grouped.
+Ranges are sorted and overlapping or adjacent ranges merge within each file.
+The example reads main.rs lines 1–30 once, then lib.rs lines 40–60. Repeated
+`--section` instead preserves supplied range order and overlaps.
+Slices support auto/full and edit hash anchors, preserve original line numbers,
+and share one output budget. They exclude positional paths, symbols, sections,
+paging, and signature/stripped modes. All ranges are validated before reads;
+file errors appear alongside successful results.
+
+MCP `tilth_read` uses `symbols` with either `path` or `paths`, or uses `slices`
+exclusively with those other path/selection fields:
+
+```json
+{"root":"/project","paths":["src/main.rs","src/lib.rs"],"symbols":["main","parse@42"],"mode":"signature","budget":2000}
+{"root":"/project","slices":[{"path":"src/main.rs","sections":["1-20","15-30"]},{"path":"src/lib.rs","sections":["40-60"]}],"budget":2000}
+```
+
 ## Search
 
 Search scopes accept directories, files, and quoted globs of files or directories. Repeat `--scope` to combine selections. Globs honor ignore rules; expansion stops with an error beyond 100,000 visited entries or 1,000 matching paths across the request. Narrow the scope when a limit is reached. Missing selections report errors and up to five similar filenames (normalized Levenshtein similarity ≥0.8). If none qualify, lower-confidence suggestions require similarity ≥0.4, the same extension, and a shared whole stem component of at least two characters (e.g. `wal-checkpoint.lisp` → `wal.lisp`). Otherwise nearby directory hints are offered. Hints fit within the response budget; suggestions do not select a replacement or widen the search. Valid scopes can still return results alongside failed scopes.
@@ -89,6 +126,52 @@ Output per match:
 ```
 
 `--callers` finds direct, by-name call sites. If it returns 0 matches but the symbol exists, the call is likely indirect (trait/interface dispatch, reflection, route registration, callback) — fall back to `tilth <symbol> --scope .` to see references.
+
+### Compact projections and literal query batches
+
+```bash
+tilth search --query 'alpha,beta' --query TODO --kind content --select files --scope src
+tilth search --query read --kind symbol --select signatures --scope src --limit 10
+tilth search --query TODO --kind content --select count --scope src
+```
+
+Repeat `--query` for 1–20 nonempty literal queries; commas are preserved and
+duplicate queries run once. Kind defaults to symbol; content and regex also work.
+MCP `tilth_search` accepts `queries` (exclusive with `query`), `kind`, and `select`:
+
+```json
+{"root":"/project","queries":["alpha,beta","TODO"],"kind":"content","select":"files","scope":"src","budget":2000}
+```
+
+`files` returns unique sorted paths. `definitions` and `signatures` require symbol
+search and retain only definitions. Signatures preserve complete multiline headers,
+including parameters and return types, without bodies; unavailable or ambiguous
+headers and parser recovery are reported. `count` returns total matches per query,
+independent of page size, with lower bounds when work was skipped. Projection and
+filtering precede offset/limit; pages are per query and the output budget is shared.
+Literal batches return compact matches even without select. Positive `--expand`
+is incompatible with literal batches and projections.
+
+## Trace
+
+```bash
+tilth trace handle_request --to execute_query --depth 5 --scope src
+tilth trace execute_query --direction callers --depth 3 --scope src --budget 2000
+```
+
+Returns a shortest discovered static call path, or a bounded neighborhood without
+`--to`. Depth is 1–16 (default 2); direction defaults to callees. Endpoints accept
+names, qualified names, `name@line`, or scope-relative `file:line`; ambiguity
+reports candidates. MCP `tilth_trace` uses `from`, optional `to`, `direction`,
+`depth`, directory `scope`, `root`, and `budget`.
+
+Calls are resolved by name with explicit heuristic and completeness notices.
+Missing paths do not prove unreachability. Dispatch, aliases, macros, callbacks,
+parse failures, and unsupported syntax can leave gaps. Work caps are independent
+of output budget: 100,000 directory entries, 2,000 source files, 64 MiB, 30,000
+functions, 50,000 call sites, and 500 KB per parsed file. Narrow scope when a cap
+prevents useful results. Hard caps and path-local concerns remain visible even
+when a clean local path suppresses warnings about unrelated files.
 
 ## Files
 

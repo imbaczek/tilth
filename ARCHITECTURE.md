@@ -504,6 +504,24 @@ emits `path  (~N tokens)` lines, sorted by path. The token
 estimate comes from `estimate_tokens(byte_len)` — `bytes / 4` ceiling
 division.
 
+### Compact projections and static traces
+
+`search::projection::run` serves CLI repeated `--query` and MCP `queries` through
+`projected_search`. It deduplicates literal queries and projects before paging:
+files use unique sorted paths (content searches use the file ledger), definitions
+and signatures filter symbol definitions, and count reports totals independently
+of page size. Pages are per query; the final output budget is shared. Compact
+requests do not expand source; skipped work and scope failures remain explicit.
+
+`search/trace/` provides the stateless service behind CLI `trace` and MCP
+`tilth_trace`. Separate phases collect source paths, index declarations, collect
+syntactic calls, resolve names, and traverse the graph. Breadth-first traversal
+returns a shortest discovered destination path or a bounded callers/callees
+neighborhood. Rust bindings and Lisp forms receive dedicated handling, but
+resolution remains heuristic. Parse/extraction/binding concerns and work caps
+are reported; output budget is independent of scan limits. See the README's
+bounded call traces section for limits and interpretation.
+
 ## Read subsystem (`src/read/`)
 
 `read::read_file(path, section, full, cache, edit_mode)` is the
@@ -563,6 +581,22 @@ Two helpers feed the MCP layer:
   is going to see an outline.
 - `imports::resolve_related_files` does the related-file resolution
   for the same hint.
+
+### Exact declaration and slice services
+
+`mcp/tools/read_symbols.rs` resolves each exact selector against all supplied
+files, reports per-selector status, and emits each declaration body once using
+exact source spans. Edit mode preserves complete physical hash lines.
+`mcp/tools/read_slices.rs` validates numeric ranges before reads, groups canonical
+file identities in first-seen order, and sorts/coalesces adjacent or overlapping
+ranges. Both routes exclude ordinary paging, share a final output budget, and
+report file errors alongside successful results.
+
+`lang/declarations.rs` shares declaration indexing, exact spans, and complete
+signature extraction between symbol reads and search projections. Headers retain
+multiline parameters and return types without bodies; unavailable or ambiguous
+extraction is explicit. `lang/walk.rs` provides source-ordered named descendant
+traversal with subtree boundaries for declaration and call extraction.
 
 ## Language layer (`src/lang/`)
 

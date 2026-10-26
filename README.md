@@ -535,6 +535,68 @@ for full content. Sections require one file and auto/full mode. Up to 20 files
 or sections are accepted; batch output shares the token budget. Batch file errors
 are reported alongside successful reads.
 
+### Compact projections and literal query batches
+
+```bash
+tilth search --query 'alpha,beta' --query TODO --kind content --select files --scope src
+tilth search --query read --kind symbol --select signatures --scope src --limit 10
+tilth search --query TODO --kind content --select count --scope src
+```
+
+Repeat `--query` for 1–20 nonempty literal queries; commas are preserved and
+duplicate queries run once. Kind defaults to symbol; content and regex also work.
+MCP `tilth_search` accepts `queries` (exclusive with `query`), `kind`, and `select`:
+
+```json
+{"root":"/project","queries":["alpha,beta","TODO"],"kind":"content","select":"files","scope":"src","budget":2000}
+```
+
+`files` returns unique sorted paths. `definitions` and `signatures` require symbol
+search and retain only definitions. Signatures preserve complete multiline headers,
+including parameters and return types, without bodies; unavailable or ambiguous
+headers and parser recovery are reported. `count` returns total matches per query,
+independent of page size, with lower bounds when work was skipped. Projection and
+filtering precede offset/limit; pages are per query and the output budget is shared.
+Literal batches return compact matches even without select. Positive `--expand`
+is incompatible with literal batches and projections.
+
+### Exact symbol reads and merged file slices
+
+```bash
+tilth read src/main.rs --symbol main --symbol SearchOptions::validate
+tilth read src/main.rs src/lib.rs --symbol 'parse@42' --mode signature
+tilth read --slice src/main.rs:1-20 --slice src/main.rs:15-30 --slice src/lib.rs:40-60 --budget 2000
+```
+
+Repeat `--symbol` for 1–20 exact names, qualified names, or `name@line` selectors.
+Every selector searches all supplied files; files and selectors are not paired by
+position. Results preserve selector order, report missing or ambiguous names, and
+emit each declaration body once. Use qualified candidates to disambiguate names
+or declarations sharing a line. Ordinary reads use exact declaration spans;
+signature mode shares the complete header extraction used by search projections.
+Symbol reads accept auto/full/signature and a shared budget, but exclude sections,
+slices, paging, and stripped mode. Edit mode requires auto/full and emits complete
+physical lines with hash anchors. Unsupported, unreadable, oversized (over 500 KB),
+or partially parsed files report indexing limitations.
+
+Repeat `--slice path:start-end` for up to 20 numeric ranges total. Files retain
+first-seen order; repeated paths and aliases of the same physical file are grouped.
+Ranges are sorted and overlapping or adjacent ranges merge within each file.
+The example reads main.rs lines 1–30 once, then lib.rs lines 40–60. Repeated
+`--section` instead preserves supplied range order and overlaps.
+Slices support auto/full and edit hash anchors, preserve original line numbers,
+and share one output budget. They exclude positional paths, symbols, sections,
+paging, and signature/stripped modes. All ranges are validated before reads;
+file errors appear alongside successful results.
+
+MCP `tilth_read` uses `symbols` with either `path` or `paths`, or uses `slices`
+exclusively with those other path/selection fields:
+
+```json
+{"root":"/project","paths":["src/main.rs","src/lib.rs"],"symbols":["main","parse@42"],"mode":"signature","budget":2000}
+{"root":"/project","slices":[{"path":"src/main.rs","sections":["1-20","15-30"]},{"path":"src/lib.rs","sections":["40-60"]}],"budget":2000}
+```
+
 ### Pagination
 
 Offsets are zero-based nonnegative integers; limits are positive integers. Supplying either flag/field opts into paging, except directory reads, MCP `tilth_list`, and caller searches, which already return pages by default. Without explicit paging, other views retain their existing previews and smart-view behavior.
