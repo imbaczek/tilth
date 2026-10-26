@@ -27,7 +27,9 @@ Code outline format: `[<start>-<end>]  <symbol>`. Markdown outlines align `Lines
 
 Markdown section titles match exactly, with an optional ATX level prefix (`#` through `######`). Ambiguous titles report parent paths, line ranges, and selectable `toc:` addresses; missing titles suggest nearby headings with addresses. `toc:1.2` selects the second child of the first root ATX section. Indices start at 1; skipped heading levels add no phantom entries, and container headings follow section containment. Addresses follow document order and may change when headings move. Valid line ranges such as `123-456` take precedence; use an ATX prefix to select a title that looks like a range or starts with `toc:`. Setext headings are unsupported.
 
-`tilth read` always treats its arguments as file paths, including extensionless files.
+Directory reads start with a README preview (up to eight lines / 4 KiB; README.md, README, README.txt, then other README extensions). Each immediate subdirectory on the selected page gets its own README preview and overview counts of files, source files, and subdirectories, walking at most three levels like the default overview. Counts honor ignore rules, exclude symlinks, and report capped walks as partial. Root counts cover immediate entries. Offset/limit page immediate children by name; previews and summaries do not consume page slots. Output remains subject to the shared token budget.
+
+`tilth read` always treats its arguments as paths, including extensionless files and directories.
 Relative paths use the current directory, or `--root <dir>`. Legacy `tilth <path>`
 reads remain supported when the query resolves to a file.
 

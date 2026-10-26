@@ -531,7 +531,7 @@ The unpaged decision tree, in order:
 1. `metadata` errors → typed `TilthError::NotFound` /
    `PermissionDenied` / `IoError` with a `suggest_similar` fallback
    (Levenshtein on directory siblings).
-2. **Directory** → `list_directory` (sorted entries, file types).
+2. **Directory** → `list_directory` (sorted, ignore-aware entries, README previews, and bounded child summaries). Directory reads start with a README preview (up to eight lines / 4 KiB; README.md, README, README.txt, then other README extensions). Each immediate subdirectory on the selected page gets its own README preview and overview counts of files, source files, and subdirectories, walking at most three levels like the default overview. Counts honor ignore rules, exclude symlinks, and report capped walks as partial. Root counts cover immediate entries. Offset/limit page immediate children by name; previews and summaries do not consume page slots. Output remains subject to the shared token budget.
 3. **Empty file** → header with `ViewMode::Empty`.
 4. **`section: Some(...)` or `sections: [...]`** → `read_ranges`.
    Each range is either a line range (`"45-89"`) or a heading address

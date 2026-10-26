@@ -505,7 +505,7 @@ Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-pro
 ## Usage
 
 ```bash
-tilth read <path>                 # read file (outline if large)
+tilth read <path>                 # read file (outline if large) or directory overview
 tilth read <path> --section 45-89      # exact line range
 tilth read <path> --section "Foo"      # markdown heading (optional ## prefix)
 tilth read <path> --section toc:1.2    # TOC address from ambiguity hints
@@ -532,9 +532,9 @@ tilth --map --scope <dir>         # codebase skeleton (CLI only)
 
 `--map` is a command-line feature only. It is not offered as an MCP tool, because in testing agents called it far more often than it helped.
 
-### Explicit file reads
+### Explicit file and directory reads
 
-`tilth read <path> [<path> ...]` reads files directly, without classifying the
+`tilth read <path> [<path> ...]` reads files and directories directly, without classifying the
 argument as a search query. Relative paths use the current directory; pass
 `--root <dir>` to anchor them elsewhere. Legacy `tilth <path>` remains supported.
 
@@ -551,6 +551,8 @@ The CLI shares the MCP `tilth_read` implementation: smart `auto` view, `full`,
 for full content. Sections require one file and auto/full mode. Up to 20 files
 or sections are accepted; batch output shares the token budget. Batch file errors
 are reported alongside successful reads.
+
+Directory reads start with a README preview (up to eight lines / 4 KiB; README.md, README, README.txt, then other README extensions). Each immediate subdirectory on the selected page gets its own README preview and overview counts of files, source files, and subdirectories, walking at most three levels like the default overview. Counts honor ignore rules, exclude symlinks, and report capped walks as partial. Root counts cover immediate entries. Offset/limit page immediate children by name; previews and summaries do not consume page slots. Output remains subject to the shared token budget.
 
 ### Compact projections and literal query batches
 

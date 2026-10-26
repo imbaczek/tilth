@@ -681,50 +681,178 @@ fn parse_range(s: &str) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-/// List directory contents — treat as glob on dir/*.
+/// Directory page with README previews and bounded child overviews.
 pub(crate) fn list_directory(
     path: &Path,
     page: crate::listing::Page,
     mcp: bool,
 ) -> Result<String, TilthError> {
-    let mut entries: Vec<String> = Vec::new();
-    let read_dir = fs::read_dir(path).map_err(|e| TilthError::IoError {
+    // Validate the requested directory before using the ignore-aware walker.
+    fs::read_dir(path).map_err(|source| TilthError::IoError {
         path: path.to_path_buf(),
-        source: e,
+        source,
     })?;
-
-    let mut items: Vec<_> = read_dir.filter_map(std::result::Result::ok).collect();
-    items.sort_by_key(std::fs::DirEntry::file_name);
-
-    let (start, end) = page.bounds(items.len());
-    for entry in &items[start..end] {
-        let ft = entry.file_type().ok();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        let meta = entry.metadata().ok();
-
-        let suffix = match ft {
-            Some(t) if t.is_dir() => "/".to_string(),
-            Some(t) if t.is_symlink() => " →".to_string(),
-            _ => match meta {
-                Some(m) => {
-                    let tokens = estimate_tokens(m.len());
-                    format!("  ({tokens} tokens)")
-                }
-                None => String::new(),
-            },
-        };
-        entries.push(format!("  {name}{suffix}"));
-    }
-
-    let header = format!("# {} ({} items)", path.display(), items.len());
-    let mut output = format!(
-        "{header}\n\n{}\n{}",
-        page.summary(items.len(), "items"),
-        entries.join("\n")
+    let mut walker = crate::search::base_walk_builder(path);
+    walker.max_depth(Some(1)).follow_links(false);
+    let mut items: Vec<_> = walker
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.depth() == 1)
+        .collect();
+    items.sort_by(|a, b| a.file_name().cmp(b.file_name()));
+    let directories = items
+        .iter()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_dir()))
+        .count();
+    let files = items
+        .iter()
+        .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        .count();
+    let mut output = String::new();
+    append_readme_preview(&mut output, &items);
+    let _ = writeln!(
+        output,
+        "# {} ({} items; {directories} subdirectories, {files} files)\n",
+        path.display(),
+        items.len()
     );
+    let _ = writeln!(output, "{}", page.summary(items.len(), "items"));
+    let (start, end) = page.bounds(items.len());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut remaining = 100_000usize;
+    for entry in &items[start..end] {
+        let name = entry.file_name().to_string_lossy();
+        match entry.file_type() {
+            Some(t) if t.is_dir() => {
+                let _ = writeln!(output, "  {name}/");
+                append_directory_overview(&mut output, entry.path(), deadline, &mut remaining);
+            }
+            Some(t) if t.is_symlink() => {
+                let _ = writeln!(output, "  {name} →");
+            }
+            _ => {
+                let tokens = entry.metadata().map_or(0, |m| estimate_tokens(m.len()));
+                let _ = writeln!(output, "  {name}  ({tokens} tokens)");
+            }
+        }
+    }
     page.append_navigation(&mut output, items.len(), mcp);
     Ok(output)
+}
+
+/// Read at most 4 KiB and eight lines; never follow README symlinks.
+fn append_readme_preview(output: &mut String, entries: &[ignore::DirEntry]) {
+    use std::io::Read;
+    let readme = entries
+        .iter()
+        .filter(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            entry.file_type().is_some_and(|t| t.is_file())
+                && (name == "readme" || name.starts_with("readme."))
+        })
+        .min_by_key(|entry| {
+            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+            (
+                match name.as_str() {
+                    "readme.md" => 0,
+                    "readme" => 1,
+                    "readme.txt" => 2,
+                    _ => 3,
+                },
+                name,
+            )
+        });
+    let Some(entry) = readme else { return };
+    let Ok(file) = fs::File::open(entry.path()) else {
+        return;
+    };
+    let mut bytes = Vec::new();
+    if file.take(4096).read_to_end(&mut bytes).is_err() || crate::lang::detection::is_binary(&bytes)
+    {
+        return;
+    }
+    let _ = writeln!(output, "README: {}", entry.path().display());
+    for line in String::from_utf8_lossy(&bytes).lines().take(8) {
+        let _ = writeln!(output, "    {line}");
+    }
+    output.push('\n');
+}
+
+fn append_directory_overview(
+    output: &mut String,
+    path: &Path,
+    deadline: std::time::Instant,
+    remaining: &mut usize,
+) {
+    if *remaining == 0 || std::time::Instant::now() >= deadline {
+        let _ = writeln!(
+            output,
+            "    README and counts unavailable: page walk capped"
+        );
+        return;
+    }
+    // Discover the README before descending into deeper directories.
+    let mut direct = crate::search::base_walk_builder(path);
+    direct.max_depth(Some(1)).follow_links(false);
+    let mut children = Vec::new();
+    let mut preview_partial = false;
+    for entry in direct.build() {
+        if *remaining == 0 || std::time::Instant::now() >= deadline {
+            preview_partial = true;
+            break;
+        }
+        *remaining -= 1;
+        match entry {
+            Ok(entry) if entry.depth() == 1 => children.push(entry),
+            Err(_) => preview_partial = true,
+            _ => {}
+        }
+    }
+    append_readme_preview(output, &children);
+    let mut walker = crate::search::base_walk_builder(path);
+    walker.max_depth(Some(3)).follow_links(false);
+    let (mut directories, mut files, mut sources) = (0, 0, 0);
+    if preview_partial {
+        let _ = writeln!(
+            output,
+            "    README discovery partial: walk capped or unreadable entries"
+        );
+    }
+    let mut partial = preview_partial;
+    for entry in walker.build() {
+        if *remaining == 0 || std::time::Instant::now() >= deadline {
+            partial = true;
+            break;
+        }
+        *remaining -= 1;
+        let Ok(entry) = entry else {
+            partial = true;
+            continue;
+        };
+        if entry.depth() == 0 {
+            continue;
+        }
+        if let Some(kind) = entry.file_type() {
+            if kind.is_dir() {
+                directories += 1;
+            }
+            if kind.is_file() {
+                files += 1;
+                if matches!(detect_file_type(entry.path()), FileType::Code(_)) {
+                    sources += 1;
+                }
+            }
+        }
+    }
+    let _ = writeln!(
+        output,
+        "    {directories} subdirectories, {files} files, {sources} source files (depth ≤3{})",
+        if partial {
+            "; partial: walk capped"
+        } else {
+            ""
+        }
+    );
 }
 
 /// Public entry point for did-you-mean on path-like fallthrough queries.
@@ -1450,5 +1578,93 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    fn page(offset: usize, limit: usize) -> crate::listing::Page {
+        crate::listing::Page::new(offset, limit).unwrap()
+    }
+    #[test]
+    fn readmes_counts_depth_and_paging() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(
+            root.join("README.md"),
+            (1..=12).fold(String::new(), |mut text, n| {
+                writeln!(text, "root line {n}").unwrap();
+                text
+            }),
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("child/deep/deeper/beyond")).unwrap();
+        fs::write(root.join("child/readme.txt"), "child intro\n").unwrap();
+        fs::write(root.join("child/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            root.join("child/deep/deeper/beyond/hidden.rs"),
+            "fn hidden() {}\n",
+        )
+        .unwrap();
+        let output = list_directory(root, page(0, 50), false).unwrap();
+        assert!(output.starts_with("README:"), "{output}");
+        assert!(output.contains("root line 8"));
+        assert!(!output.contains("root line 9"));
+        assert!(output.contains("1 subdirectories, 1 files"), "{output}");
+        assert!(output.contains("child intro"));
+        assert!(
+            output.contains("3 subdirectories, 2 files, 1 source files (depth ≤3)"),
+            "{output}"
+        );
+        let first = list_directory(root, page(0, 1), false).unwrap();
+        assert!(!first.contains("child intro"));
+        assert!(first.contains("--offset 1"));
+        let second = list_directory(root, page(1, 1), true).unwrap();
+        assert!(second.contains("child intro"));
+        assert!(second.contains("root line 1"));
+    }
+    #[test]
+    fn ignore_rules_and_readme_preference() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".ignore"), "ignored/\nREADME.txt\n").unwrap();
+        fs::write(root.join("README.md"), "preferred\n").unwrap();
+        fs::write(root.join("README.txt"), "ignored readme\n").unwrap();
+        fs::create_dir(root.join("ignored")).unwrap();
+        fs::write(root.join("ignored/README"), "secret\n").unwrap();
+        let output = list_directory(root, page(0, 50), false).unwrap();
+        assert!(output.contains("preferred"));
+        assert!(!output.contains("secret"));
+        assert!(!output.contains("README.txt"));
+        assert!(output.contains("0 subdirectories, 2 files"), "{output}");
+    }
+    #[test]
+    fn exhausted_page_budget_reports_unavailable_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut output = String::new();
+        let mut remaining = 0;
+        append_directory_overview(
+            &mut output,
+            dir.path(),
+            std::time::Instant::now(),
+            &mut remaining,
+        );
+        assert!(output.contains("README and counts unavailable: page walk capped"));
+        assert!(!output.contains("0 files"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn no_readme_symlink_or_binary_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target"), "secret\n").unwrap();
+        std::os::unix::fs::symlink("target", dir.path().join("README.md")).unwrap();
+        let output = list_directory(dir.path(), page(0, 50), false).unwrap();
+        assert!(!output.contains("secret"));
+        assert!(!output.starts_with("README:"));
+        fs::remove_file(dir.path().join("README.md")).unwrap();
+        fs::write(dir.path().join("README.md"), b"\0binary").unwrap();
+        let output = list_directory(dir.path(), page(0, 50), false).unwrap();
+        assert!(!output.starts_with("README:"));
     }
 }
