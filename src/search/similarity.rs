@@ -22,8 +22,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             threshold: 0.80,
-            max_files: 20,
-            max_bytes: 10_000_000,
+            max_files: 500,
+            max_bytes: 20_000_000,
         }
     }
 }
@@ -484,37 +484,37 @@ mod tests {
     #[test]
     fn inventory_limits_are_inclusive_and_deduplicate_overlapping_scopes() {
         let dir = tempfile::tempdir().unwrap();
-        for n in 0..20 {
+        for n in 0..500 {
             let path = dir.path().join(format!("{n}.txt"));
             let file = std::fs::File::create(path).unwrap();
-            file.set_len(500_000).unwrap();
+            file.set_len(40_000).unwrap();
         }
         let roots = [dir.path().to_path_buf(), dir.path().join("0.txt")];
         assert_eq!(
             inventory(&roots, None, Options::default()).unwrap().len(),
-            20
+            500
         );
         std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join("0.txt"))
             .unwrap()
-            .set_len(500_001)
+            .set_len(40_001)
             .unwrap();
         assert!(inventory(&roots, None, Options::default()).is_none());
         std::fs::OpenOptions::new()
             .write(true)
             .open(dir.path().join("0.txt"))
             .unwrap()
-            .set_len(500_000)
+            .set_len(40_000)
             .unwrap();
-        std::fs::write(dir.path().join("extra.txt"), "x").unwrap();
+        std::fs::write(dir.path().join("extra.txt"), "").unwrap();
         assert!(inventory(&roots, None, Options::default()).is_none());
         let relaxed = Options {
-            max_files: 21,
-            max_bytes: 10_000_001,
+            max_files: 501,
+            max_bytes: 20_000_000,
             ..Options::default()
         };
-        assert_eq!(inventory(&roots, None, relaxed).unwrap().len(), 21);
+        assert_eq!(inventory(&roots, None, relaxed).unwrap().len(), 501);
     }
 
     #[test]

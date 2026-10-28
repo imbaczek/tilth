@@ -21,7 +21,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
         serde_json::json!({
             "name": "tilth_search",
             "annotations": { "readOnlyHint": true },
-            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. Complete zero-hit symbol and literal searches on at most 20 files and 10000000 bytes may return explicitly labeled approximate suggestions. Suggestions are not definitions or targets for grok, trace, or follow-on traversal. For cross-file tracing, pass comma-separated symbol names (max 5). Searches honor .tilthignore, .gitignore, .ignore, and Git excludes by default. Set gitignore=false for one call, or use TILTH_RESPECT_GITIGNORE=0 at startup, to bypass Git ignore rules.",
+            "description": "Search for symbols, text, or regex patterns in code. Replaces grep/rg and the host Grep tool — use this for all code search. Symbol search returns definitions first (via tree-sitter AST), then usages, with full source code inlined for top matches. Content search finds literal text. Regex search supports full regex patterns. Complete zero-hit symbol and literal searches on at most 500 files and 20000000 bytes may return explicitly labeled approximate suggestions. Suggestions are not definitions or targets for grok, trace, or follow-on traversal. For cross-file tracing, pass comma-separated symbol names (max 5). Searches honor .tilthignore, .gitignore, .ignore, and Git excludes by default. Set gitignore=false for one call, or use TILTH_RESPECT_GITIGNORE=0 at startup, to bypass Git ignore rules.",
             "inputSchema": {
                 "type": "object",
                 "oneOf": [{"required":["query"],"not":{"required":["queries"]}}, {"required":["queries"],"not":{"required":["query"]}}],
@@ -48,8 +48,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "description": "Search type. symbol: structural definitions + usages. content: literal text. regex: regex pattern. callers: find ranked call sites. Every kind supports offset/limit pagination per target; callers additionally page each resolved scope independently."
                     },
                     "similarity_threshold": {"type":"number", "minimum":0, "maximum":1, "default":0.8, "description":"Minimum normalized OSA similarity for approximate zero-hit suggestions."},
-                    "similarity_max_files": {"type":"integer", "minimum":1, "default":20, "description":"Inclusive maximum number of distinct scoped files eligible for similarity suggestions."},
-                    "similarity_max_bytes": {"type":"integer", "minimum":1, "default":10000000, "description":"Inclusive maximum total bytes of distinct scoped files eligible for similarity suggestions."},
+                    "similarity_max_files": {"type":"integer", "minimum":1, "default":500, "description":"Inclusive maximum number of distinct scoped files eligible for similarity suggestions."},
+                    "similarity_max_bytes": {"type":"integer", "minimum":1, "default":20000000, "description":"Inclusive maximum total bytes of distinct scoped files eligible for similarity suggestions."},
                     "expand": {
                         "type": "number",
                         "default": 2,

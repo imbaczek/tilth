@@ -118,11 +118,11 @@ struct SearchOptions {
     #[arg(long)]
     similarity_threshold: Option<f64>,
 
-    /// Maximum number of files eligible for similar suggestions (default 20, inclusive).
+    /// Maximum number of files eligible for similar suggestions (default 500, inclusive).
     #[arg(long)]
     similarity_max_files: Option<std::num::NonZeroUsize>,
 
-    /// Maximum total file bytes eligible for similar suggestions (default 10000000, inclusive).
+    /// Maximum total file bytes eligible for similar suggestions (default 20000000, inclusive).
     #[arg(long)]
     similarity_max_bytes: Option<std::num::NonZeroU64>,
 

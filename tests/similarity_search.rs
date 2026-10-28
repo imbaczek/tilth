@@ -98,3 +98,18 @@ fn compact_and_literal_modes_use_the_same_limits() {
     let regex = output(dir.path(), &["/serach_collecte./", "--kind", "content"]);
     assert!(!regex.contains("Similar suggestions"), "{regex}");
 }
+
+#[test]
+fn default_scope_accepts_more_than_twenty_files_and_can_be_narrowed() {
+    let dir = fixture();
+    for n in 0..20 {
+        std::fs::write(dir.path().join(format!("extra_{n}.txt")), "padding\n").unwrap();
+    }
+    let default = output(dir.path(), &["serach_collected"]);
+    assert!(default.contains("Similar suggestions"), "{default}");
+    let restricted = output(
+        dir.path(),
+        &["serach_collected", "--similarity-max-files", "20"],
+    );
+    assert!(!restricted.contains("Similar suggestions"), "{restricted}");
+}
