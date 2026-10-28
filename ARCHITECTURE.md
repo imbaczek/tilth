@@ -345,6 +345,17 @@ the same MCP navigation and budget formatter used for single-scope callers.
 List, deps, grok, map, and MCP startup keep directory-only scope validation;
 diff retains file and directory scopes.
 
+### Similarity suggestions (`similarity.rs`)
+
+A complete zero-hit symbol or literal search can append a separate approximate
+page. A preflight walks the entire ignore- and glob-filtered scope, deduplicates
+physical files, and rejects scopes exceeding the configured inclusive file/byte
+limits. A bounded normalized OSA scan ranks identifier tokens or literal substrings;
+its results are never structural `Match` records and are not passed into source
+expansion or relationship traversal. Per-call settings avoid shared-server state.
+A work cap and suggestion-count cap prevent unbounded computation and report a
+skipped scan instead of returning partial results as complete.
+
 `walker(scope, glob)` builds an `ignore::WalkParallel` with tilth's
 opinionated defaults:
 

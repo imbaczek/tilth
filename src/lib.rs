@@ -77,6 +77,87 @@ pub fn apply_output_budget(output: &str, budget_tokens: u64) -> String {
     budget::apply(output, budget_tokens)
 }
 
+/// Add approximate suggestions to an otherwise complete zero-hit CLI search.
+/// This wrapper intentionally leaves raw searches and relationship tools exact.
+pub fn append_cli_similarity(
+    result: Result<String, TilthError>,
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    args: &serde_json::Value,
+    offset: usize,
+    limit: usize,
+    budget: Option<u64>,
+) -> Result<String, TilthError> {
+    let options = search::similarity::Options::from_args(args).map_err(|reason| {
+        TilthError::InvalidQuery {
+            query: query.into(),
+            reason,
+        }
+    })?;
+    if result.is_err() && !matches!(&result, Err(TilthError::NotFound { .. })) {
+        return result;
+    }
+    if scopes.is_empty() {
+        return result;
+    }
+    let kinds: Vec<_> = scopes.iter().map(|scope| classify(query, scope)).collect();
+    if kinds.iter().any(|k| {
+        matches!(
+            k,
+            QueryType::FilePath(_) | QueryType::Glob(_) | QueryType::Regex(_)
+        )
+    }) {
+        return result;
+    }
+    let parts: Vec<_> = query
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let multi = query.contains(',')
+        && (2..=5).contains(&parts.len())
+        && parts.iter().all(|part| classify::is_identifier(part));
+    let kind = if multi {
+        "symbol"
+    } else {
+        match &kinds[0] {
+            QueryType::Symbol(_) => "symbol",
+            QueryType::Content(_) => "content",
+            QueryType::Concept(_) => "concept",
+            QueryType::Fallthrough(_) => "fallthrough",
+            _ => return result,
+        }
+    };
+    let targets = if multi { parts } else { vec![query] };
+    let page = listing::Page::new(offset, limit).map_err(|reason| TilthError::InvalidQuery {
+        query: query.into(),
+        reason,
+    })?;
+    let original_is_error = result.is_err();
+    let base = result
+        .as_ref()
+        .cloned()
+        .unwrap_or_else(|_| format!("# Search: {query:?} — 0 matches"));
+    let out = search::similarity::append(
+        base.clone(),
+        &targets,
+        kind,
+        scopes,
+        None,
+        glob,
+        options,
+        page,
+        budget,
+        false,
+    );
+    if original_is_error && out == base {
+        result
+    } else {
+        Ok(out)
+    }
+}
+
 /// What a caller that refuses a file-valued scope can offer instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileScopeHint {

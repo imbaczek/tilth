@@ -88,6 +88,8 @@ Search scopes accept directories, files, and quoted globs of files or directorie
 
 For symbol/text/regex/callers results, an additional `--glob` filters each resolved scope relative to its directory, or a selected file's parent. File scopes honor ignore rules too. MCP `tilth_search` accepts the same selections in `scope` or `scopes`, with an absolute `root` required for relative scopes. `tilth_list`, deps, grok, map, and MCP startup require directory scopes; diff accepts file or directory scopes.
 
+A complete zero-hit symbol or literal search may show a separately warned list of approximate suggestions when the filtered, deduplicated scope contains at most 20 files and 10,000,000 bytes, inclusive. Do not treat these suggestions as definitions or automatically follow, grok, trace, or expand them. Regex searches do not use this fallback; projections keep exact counts. Similarity defaults to 0.80 normalized OSA. Set CLI `--similarity-threshold`, `--similarity-max-files`, or `--similarity-max-bytes`, or MCP `similarity_threshold`, `similarity_max_files`, or `similarity_max_bytes`, per search. Offset, limit, and budget apply to suggestions. Work-limit exhaustion is reported.
+
 With multiple `--scope` arguments, a relative query that resolves to a file under a directory scope reads the matching file(s); it does not search the other scopes for that query as text. If no scope contains the file, normal search fallback applies.
 
 ```bash

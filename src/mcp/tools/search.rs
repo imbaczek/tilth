@@ -25,6 +25,7 @@ fn search_inner(
     session: &Session,
     bloom: &Arc<BloomFilterCache>,
 ) -> Result<String, String> {
+    let similarity = crate::search::similarity::Options::from_args(args)?;
     if args.get("queries").is_some() || args.get("select").is_some() {
         return projected_search(args, cache, session, true);
     }
@@ -37,6 +38,7 @@ fn search_inner(
         .and_then(|v| v.as_str())
         .map(std::path::Path::new);
     let (scopes, scope_warning) = resolve_scopes(args, root)?;
+    let scope_complete = scope_warning.is_none();
     let kind = args
         .get("kind")
         .and_then(|v| v.as_str())
@@ -106,6 +108,22 @@ fn search_inner(
         .map_err(|e| e.to_string())?;
         let result = format!("{}{output}", scope_warning.unwrap_or_default());
         // A scope warning can itself make a previously complete page exceed budget.
+        let targets: Vec<_> = if kind == "symbol" {
+            query
+                .split(',')
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+                .collect()
+        } else {
+            vec![query]
+        };
+        let result = if scope_complete {
+            crate::search::similarity::append(
+                result, &targets, kind, &scopes, context, glob, similarity, page, budget, true,
+            )
+        } else {
+            result
+        };
         return Ok(crate::search::paging::apply_final_budget(&result, budget));
     }
 
@@ -238,6 +256,23 @@ fn search_inner(
         return Ok(finish_callers_response(&result, budget));
     }
     result.push_str(&output);
+    let targets: Vec<_> = if kind == "symbol" {
+        query
+            .split(',')
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .collect()
+    } else {
+        vec![query]
+    };
+    let page = crate::listing::Page::new(offset, limit)?;
+    let result = if scope_complete {
+        crate::search::similarity::append(
+            result, &targets, kind, &scopes, context, glob, similarity, page, budget, true,
+        )
+    } else {
+        result
+    };
     Ok(apply_budget(&result, budget))
 }
 
@@ -291,6 +326,7 @@ pub(in crate::mcp) fn projected_search(
         .and_then(Value::as_str)
         .map(std::path::Path::new);
     let (scopes, warning) = resolve_scopes(args, root)?;
+    let similarity = crate::search::similarity::Options::from_args(args)?;
     let kind = args.get("kind").and_then(Value::as_str).unwrap_or("symbol");
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let page = crate::listing::Page::new(
@@ -318,6 +354,23 @@ pub(in crate::mcp) fn projected_search(
         cache,
     )
     .map_err(|e| e.to_string())?;
+    let output = if warning.is_none() {
+        let targets: Vec<_> = queries.iter().map(String::as_str).collect();
+        crate::search::similarity::append(
+            output,
+            &targets,
+            kind,
+            &scopes,
+            context,
+            args.get("glob").and_then(Value::as_str),
+            similarity,
+            page,
+            budget,
+            mcp_navigation,
+        )
+    } else {
+        output
+    };
     Ok(crate::listing::finish(
         &format!("{}{output}", warning.unwrap_or_default()),
         budget,
@@ -1802,5 +1855,142 @@ mod projection_tests {
             run(serde_json::json!({"queries":["alpha","beta"],"select":"definitions","budget":50}))
                 .unwrap();
         assert!(!out.contains("> Next page:"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod similarity_integration_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn search(args: Value) -> Result<String, String> {
+        tool_search(
+            &args,
+            &OutlineCache::new(),
+            &Session::new(),
+            &Arc::new(BloomFilterCache::new()),
+        )
+    }
+    fn fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn search_collected() {}\nfn caller() { search_collected(); }\n// the little brown fox sleeps\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn zero_hit_symbol_pages_are_warned_and_ranked() {
+        let dir = fixture();
+        let args = json!({"root":dir.path(), "query":"serach_collected", "expand":5, "offset":0, "limit":1});
+        let first = search(args.clone()).unwrap();
+        assert!(
+            first.contains("WARNING: No exact matches") && first.contains("similarity 0.938"),
+            "{first}"
+        );
+        assert!(
+            first.contains("suggestions 1-1 of 2") && first.contains("Next page"),
+            "{first}"
+        );
+        assert!(
+            !first.contains("-- calls --") && !first.contains("-- siblings --"),
+            "{first}"
+        );
+        let mut next = args.clone();
+        next["offset"] = json!(1);
+        let second = search(next).unwrap();
+        assert!(second.contains("suggestions 2-2 of 2"), "{second}");
+        assert!(
+            first.contains("a.rs:1") && second.contains("a.rs:2"),
+            "{first}\n{second}"
+        );
+        let mut high = args;
+        high["similarity_threshold"] = json!(0.99);
+        assert!(!search(high).unwrap().contains("Similar suggestions"));
+    }
+
+    #[test]
+    fn exact_in_any_scope_and_empty_exact_page_suppress_suggestions() {
+        let dir = fixture();
+        let second = tempfile::tempdir().unwrap();
+        std::fs::write(second.path().join("b.rs"), "fn serach_collected() {}\n").unwrap();
+        let out = search(json!({"root":dir.path(), "scopes":[dir.path(), second.path()], "query":"serach_collected", "offset":100, "limit":1})).unwrap();
+        assert!(!out.contains("Similar suggestions"), "{out}");
+        assert!(out.contains("0 of") || out.contains("matches 0"), "{out}");
+    }
+
+    #[test]
+    fn literal_regex_projections_and_batches_keep_their_semantics() {
+        let dir = fixture();
+        let content =
+            search(json!({"root":dir.path(), "query":"little brown box", "kind":"content"}))
+                .unwrap();
+        assert!(
+            content.contains("WARNING: No exact matches") && content.contains("little brown fox"),
+            "{content}"
+        );
+        for kind in ["regex", "content"] {
+            let regex =
+                search(json!({"root":dir.path(), "query":"/serach_collecte./", "kind":kind}))
+                    .unwrap();
+            assert!(!regex.contains("Similar suggestions"), "{regex}");
+        }
+        let projection =
+            search(json!({"root":dir.path(), "query":"serach_collected", "select":"count"}))
+                .unwrap();
+        assert!(
+            projection.contains("0 matches") && projection.contains("WARNING: No exact matches"),
+            "{projection}"
+        );
+        let batch = search(json!({"root":dir.path(), "queries":["search_collected","serach_collected"], "expand":0})).unwrap();
+        assert_eq!(batch.matches("# Similar suggestions").count(), 1, "{batch}");
+        assert!(
+            batch.contains("# Similar suggestions for \"serach_collected\""),
+            "{batch}"
+        );
+    }
+
+    #[test]
+    fn binary_files_do_not_hide_text_suggestions() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("image.png"), [137, 80, 78, 71, 255, 0]).unwrap();
+        let out = search(json!({"root":dir.path(),"query":"serach_collected"})).unwrap();
+        assert!(
+            out.contains("Similar suggestions") && out.contains("search_collected"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn per_call_limits_and_partial_scope_errors_do_not_leak_suggestions() {
+        let dir = fixture();
+        std::fs::write(dir.path().join("b.txt"), "extra\n").unwrap();
+        let strict =
+            search(json!({"root":dir.path(),"query":"serach_collected","similarity_max_files":1}))
+                .unwrap();
+        assert!(!strict.contains("Similar suggestions"), "{strict}");
+        let relaxed =
+            search(json!({"root":dir.path(),"query":"serach_collected","similarity_max_files":2}))
+                .unwrap();
+        assert!(relaxed.contains("Similar suggestions"), "{relaxed}");
+        let too_small =
+            search(json!({"root":dir.path(),"query":"serach_collected","similarity_max_bytes":1}))
+                .unwrap();
+        assert!(!too_small.contains("Similar suggestions"), "{too_small}");
+        let enough = search(
+            json!({"root":dir.path(),"query":"serach_collected","similarity_max_bytes":1000}),
+        )
+        .unwrap();
+        assert!(enough.contains("Similar suggestions"), "{enough}");
+        let filtered = search(json!({"root":dir.path(),"query":"serach_collected","glob":"*.rs","similarity_max_files":1})).unwrap();
+        assert!(filtered.contains("Similar suggestions"), "{filtered}");
+        let partial = search(
+            json!({"root":dir.path(),"scopes":[dir.path(),dir.path().join("missing")],"query":"serach_collected"}),
+        );
+        if let Ok(out) = partial {
+            assert!(!out.contains("Similar suggestions"), "{out}");
+        }
+        assert!(
+            search(json!({"root":dir.path(),"query":"anything","similarity_threshold":1.2}))
+                .is_err()
+        );
     }
 }

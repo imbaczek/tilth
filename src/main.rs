@@ -114,6 +114,18 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
+    /// Minimum normalized similarity for zero-hit narrow searches (default 0.80).
+    #[arg(long)]
+    similarity_threshold: Option<f64>,
+
+    /// Maximum number of files eligible for similar suggestions (default 20, inclusive).
+    #[arg(long)]
+    similarity_max_files: Option<std::num::NonZeroUsize>,
+
+    /// Maximum total file bytes eligible for similar suggestions (default 10000000, inclusive).
+    #[arg(long)]
+    similarity_max_bytes: Option<std::num::NonZeroU64>,
+
     /// Skip N entries in the selected view (zero-based): search matches, files, declarations, or lines.
     #[arg(long)]
     offset: Option<usize>,
@@ -150,6 +162,9 @@ impl SearchOptions {
         self.json |= options.json;
         self.expand = options.expand.or(self.expand);
         self.glob = options.glob.or(self.glob.take());
+        self.similarity_threshold = options.similarity_threshold.or(self.similarity_threshold);
+        self.similarity_max_files = options.similarity_max_files.or(self.similarity_max_files);
+        self.similarity_max_bytes = options.similarity_max_bytes.or(self.similarity_max_bytes);
         self.offset = options.offset.or(self.offset);
         self.limit = options.limit.or(self.limit);
         self.callers |= options.callers;
@@ -157,7 +172,30 @@ impl SearchOptions {
         self.map |= options.map;
     }
 
+    fn similarity_args(&self) -> serde_json::Value {
+        let mut args = serde_json::json!({});
+        if let Some(value) = self.similarity_threshold {
+            args["similarity_threshold"] = value.into();
+        }
+        if let Some(value) = self.similarity_max_files {
+            args["similarity_max_files"] = value.get().into();
+        }
+        if let Some(value) = self.similarity_max_bytes {
+            args["similarity_max_bytes"] = value.get().into();
+        }
+        args
+    }
+
     fn validate(&self, edit: bool) -> Result<(), clap::Error> {
+        if self
+            .similarity_threshold
+            .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))
+        {
+            return Err(clap::Error::raw(
+                clap::error::ErrorKind::ValueValidation,
+                "--similarity-threshold must be between 0 and 1",
+            ));
+        }
         let compact = !self.queries.is_empty() || self.select.is_some() || self.kind.is_some();
         let conflict = if compact
             && (self.deps || self.map || self.callers || self.section.is_some() || edit)
@@ -747,6 +785,9 @@ fn main() {
         }
         let root = std::env::current_dir().expect("current directory");
         let mut args = serde_json::json!({"root":root,"kind":cli.search.kind.as_deref().unwrap_or("symbol"),"full":cli.search.full});
+        for (key, value) in cli.search.similarity_args().as_object().unwrap() {
+            args[key] = value.clone();
+        }
         if cli.search.queries.is_empty() {
             let query = cli
                 .query
@@ -921,6 +962,18 @@ fn main() {
         )),
     );
 
+    let result = tilth::append_cli_similarity(
+        result,
+        &query,
+        &scopes,
+        cli.search.glob.as_deref(),
+        &cli.search.similarity_args(),
+        cli.search.offset.unwrap_or(0),
+        cli.search
+            .limit
+            .map_or(if cli.search.full { 100 } else { 10 }, |v| v.get()),
+        cli.search.budget,
+    );
     emit_result(result, &query, cli.search.json, is_tty, cli.search.budget);
 }
 

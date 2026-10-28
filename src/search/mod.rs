@@ -12,6 +12,7 @@ pub(crate) mod paging;
 pub(crate) mod projection;
 pub mod rank;
 pub mod siblings;
+pub(crate) mod similarity;
 pub mod strip;
 pub mod symbol;
 pub(crate) mod trace;
