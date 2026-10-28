@@ -962,12 +962,15 @@ fn main() {
         )),
     );
 
+    let mut similarity_args = cli.search.similarity_args();
+    similarity_args["_similarity_page_requested"] =
+        serde_json::json!(cli.search.offset.is_some() || cli.search.limit.is_some());
     let result = tilth::append_cli_similarity(
         result,
         &query,
         &scopes,
         cli.search.glob.as_deref(),
-        &cli.search.similarity_args(),
+        &similarity_args,
         cli.search.offset.unwrap_or(0),
         cli.search
             .limit

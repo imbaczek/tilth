@@ -400,7 +400,7 @@ fn best_substring(
     Ok(best.map(|(start, end, score)| (chars[start..end].iter().collect(), score)))
 }
 
-/// Return a warning plus a stable page, or `None` if no suggestion is useful.
+/// Return a stable page of suggestions or a scan notice, or `None` if no suggestion is useful.
 /// A work cap is reported rather than treating a partial scan as complete.
 fn suggest(
     query: &str,
@@ -567,7 +567,7 @@ fn suggest(
             ),
         })
         .collect();
-    let mut header = format!("# Similar suggestions for {query:?}\n> WARNING: No exact matches. These are approximate suggestions, not verified matches; do not follow, grok, or trace them.");
+    let mut header = format!("# Similar suggestions for {query:?}");
     for notice in notices {
         header.push_str("\n> ");
         header.push_str(notice);
@@ -577,6 +577,49 @@ fn suggest(
     } else {
         Some(page.render(&header, &rows, "suggestions", mcp))
     }
+}
+
+/// Remove a footer only when the caller knows the base formatter emitted it.
+fn strip_generated_token_footer(output: &mut String) {
+    let Some((body, suffix)) = output.rsplit_once("\n\n(") else {
+        return;
+    };
+    let expected = format!(
+        "{} tokens)",
+        super::format_token_count(crate::types::estimate_tokens(body.len() as u64))
+    );
+    if suffix == expected {
+        output.truncate(body.len());
+    }
+}
+
+/// Budget the complete response before measuring it. Omit the footer if it
+/// cannot fit, and enforce the limit even for very small budgets.
+fn finish_with_token_footer(output: &str, budget: Option<u64>) -> String {
+    let limit = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+    let footer = |body: &str| {
+        format!(
+            "\n\n({} tokens)",
+            super::format_token_count(crate::types::estimate_tokens(body.len() as u64))
+        )
+    };
+    let initial_footer = footer(output);
+    if crate::types::estimate_tokens((output.len() + initial_footer.len()) as u64) <= limit {
+        return format!("{output}{initial_footer}");
+    }
+    let reserve = crate::types::estimate_tokens(initial_footer.len() as u64).saturating_add(1);
+    let body =
+        crate::listing::finish_with_reported_budget(output, limit.saturating_sub(reserve), limit);
+    let final_footer = footer(&body);
+    if crate::types::estimate_tokens((body.len() + final_footer.len()) as u64) <= limit {
+        return format!("{body}{final_footer}");
+    }
+    let max_bytes = usize::try_from(limit.saturating_mul(4)).unwrap_or(usize::MAX);
+    let mut end = max_bytes.min(body.len());
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    body[..end].to_string()
 }
 
 /// Append suggestions only when the complete exact result for that query is zero.
@@ -593,6 +636,7 @@ pub(crate) fn append(
     page: Page,
     budget: Option<u64>,
     mcp: bool,
+    base_has_token_footer: bool,
 ) -> String {
     if !matches!(kind, "symbol" | "content" | "concept" | "fallthrough") {
         return base;
@@ -666,13 +710,16 @@ pub(crate) fn append(
             page,
             mcp,
         ) {
+            if !appended && base_has_token_footer {
+                strip_generated_token_footer(&mut output);
+            }
             output.push_str("\n\n---\n\n");
             output.push_str(&suggestions);
             appended = true;
         }
     }
     if appended {
-        crate::listing::finish(&output, budget)
+        finish_with_token_footer(&output, budget)
     } else {
         output
     }
@@ -681,6 +728,38 @@ pub(crate) fn append(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn similarity_footer_respects_small_budgets_and_utf8() {
+        let output = format!(
+            "# Search: résumé\n\n{}\n> Next page: offset=1",
+            "é".repeat(200)
+        );
+        for limit in [0, 1, 5, 15, 20, 30, 40, 60, 120] {
+            let result = finish_with_token_footer(&output, Some(limit));
+            assert!(
+                crate::types::estimate_tokens(result.len() as u64) <= limit,
+                "budget {limit}: {result}"
+            );
+            if crate::types::estimate_tokens(output.len() as u64) > limit {
+                assert!(!result.contains("> Next page:"), "budget {limit}: {result}");
+            }
+            if let Some((_, diagnostic)) = result.rsplit_once("budget: ") {
+                let digits: String = diagnostic
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if !digits.is_empty() {
+                    assert_eq!(digits.parse::<u64>().unwrap(), limit);
+                }
+            }
+        }
+        let limit = crate::types::estimate_tokens(output.len() as u64);
+        let result = finish_with_token_footer(&output, Some(limit));
+        assert!(result.ends_with(" tokens)"), "{result}");
+        assert!(!result.contains("> Next page:"));
+        assert!(crate::types::estimate_tokens(result.len() as u64) <= limit);
+    }
 
     #[test]
     fn osa_and_literal_substrings_handle_transposition_and_length_changes() {

@@ -49,7 +49,7 @@ fn directory_queries_and_read_share_stable_pages() {
         let mut second_args = prefix.clone();
         second_args.extend(["--limit", "30", "--offset", "30"]);
         let second = success(root.path(), &second_args);
-        assert!(second.contains("31-57 of 57") && second.contains("End of listing."));
+        assert!(second.contains("31-57 of 57") && !second.contains("Next page:"));
         for i in 0..57 {
             let name = format!("  entry{i:03}.txt ");
             assert_eq!(
@@ -163,7 +163,7 @@ fn directory_listing_counts_subdirectories_and_symlinks_as_entries() {
     {
         let out = success(root.path(), &[".", "--offset", "2", "--limit", "1"]);
         assert!(
-            out.contains("  c_link →") && out.contains("End of listing."),
+            out.contains("  c_link →") && !out.contains("Next page:"),
             "{out}"
         );
     }
@@ -178,7 +178,7 @@ fn empty_listing_and_extreme_offset_have_clear_terminal_pages() {
         args.extend(["--offset", &offset, "--limit", "1"]);
         let out = success(root.path(), &args);
         assert!(
-            out.contains("Showing items 0 of 0") && out.contains("End of listing."),
+            out.contains("Showing items 0 of 0") && !out.contains("Next page:"),
             "{out}"
         );
         assert!(!out.contains("Next page:"), "{out}");

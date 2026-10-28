@@ -30,7 +30,7 @@ fn single_search_defaults_threshold_and_pages() {
         &["serach_collected", "--scope", "a.rs", "--limit", "1"],
     );
     assert!(
-        first.contains("WARNING: No exact matches") && first.contains("suggestions 1-1 of 2"),
+        first.contains("# Similar suggestions") && first.contains("suggestions 1-1 of 2"),
         "{first}"
     );
     let second = output(
@@ -76,7 +76,7 @@ fn compact_and_literal_modes_use_the_same_limits() {
     let dir = fixture();
     let literal = output(dir.path(), &["little brown box", "--kind", "content"]);
     assert!(
-        literal.contains("little brown fox") && literal.contains("WARNING: No exact matches"),
+        literal.contains("little brown fox") && literal.contains("# Similar suggestions"),
         "{literal}"
     );
     std::fs::write(dir.path().join("b.txt"), "extra\n").unwrap();
@@ -130,7 +130,7 @@ fn similar_filenames_work_in_large_scopes_without_previewing_files() {
         args.extend_from_slice(extra);
         let out = output(dir.path(), &args);
         assert!(
-            out.contains("WARNING: No exact matches")
+            out.contains("# Similar suggestions")
                 && out.contains("[filename]")
                 && out.contains("catalog_digest.py"),
             "{out}"
@@ -231,4 +231,56 @@ fn exact_filename_stem_suppresses_fuzzy_suggestions_per_query() {
         &["--query", "catalog_export", "--kind", "symbol"],
     );
     assert!(!binary.contains("Similar suggestions"), "{binary}");
+}
+
+fn assert_final_token_summary(output: &str) {
+    let output = output.trim_end_matches('\n');
+    let (body, footer) = output.rsplit_once("\n\n(").expect("final token summary");
+    let count = body.len().div_ceil(4);
+    let expected = if count >= 1000 {
+        format!("~{}.{}k tokens)", count / 1000, (count % 1000) / 100)
+    } else {
+        format!("~{count} tokens)")
+    };
+    assert_eq!(footer, expected, "{output}");
+}
+
+#[test]
+fn token_summary_follows_all_suggestions_in_normal_paged_and_batch_searches() {
+    let dir = fixture();
+    for args in [
+        vec!["serach_collected"],
+        vec!["serach_collected", "--limit", "1"],
+        vec!["--query", "search_collected", "--query", "serach_collected"],
+        vec!["serach_collected", "--budget", "60"],
+    ] {
+        let out = output(dir.path(), &args);
+        assert_final_token_summary(&out);
+        assert!(!out.contains("End of listing."), "{out}");
+        let body = out.rsplit_once("\n\n(").unwrap().0;
+        assert!(!body.contains("\n\n(~"), "{out}");
+        if out.contains("Page or navigation omitted") {
+            assert!(!out.contains("Next page:"), "{out}");
+        }
+    }
+}
+
+#[test]
+fn token_summary_counts_unicode_bytes_and_preserves_footer_shaped_source() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("résumé.rs"),
+        "fn exact_symbol() {} // (~9 tokens)\nfn search_collected() {}\n",
+    )
+    .unwrap();
+    let out = output(
+        dir.path(),
+        &["--query", "exact_symbol", "--query", "serach_collected"],
+    );
+    assert!(out.contains("(~9 tokens)"), "{out}");
+    assert!(
+        out.contains("résumé.rs") && out.contains("Similar suggestions"),
+        "{out}"
+    );
+    assert_final_token_summary(&out);
 }

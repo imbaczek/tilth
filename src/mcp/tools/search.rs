@@ -120,6 +120,7 @@ fn search_inner(
         let result = if scope_complete {
             crate::search::similarity::append(
                 result, &targets, kind, &scopes, context, glob, similarity, page, budget, true,
+                false,
             )
         } else {
             result
@@ -268,7 +269,17 @@ fn search_inner(
     let page = crate::listing::Page::new(offset, limit)?;
     let result = if scope_complete {
         crate::search::similarity::append(
-            result, &targets, kind, &scopes, context, glob, similarity, page, budget, true,
+            result,
+            &targets,
+            kind,
+            &scopes,
+            context,
+            glob,
+            similarity,
+            page,
+            budget,
+            true,
+            targets.len() == 1,
         )
     } else {
         result
@@ -367,6 +378,7 @@ pub(in crate::mcp) fn projected_search(
             page,
             budget,
             mcp_navigation,
+            false,
         )
     } else {
         output
@@ -1642,7 +1654,7 @@ mod ranked_pagination_tests {
                     assert!(!output.contains("--offset"), "{output}");
                     assert!(output.contains(&format!(r#""kind":"{kind}""#)), "{output}");
                 } else {
-                    assert!(output.contains("End of listing."), "{output}");
+                    assert!(!output.contains("Next page:"), "{output}");
                 }
                 assert!(!output.contains("ignored"), "{output}");
                 pages.push(output);
@@ -1878,12 +1890,15 @@ mod similarity_integration_tests {
     }
 
     #[test]
-    fn zero_hit_symbol_pages_are_warned_and_ranked() {
+    fn zero_hit_symbol_pages_are_labeled_and_ranked() {
         let dir = fixture();
         let args = json!({"root":dir.path(), "query":"serach_collected", "expand":5, "offset":0, "limit":1});
         let first = search(args.clone()).unwrap();
         assert!(
-            first.contains("WARNING: No exact matches") && first.contains("similarity 0.938"),
+            first.contains("# Similar suggestions")
+                && !first.contains("WARNING:")
+                && !first.contains("do not follow")
+                && first.contains("similarity 0.938"),
             "{first}"
         );
         assert!(
@@ -1924,7 +1939,7 @@ mod similarity_integration_tests {
             search(json!({"root":dir.path(), "query":"little brown box", "kind":"content"}))
                 .unwrap();
         assert!(
-            content.contains("WARNING: No exact matches") && content.contains("little brown fox"),
+            content.contains("# Similar suggestions") && content.contains("little brown fox"),
             "{content}"
         );
         for kind in ["regex", "content"] {
@@ -1937,7 +1952,7 @@ mod similarity_integration_tests {
             search(json!({"root":dir.path(), "query":"serach_collected", "select":"count"}))
                 .unwrap();
         assert!(
-            projection.contains("0 matches") && projection.contains("WARNING: No exact matches"),
+            projection.contains("0 matches") && projection.contains("# Similar suggestions"),
             "{projection}"
         );
         let batch = search(json!({"root":dir.path(), "queries":["search_collected","serach_collected"], "expand":0})).unwrap();
@@ -2031,5 +2046,55 @@ mod filename_similarity_tests {
         );
         let regex = search(json!({"root":dir.path(), "query":"catalog_digests", "kind":"regex"}));
         assert!(!regex.contains("[filename]"), "{regex}");
+    }
+}
+
+#[cfg(test)]
+mod similarity_footer_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn assert_footer(output: &str) {
+        let (body, footer) = output.rsplit_once("\n\n(").expect("final token summary");
+        let expected =
+            crate::search::format_token_count(crate::types::estimate_tokens(body.len() as u64));
+        assert_eq!(footer, format!("{expected} tokens)"), "{output}");
+        assert!(!body.contains("\n\n(~"), "{output}");
+    }
+
+    #[test]
+    fn mcp_summary_covers_similarity_pages_and_projections() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "fn search_collected() {}\nfn caller() { search_collected(); }\n",
+        )
+        .unwrap();
+        let run = |extra: Value| {
+            let mut args = json!({"root":dir.path(),"query":"serach_collected"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            tool_search(
+                &args,
+                &OutlineCache::new(),
+                &Session::new(),
+                &Arc::new(BloomFilterCache::new()),
+            )
+            .unwrap()
+        };
+        for extra in [
+            json!({}),
+            json!({"offset":0,"limit":1}),
+            json!({"select":"count"}),
+            json!({"budget":60}),
+        ] {
+            let output = run(extra);
+            assert_footer(&output);
+            assert!(!output.contains("End of listing."), "{output}");
+            if output.contains("Page or navigation omitted") {
+                assert!(!output.contains("Next page:"), "{output}");
+            }
+        }
     }
 }

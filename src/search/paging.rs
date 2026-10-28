@@ -311,7 +311,7 @@ mod tests {
         .unwrap();
         assert!(output.contains("Source expansion omitted"), "{output}");
         assert!(
-            output.contains("one.rs:") && output.contains("End of listing."),
+            output.contains("one.rs:") && !output.contains("Next page:"),
             "{output}"
         );
         assert!(!output.contains("Page or navigation omitted"), "{output}");

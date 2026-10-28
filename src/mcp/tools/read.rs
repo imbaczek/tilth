@@ -941,7 +941,7 @@ mod tests {
         assert!(first.contains("file049.txt") && !first.contains("file050.txt"));
         let second =
             run(serde_json::json!({"path":project.path(), "offset":50, "limit":5})).unwrap();
-        assert!(second.contains("51-55 of 55") && second.contains("End of listing."));
+        assert!(second.contains("51-55 of 55") && !second.contains("Next page:"));
         for i in 0..55 {
             let name = format!("  file{i:03}.txt ");
             assert_eq!(
@@ -1245,7 +1245,7 @@ mod markdown_pagination_tests {
         assert!(first.contains("Requested headings 1-2 of 4"), "{first}");
         assert!(first.contains(r#""offset":2"#), "{first}");
         assert!(second.contains("1.2") && second.contains("1.3"), "{second}");
-        assert!(second.contains("End of listing."), "{second}");
+        assert!(!second.contains("Next page:"), "{second}");
         let selected = tool_read(
             &serde_json::json!({"path":path,"section":"toc:1.2"}),
             &cache,

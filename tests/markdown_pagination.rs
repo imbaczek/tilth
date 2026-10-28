@@ -90,7 +90,7 @@ fn markdown_pages_are_disjoint_with_global_addresses() {
             second.contains("Requested headings 81-145 of 145"),
             "{second}"
         );
-        assert!(second.contains("End of listing."), "{second}");
+        assert!(!second.contains("Next page:"), "{second}");
         let second_rows = rows(&second);
         assert_eq!(second_rows[0][1], "1.80");
         let selected = success(

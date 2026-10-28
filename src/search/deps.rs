@@ -101,9 +101,7 @@ pub(crate) fn format_deps_page(
     } else {
         let output = output
             .lines()
-            .filter(|line| {
-                !line.starts_with("> Next page:") && !line.starts_with("> End of listing.")
-            })
+            .filter(|line| !line.starts_with("> Next page:"))
             .collect::<Vec<_>>()
             .join("\n");
         format!("{output}\n\n> Dependency analysis is incomplete; counts are lower bounds and continuation is unavailable.")

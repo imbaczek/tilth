@@ -104,8 +104,6 @@ impl Page {
                     self.limit
                 );
             }
-        } else {
-            out.push_str("\n> End of listing.");
         }
     }
 }
@@ -114,15 +112,58 @@ impl Page {
 /// including an earlier page in a batch or combined scope response.
 pub(crate) fn finish(output: &str, budget: Option<u64>) -> String {
     let budget = budget.unwrap_or(crate::budget::DEFAULT_BUDGET);
+    finish_with_reported_budget(output, budget, budget)
+}
+
+pub(crate) fn finish_with_reported_budget(
+    output: &str,
+    budget: u64,
+    reported_budget: u64,
+) -> String {
     if crate::types::estimate_tokens(output.len() as u64) <= budget {
         return output.into();
     }
     let safe = output
         .lines()
-        .filter(|line| !line.starts_with("> Next page:") && !line.starts_with("> End of listing."))
+        .filter(|line| !line.starts_with("> Next page:"))
         .collect::<Vec<_>>()
         .join("\n");
-    crate::budget::apply(&format!(
+    crate::budget::apply_with_reported_budget(&format!(
         "> Page or navigation omitted to fit budget; retry the same offset with a smaller limit or a larger budget.\n\n{safe}"
-    ), budget)
+    ), budget, reported_budget)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_pages_omit_marker_but_keep_continuations_when_needed() {
+        let entries = vec!["first".to_string(), "second".to_string()];
+        let first = Page::new(0, 1)
+            .unwrap()
+            .render("# Test", &entries, "items", true);
+        let last = Page::new(1, 1)
+            .unwrap()
+            .render("# Test", &entries, "items", true);
+        assert!(first.contains("Next page:"), "{first}");
+        assert!(
+            !last.contains("Next page:") && !last.contains("End of listing."),
+            "{last}"
+        );
+        assert!(last.contains("Showing items 2-2 of 2"), "{last}");
+    }
+
+    #[test]
+    fn budgeted_output_keeps_literal_end_marker_text() {
+        let source = format!(
+            "# File\n> End of listing. literal source\n\n{}",
+            "line\n".repeat(500)
+        );
+        let output = finish(&source, Some(150));
+        assert!(
+            output.contains("> End of listing. literal source"),
+            "{output}"
+        );
+    }
 }

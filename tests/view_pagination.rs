@@ -64,7 +64,7 @@ fn cli_glob_and_map_cover_all_files_in_stable_pages() {
         args.extend(["--offset", &offset, "--limit", "1"]);
         let beyond = run(root.path(), &args);
         assert!(
-            beyond.contains("files 0 of 63") && beyond.contains("End of listing."),
+            beyond.contains("files 0 of 63") && !beyond.contains("Next page:"),
             "{beyond}"
         );
         let mut args = prefix;
@@ -223,7 +223,7 @@ fn cli_source_stripped_and_section_pages_preserve_original_addresses() {
         ],
     );
     assert!(
-        empty.contains("source lines 0 of 6") && empty.contains("End of listing."),
+        empty.contains("source lines 0 of 6") && !empty.contains("Next page:"),
         "{empty}"
     );
 }
@@ -415,7 +415,7 @@ fn diff_pages_use_files_then_symbol_blocks_and_filter_before_slicing() {
         ],
     );
     assert!(
-        empty.contains("files 0 of 0") && empty.contains("End of listing."),
+        empty.contains("files 0 of 0") && !empty.contains("Next page:"),
         "{empty}"
     );
 }

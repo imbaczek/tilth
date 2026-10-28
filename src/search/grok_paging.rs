@@ -310,8 +310,6 @@ fn format_page(
         } else {
             let _=write!(output,"\n> Next page: --section {} --offset {end} --limit {} (keep target, scope and source unchanged).",section.name(),page.limit);
         }
-    } else {
-        output.push_str("\n> End of listing.");
     }
     crate::listing::finish(&output, budget)
 }

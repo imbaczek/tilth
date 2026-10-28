@@ -150,6 +150,12 @@ pub fn append_cli_similarity(
         page,
         budget,
         false,
+        !original_is_error
+            && !multi
+            && !args
+                .get("_similarity_page_requested")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
     );
     if original_is_error && out == base {
         result

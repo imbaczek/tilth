@@ -10,6 +10,14 @@ pub const DEFAULT_BUDGET: u64 = 24_000;
 /// 2. Truncate content at section boundaries to avoid broken output
 /// 3. Never exceed the budget
 pub fn apply(output: &str, budget: u64) -> String {
+    apply_with_reported_budget(output, budget, budget)
+}
+
+pub(crate) fn apply_with_reported_budget(
+    output: &str,
+    budget: u64,
+    reported_budget: u64,
+) -> String {
     if estimate_tokens(output.len() as u64) > budget {
         if let Some(outline) = apply_outline(output, budget) {
             return outline;
@@ -139,10 +147,12 @@ pub fn apply(output: &str, budget: u64) -> String {
         let total = prior_tokens.saturating_add(estimate_tokens(
             omitted_bytes.saturating_sub(diagnostic_bytes) as u64,
         ));
-        format!("{header}{clean_body}\n\n... total omitted: {total} tokens (budget: {budget})")
+        format!(
+            "{header}{clean_body}\n\n... total omitted: {total} tokens (budget: {reported_budget})"
+        )
     } else {
         format!(
-            "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {budget})"
+            "{header}{clean_body}\n\n... truncated ({remaining_tokens} tokens omitted, budget: {reported_budget})"
         )
     }
 }

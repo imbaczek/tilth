@@ -110,7 +110,7 @@ fn cli_pages_cover_each_section_beyond_old_caps_without_overlap() {
                 "{section}: {label}"
             );
         }
-        assert!(pages.last().unwrap().contains("End of listing."));
+        assert!(!pages.last().unwrap().contains("Next page:"));
         let default = run(
             root.path(),
             &["grok", "target.rs:1", "--section", section, "--full"],
@@ -150,7 +150,7 @@ fn cli_pages_cover_each_section_beyond_old_caps_without_overlap() {
         );
         assert!(
             beyond.contains(&format!("Showing {section} 0 of {}", total(section)))
-                && beyond.contains("End of listing."),
+                && !beyond.contains("Next page:"),
             "{beyond}"
         );
         let tight = run(
@@ -420,7 +420,7 @@ fn qualified_same_line_methods_keep_their_owner_across_sections_and_continuation
             first.contains(labels[0]) && second.contains(labels[1]),
             "{first}\n{second}"
         );
-        assert!(second.contains("End of listing."));
+        assert!(!second.contains("Next page:"));
     }
 }
 
@@ -432,7 +432,7 @@ fn empty_sections_and_large_explicit_budgets_have_valid_terminal_pages() {
     for section in ["callers", "callees", "siblings", "tests"] {
         let page=client.tool(json!({"root":root.path(),"target":"target.rs:1","section":section,"offset":usize::MAX,"limit":1}));
         assert!(
-            page.contains(&format!("Showing {section} 0 of 0")) && page.contains("End of listing."),
+            page.contains(&format!("Showing {section} 0 of 0")) && !page.contains("Next page:"),
             "{page}"
         );
     }
@@ -452,8 +452,7 @@ fn empty_sections_and_large_explicit_budgets_have_valid_terminal_pages() {
         page.len()
     );
     assert!(
-        page.contains("a_long_distinct_caller_function_name_1999")
-            && page.contains("End of listing."),
+        page.contains("a_long_distinct_caller_function_name_1999") && !page.contains("Next page:"),
         "{page}"
     );
     assert!(!page.contains("Page or navigation omitted"));
@@ -482,7 +481,7 @@ fn sibling_pages_preserve_same_line_source_order_and_full_nested_owner() {
             .extend(next.as_object().unwrap().clone());
         let second = client.tool(args);
         assert!(
-            second.contains(labels[1]) && second.contains("End of listing."),
+            second.contains(labels[1]) && !second.contains("Next page:"),
             "{second}"
         );
     }

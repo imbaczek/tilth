@@ -152,9 +152,7 @@ pub(crate) fn run(
         if lower_bound {
             body = body
                 .lines()
-                .filter(|line| {
-                    !line.starts_with("> Next page:") && !line.starts_with("> End of listing.")
-                })
+                .filter(|line| !line.starts_with("> Next page:"))
                 .collect::<Vec<_>>()
                 .join("\n");
         }

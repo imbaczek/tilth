@@ -108,7 +108,7 @@ fn cli_concept_cascade_and_multi_symbol_paging_work() {
         ],
     );
     assert!(
-        beyond.contains("Showing matches 0 of 0") && beyond.contains("End of listing."),
+        beyond.contains("Showing matches 0 of 0") && !beyond.contains("Next page:"),
         "{beyond}"
     );
 }

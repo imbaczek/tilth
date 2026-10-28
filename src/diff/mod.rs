@@ -731,9 +731,9 @@ fn diff_inner(
     }
 
     if page.is_some() {
-        let (navigation, body): (Vec<_>, Vec<_>) = output.lines().partition(|line| {
-            line.starts_with("> Next page:") || line.starts_with("> End of listing.")
-        });
+        let (navigation, body): (Vec<_>, Vec<_>) = output
+            .lines()
+            .partition(|line| line.starts_with("> Next page:"));
         output = format!("{}\n{}", body.join("\n"), navigation.join("\n"));
         output = crate::listing::finish(&output, requested_budget);
     }
