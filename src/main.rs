@@ -16,6 +16,7 @@ struct Cli {
 
     /// File path, symbol name, glob pattern, or text to search.
     /// Search multiple terms: tilth "Foo,Bar" --scope src
+    /// Zero-hit symbol searches can show substring counts and ranked identifier suggestions.
     query: Option<String>,
 
     #[command(flatten)]

@@ -1890,6 +1890,30 @@ mod similarity_integration_tests {
     }
 
     #[test]
+    fn substring_summary_works_with_projection_and_budget() {
+        let dir = fixture();
+        let out = search(json!({"root": dir.path(), "query": "search_collect", "select": "count", "similarity_max_files": 1})).unwrap();
+        assert!(
+            out.contains("0 matches")
+                && out.contains("# Substring matches")
+                && out.contains("search_collected  2 matching lines"),
+            "{out}"
+        );
+        let limited =
+            search(json!({"root": dir.path(), "query": "search_collect", "budget": 20})).unwrap();
+        assert!(
+            crate::types::estimate_tokens(limited.len() as u64) <= 20,
+            "{limited}"
+        );
+        let no_substring =
+            search(json!({"root": dir.path(), "query": "unrelated_needle"})).unwrap();
+        assert!(
+            !no_substring.contains("# Substring matches"),
+            "{no_substring}"
+        );
+    }
+
+    #[test]
     fn zero_hit_symbol_pages_are_labeled_and_ranked() {
         let dir = fixture();
         let args = json!({"root":dir.path(), "query":"serach_collected", "expand":5, "offset":0, "limit":1});

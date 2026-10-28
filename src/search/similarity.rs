@@ -622,6 +622,101 @@ fn finish_with_token_footer(output: &str, budget: Option<u64>) -> String {
     body[..end].to_string()
 }
 
+/// Summarize literal substring hits independently of approximate suggestions.
+/// Candidate frequencies count lines, not occurrences, and large result sets use
+/// a deterministic capped sample while retaining the complete search totals.
+fn substring_suggestions(
+    query: &str,
+    scopes: &[PathBuf],
+    context: Option<&Path>,
+    glob: Option<&str>,
+    page: Page,
+    mcp: bool,
+) -> Option<String> {
+    const SAMPLE_LIMIT: usize = 10_000;
+    if query.is_empty()
+        || !query
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    let result = super::paging::collect(
+        query,
+        "content",
+        scopes,
+        context,
+        glob,
+        Page {
+            offset: 0,
+            limit: SAMPLE_LIMIT,
+        },
+    )
+    .ok()?;
+    if result.total_found == 0
+        || !result.scope_errors.is_empty()
+        || !matches!(result.count_estimate, crate::types::CountEstimate::Exact(_))
+    {
+        return None;
+    }
+    let mut frequencies: HashMap<&str, usize> = HashMap::new();
+    for hit in &result.matches {
+        let words: HashSet<_> = hit
+            .text
+            .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+            .filter(|word| word.len() > query.len() && word.contains(query))
+            .collect();
+        for word in words {
+            *frequencies.entry(word).or_default() += 1;
+        }
+    }
+    let max_frequency = frequencies.values().copied().max().unwrap_or(1);
+    let denominator = (max_frequency as f64 + 1.0).ln();
+    let mut candidates: Vec<_> = frequencies
+        .into_iter()
+        .map(|(word, count)| {
+            // For a containing string, edit distance is exactly the extra characters.
+            let similarity = query.chars().count() as f64 / word.chars().count() as f64;
+            let frequency = (count as f64 + 1.0).ln() / denominator;
+            let prefix = if word.starts_with(query) { 1.0 } else { 0.0 };
+            (
+                word,
+                count,
+                0.6 * similarity + 0.3 * frequency + 0.1 * prefix,
+            )
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        b.2.total_cmp(&a.2)
+            .then_with(|| b.1.cmp(&a.1))
+            .then_with(|| a.0.cmp(b.0))
+    });
+    candidates.truncate(3);
+    let sampled = result.matches.len() < result.total_found;
+    let sample_note = if sampled {
+        format!("; candidates sampled from {} lines", result.matches.len())
+    } else {
+        String::new()
+    };
+    let tests = result.facet_totals.tests;
+    let files = result.file_ledger.as_ref().map_or(0, |ledger| ledger.len());
+    let header = format!("# Substring matches for {query:?}: {} matching lines in {files} files ({tests} test-associated, {} other){sample_note}", result.total_found, result.total_found.saturating_sub(tests));
+    let rows: Vec<_> = candidates
+        .into_iter()
+        .map(|(name, count, _)| {
+            format!(
+                "{name}  {count} matching lines{}",
+                if sampled { " in sample" } else { "" }
+            )
+        })
+        .collect();
+    if rows.is_empty() {
+        Some(header)
+    } else {
+        Some(page.render(&header, &rows, "candidates", mcp))
+    }
+}
+
 /// Append suggestions only when the complete exact result for that query is zero.
 /// Raw search APIs and projections stay exact. A second, uncapped exact check
 /// prevents an empty requested page from being mistaken for a zero-hit search.
@@ -655,7 +750,9 @@ pub(crate) fn append(
         if content_files.is_none() {
             (filename_hits, filename_incomplete, exact_name) =
                 filename_suggestions(query, scopes, glob, options);
-            if exact_name || (filename_hits.is_empty() && !filename_incomplete) {
+            if kind != "symbol"
+                && (exact_name || (filename_hits.is_empty() && !filename_incomplete))
+            {
                 continue;
             }
         }
@@ -690,7 +787,7 @@ pub(crate) fn append(
             (filename_hits, filename_incomplete, exact_name) =
                 filename_suggestions(query, scopes, glob, options);
         }
-        if exact_name {
+        if exact_name && kind != "symbol" {
             continue;
         }
         let effective_kind = if kind == "symbol"
@@ -700,16 +797,26 @@ pub(crate) fn append(
         } else {
             "content"
         };
-        if let Some(suggestions) = suggest(
-            query,
-            effective_kind,
-            content_files.as_deref(),
-            options,
-            filename_hits,
-            filename_incomplete,
-            page,
-            mcp,
-        ) {
+        let substring = if kind == "symbol" {
+            substring_suggestions(query, scopes, context, glob, page, mcp)
+        } else {
+            None
+        };
+        let similar = if exact_name {
+            None
+        } else {
+            suggest(
+                query,
+                effective_kind,
+                content_files.as_deref(),
+                options,
+                filename_hits,
+                filename_incomplete,
+                page,
+                mcp,
+            )
+        };
+        for suggestions in [substring, similar].into_iter().flatten() {
             if !appended && base_has_token_footer {
                 strip_generated_token_footer(&mut output);
             }
