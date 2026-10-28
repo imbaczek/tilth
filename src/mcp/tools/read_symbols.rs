@@ -80,7 +80,7 @@ pub(super) fn read(
             declarations.extend(crate::lang::declarations::collect(&path, &parsed));
         } else {
             crate::read::source::mark_incomplete();
-            notices.push(format!("{}: cannot index symbols (missing/unreadable file, unsupported language, or file exceeds 500 KB)",path.display()));
+            notices.push(format!("{}: cannot index symbols (missing/unreadable file, unsupported language, or file exceeds 1 MB)",path.display()));
         }
     }
     let mut summary = String::from("# Symbol reads\n");

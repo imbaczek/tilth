@@ -314,7 +314,7 @@ fn index_sources(
                     .language_issues
                     .entry(lang)
                     .or_default()
-                    .add("source files unreadable, unsupported, or larger than 500 KB");
+                    .add("source files unreadable, unsupported, or larger than 1 MB");
             }
             continue;
         };

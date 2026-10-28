@@ -105,7 +105,7 @@ impl OutlineCache {
     }
 
     /// Parse a code file with tree-sitter and cache the result. Returns
-    /// `None` for non-code files, files larger than the 500 KB cap, or parse
+    /// `None` for non-code files, files larger than the 1 MB cap, or parse
     /// failures.
     ///
     /// Lookup and fill share one `entry()` for the same reason as
@@ -117,7 +117,7 @@ impl OutlineCache {
 
         let meta = std::fs::metadata(path).ok()?;
         let mtime = meta.modified().ok()?;
-        if meta.len() > 500_000 {
+        if meta.len() > crate::types::MAX_SOURCE_FILE_SIZE {
             return None;
         }
 

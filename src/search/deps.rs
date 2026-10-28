@@ -803,7 +803,7 @@ mod tests {
             root.path().join("large.rs"),
             format!(
                 "/* {} */\nfn caller() {{ target(); }}\n",
-                "x".repeat(510_000)
+                "x".repeat(crate::types::MAX_SOURCE_FILE_SIZE as usize)
             ),
         )
         .unwrap();

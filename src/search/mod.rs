@@ -1869,7 +1869,7 @@ fn get_outline_str(path: &std::path::Path, cache: &OutlineCache) -> Option<std::
     }
     let meta = std::fs::metadata(path).ok()?;
     let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-    if meta.len() > 500_000 {
+    if meta.len() > crate::types::MAX_SOURCE_FILE_SIZE {
         return None;
     }
     Some(cache.get_or_compute(path, mtime, || {
@@ -2262,6 +2262,42 @@ pub(crate) fn search_glob_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_size_limit_is_inclusive_for_search_and_cached_parsing() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = OutlineCache::new();
+        for (size, admitted) in [(1_000_000, true), (1_000_001, false)] {
+            let path = root.path().join(format!("source_{size}.rs"));
+            let mut source =
+                String::from("pub fn size_gate_target() {}\nfn caller() { size_gate_target(); }\n");
+            let padding = "// source padding\n";
+            while source.len() + padding.len() <= size {
+                source.push_str(padding);
+            }
+            source.push_str(&" ".repeat(size - source.len()));
+            fs::write(&path, source).unwrap();
+
+            let symbol = symbol::search("size_gate_target", &path, None, None, false).unwrap();
+            let content =
+                content::search("size_gate_target", &path, false, None, None, false).unwrap();
+            assert_eq!(symbol.definitions > 0, admitted, "definition: {size}");
+            assert_eq!(symbol.usages > 0, admitted, "usage: {size}");
+            assert_eq!(content.total_found > 0, admitted, "content: {size}");
+            let regex = content::search("size_gate_.*", &path, true, None, None, false).unwrap();
+            assert_eq!(regex.total_found > 0, admitted, "regex: {size}");
+            assert_eq!(
+                get_outline_str(&path, &cache).is_some(),
+                admitted,
+                "outline: {size}"
+            );
+            assert_eq!(
+                cache.get_or_parse(&path).is_some(),
+                admitted,
+                "cache: {size}"
+            );
+        }
+    }
 
     #[test]
     fn definition_context_keeps_class_when_constructor_has_same_name_and_range() {

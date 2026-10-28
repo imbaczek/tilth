@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 use std::time::SystemTime;
 
+/// Maximum size of a source file admitted to search and cached parsing.
+pub(crate) const MAX_SOURCE_FILE_SIZE: u64 = 1_000_000;
+
 /// What kind of query the user issued.
 #[derive(Debug, Clone)]
 pub enum QueryType {

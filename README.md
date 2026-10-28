@@ -595,7 +595,7 @@ or declarations sharing a line. Ordinary reads use exact declaration spans;
 signature mode shares the complete header extraction used by search projections.
 Symbol reads accept auto/full/signature and a shared budget, but exclude sections,
 slices, paging, and stripped mode. Edit mode requires auto/full and emits complete
-physical lines with hash anchors. Unsupported, unreadable, oversized (over 500 KB),
+physical lines with hash anchors. Unsupported, unreadable, oversized (over 1 MB),
 or partially parsed files report indexing limitations.
 
 Repeat `--slice path:start-end` for up to 20 numeric ranges total. Files retain
@@ -755,7 +755,7 @@ suppress warnings about unrelated files; path-local parse/binding concerns and
 hard work limits remain visible. Completing the requested depth alone is normal
 and does not trigger a warning. The output budget is independent of scan limits:
 100,000 visited directory entries, 2,000 source files, 64 MiB of source, 30,000
-functions, 50,000 call sites, and 500 KB per parsed file. Narrow the scope when a
+functions, 50,000 call sites, and 1 MB per parsed file. Narrow the scope when a
 limit prevents a useful result.
 
 ### Manual trace checks

@@ -61,7 +61,7 @@ or declarations sharing a line. Ordinary reads use exact declaration spans;
 signature mode shares the complete header extraction used by search projections.
 Symbol reads accept auto/full/signature and a shared budget, but exclude sections,
 slices, paging, and stripped mode. Edit mode requires auto/full and emits complete
-physical lines with hash anchors. Unsupported, unreadable, oversized (over 500 KB),
+physical lines with hash anchors. Unsupported, unreadable, oversized (over 1 MB),
 or partially parsed files report indexing limitations.
 
 Repeat `--slice path:start-end` for up to 20 numeric ranges total. Files retain
@@ -171,7 +171,7 @@ Calls are resolved by name with explicit heuristic and completeness notices.
 Missing paths do not prove unreachability. Dispatch, aliases, macros, callbacks,
 parse failures, and unsupported syntax can leave gaps. Work caps are independent
 of output budget: 100,000 directory entries, 2,000 source files, 64 MiB, 30,000
-functions, 50,000 call sites, and 500 KB per parsed file. Narrow scope when a cap
+functions, 50,000 call sites, and 1 MB per parsed file. Narrow scope when a cap
 prevents useful results. Hard caps and path-local concerns remain visible even
 when a clean local path suppresses warnings about unrelated files.
 

@@ -378,7 +378,7 @@ gitignore-style with whitelist, negation (`!`), and brace expansion.
 The biggest production-only file in the subsystem. Three layers stacked:
 
 1. **`search()`** — top-level entry. Walks files via `walker`, parses
-   each via `OutlineCache::get_or_parse` (cap: 500 KB), dispatches to
+   each via `OutlineCache::get_or_parse` (cap: 1 MB), dispatches to
    the right per-language definition extractor, runs a usage scan,
    merges definitions + usages, ranks, facets (when >5 matches), and
    computes `FacetTotals` from the pre-cap merged set. Returns a
@@ -658,7 +658,7 @@ file repeatedly modified will accumulate stale entries until the
 process exits. In practice the working set of active files is small
 enough that this hasn't been a concern.
 
-The 500 KB ceiling on `get_or_parse` keeps tree-sitter parses from
+The 1 MB ceiling on `get_or_parse` keeps tree-sitter parses from
 blowing up memory on generated TypeScript bundles or vendored
 single-file libraries. Above the cap, `get_or_parse` returns `None` and
 callers fall back to text-based heuristics.

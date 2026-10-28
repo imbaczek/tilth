@@ -15,7 +15,7 @@ use grep_searcher::Searcher;
 const MAX_MATCHES: usize = 10;
 const FULL_MAX_MATCHES: usize = 100;
 const COLLECTED_MATCH_FACTOR: usize = 3;
-const MAX_SEARCH_FILE_SIZE: u64 = 500_000;
+const MAX_SEARCH_FILE_SIZE: u64 = crate::types::MAX_SOURCE_FILE_SIZE;
 
 /// Content search using ripgrep crates. Literal by default, regex if `is_regex`.
 pub fn search(
@@ -157,7 +157,7 @@ fn search_capped_with_visited(
                 return ignore::WalkState::Continue;
             };
 
-            // Catch unmarked minified bundles in the 100KB–500KB range.
+            // Catch unmarked minified bundles above the content-check threshold.
             if file_size >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
                 && crate::lang::detection::is_minified_by_content(&bytes)
             {

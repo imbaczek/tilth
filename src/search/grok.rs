@@ -167,7 +167,7 @@ fn resolve_qualified_method(
         if !seen.insert(definition.path.clone()) {
             continue;
         }
-        // Search already bounds candidate files to 500 KB. Qualify before
+        // Search already bounds candidate files to 1 MB. Qualify before
         // enforcing grok's target read cap: unrelated definitions must not
         // abort a valid request when TILTH_FULL_SIZE_CAP is lower than that.
         let Ok(content) = fs::read_to_string(&definition.path) else {

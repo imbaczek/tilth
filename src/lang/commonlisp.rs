@@ -102,7 +102,9 @@ pub(crate) fn has_definition(
                 if !entry.file_type().is_some_and(|kind| kind.is_file())
                     || crate::lang::detect_file_type(entry.path())
                         != crate::types::FileType::Code(crate::types::Lang::CommonLisp)
-                    || entry.metadata().is_ok_and(|meta| meta.len() > 500_000)
+                    || entry
+                        .metadata()
+                        .is_ok_and(|meta| meta.len() > crate::types::MAX_SOURCE_FILE_SIZE)
                 {
                     return ignore::WalkState::Continue;
                 }
