@@ -37,6 +37,7 @@ reads remain supported when the query resolves to a file.
 tilth read src/main.rs --mode signature # declarations with hash anchors
 tilth read src/main.rs --mode stripped  # remove plain comments and debug logs
 tilth read src/main.rs --section 1-20 --section 80-100
+tilth src/main.rs --section 1-20 --section 80-100 # shorthand, one call
 tilth read src/main.rs src/lib.rs --budget 2000 # shared batch budget
 tilth read src/main.rs --edit            # hash anchors for edits
 ```
@@ -44,6 +45,8 @@ tilth read src/main.rs --edit            # hash anchors for edits
 Views are `auto` (default), `full`, `signature`, and `stripped`. `--full` is an alias
 for full content; signature/stripped take precedence. Sections require one file
 and auto/full mode. Batches and disjoint sections are limited to 20 entries.
+For multiple sections of one file, batch them in one read rather than making separate calls.
+In MCP use, for example, `tilth_read(path: "/project/src/main.rs", sections: ["1-20", "80-100"])`.
 
 ### Exact symbol reads and merged file slices
 

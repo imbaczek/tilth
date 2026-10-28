@@ -29,6 +29,7 @@ Small files come back whole. Large files come back as an outline with line range
 
 ```bash
 tilth fastapi/dependencies/utils.py --section 218-232
+tilth fastapi/dependencies/utils.py --section 128-179 --section 218-232
 tilth docs/guide.md --section "Installation"
 tilth docs/guide.md --section "toc:1.2"
 ```

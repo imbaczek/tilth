@@ -123,7 +123,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     "sections": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Multiple ranges from the same file in one call. Each entry is a line range, heading title (optional # prefix), or TOC address (toc:1.2). Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
+                        "description": "Batch multiple ranges from the same file in one call instead of separate reads. Each entry is a line range, heading title (optional # prefix), or TOC address (toc:1.2). Emits each block in user-supplied order, separated by `─── lines X-Y ───` delimiters. Mutually exclusive with `section`. Capped at 20 ranges."
                     },
                     "full": {
                         "type": "boolean",

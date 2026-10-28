@@ -348,10 +348,43 @@ pub fn run_expanded_scopes_with_listing(
     cli_full: bool,
     listing_page: Option<(usize, Option<usize>)>,
 ) -> Result<String, TilthError> {
+    run_expanded_scopes_with_sections(
+        query,
+        scopes,
+        &section.into_iter().collect::<Vec<_>>(),
+        budget_tokens,
+        full,
+        expand,
+        glob,
+        cache,
+        cli_full,
+        listing_page,
+    )
+}
+
+/// Run a query with multiple file sections, in the order requested.
+pub fn run_expanded_scopes_with_sections(
+    query: &str,
+    scopes: &[PathBuf],
+    sections: &[&str],
+    budget_tokens: Option<u64>,
+    full: bool,
+    expand: usize,
+    glob: Option<&str>,
+    cache: &OutlineCache,
+    cli_full: bool,
+    listing_page: Option<(usize, Option<usize>)>,
+) -> Result<String, TilthError> {
+    if sections.len() > 20 {
+        return Err(TilthError::InvalidQuery {
+            query: query.into(),
+            reason: "at most 20 sections are supported".into(),
+        });
+    }
     run_inner_scopes(
         query,
         scopes,
-        section,
+        sections,
         budget_tokens,
         full,
         expand,
@@ -546,7 +579,7 @@ fn run_inner(
     run_inner_scopes(
         query,
         &scopes,
-        section,
+        &section.into_iter().collect::<Vec<_>>(),
         budget_tokens,
         full,
         expand,
@@ -560,7 +593,7 @@ fn run_inner(
 fn run_inner_scopes(
     query: &str,
     scopes: &[PathBuf],
-    section: Option<&str>,
+    sections: &[&str],
     budget_tokens: Option<u64>,
     full: bool,
     expand: usize,
@@ -749,7 +782,7 @@ fn run_inner_scopes(
                     continue;
                 };
                 let read = if path.is_dir() {
-                    if section.is_some() {
+                    if !sections.is_empty() {
                         Err(TilthError::InvalidQuery {
                             query: query.to_string(),
                             reason: "section is not supported for directory listings".into(),
@@ -771,13 +804,27 @@ fn run_inner_scopes(
                             reason,
                         }
                     })?;
-                    if let Some(section) = section {
-                        read::read_ranges_page(&path, &[section], false, page, false)
+                    if !sections.is_empty() {
+                        read::read_ranges_page(&path, sections, false, page, false)
                     } else {
                         read::read_file_page(&path, full, cache, false, page, false)
                     }
+                } else if sections.len() > 1 {
+                    match budget_tokens {
+                        Some(budget) => {
+                            read::read_ranges_with_budget(&path, sections, false, budget)
+                        }
+                        None => read::read_ranges(&path, sections, false),
+                    }
                 } else {
-                    read_file_query(&path, scope, section, full, cache, budget_tokens)
+                    read_file_query(
+                        &path,
+                        scope,
+                        sections.first().copied(),
+                        full,
+                        cache,
+                        budget_tokens,
+                    )
                 };
                 match read {
                     Ok(output) => {

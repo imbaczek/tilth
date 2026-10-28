@@ -72,9 +72,9 @@ struct SearchOptions {
     #[arg(long, conflicts_with = "respect_gitignore")]
     no_respect_gitignore: bool,
 
-    /// Line range (45-89), heading title (Architecture or ## Architecture), or TOC address (toc:1.2). Bypasses smart view.
+    /// Line range (45-89), heading title, or TOC address (toc:1.2). Repeat for disjoint slices.
     #[arg(long)]
-    section: Option<String>,
+    section: Vec<String>,
 
     /// Max tokens in response. Reduces detail to fit.
     #[arg(long)]
@@ -157,7 +157,7 @@ impl SearchOptions {
         self.scope.extend(options.scope);
         self.respect_gitignore |= options.respect_gitignore;
         self.no_respect_gitignore |= options.no_respect_gitignore;
-        self.section = options.section.or(self.section.take());
+        self.section.extend(options.section);
         self.budget = options.budget.or(self.budget);
         self.full |= options.full;
         self.json |= options.json;
@@ -199,7 +199,7 @@ impl SearchOptions {
         }
         let compact = !self.queries.is_empty() || self.select.is_some() || self.kind.is_some();
         let conflict = if compact
-            && (self.deps || self.map || self.callers || self.section.is_some() || edit)
+            && (self.deps || self.map || self.callers || !self.section.is_empty() || edit)
         {
             Some("--query, --select, and --kind conflict with --deps, --map, --callers, --section, and --edit")
         } else if self.respect_gitignore && self.no_respect_gitignore {
@@ -208,7 +208,7 @@ impl SearchOptions {
             Some("--callers conflicts with --deps, --map, and --edit")
         } else if self.deps && (self.map || edit) {
             Some("--deps conflicts with --map and --edit")
-        } else if self.map && (self.expand.is_some() || self.section.is_some() || self.full) {
+        } else if self.map && (self.expand.is_some() || !self.section.is_empty() || self.full) {
             Some("--map conflicts with --expand, --section, and --full")
         } else {
             None
@@ -455,9 +455,7 @@ fn main() {
                 if_tag,
                 json,
             } => {
-                if let Some(parent_section) = cli.search.section {
-                    section.insert(0, parent_section);
-                }
+                section.splice(0..0, cli.search.section);
                 if paths.len() > 1 && !section.is_empty() {
                     clap::Error::raw(
                         clap::error::ErrorKind::ArgumentConflict,
@@ -629,7 +627,10 @@ fn main() {
             } => {
                 let scope =
                     cli_scope(scope, FileScopeHint::Directory).unwrap_or_else(|e| usage_exit(&e));
-                let section = section.or(cli.search.section);
+                if cli.search.section.len() > 1 {
+                    usage_exit("grok accepts one --section");
+                }
+                let section = section.or_else(|| cli.search.section.into_iter().next());
                 let offset = offset.or(cli.search.offset);
                 let limit = limit.or(cli.search.limit);
                 let page = (offset.is_some() || limit.is_some())
@@ -947,10 +948,14 @@ fn main() {
         return;
     }
 
-    let result = tilth::run_expanded_scopes_with_listing(
+    let result = tilth::run_expanded_scopes_with_sections(
         &query,
         &scopes,
-        cli.search.section.as_deref(),
+        &cli.search
+            .section
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
         cli.search.budget,
         cli.search.full,
         expand,
@@ -1342,7 +1347,7 @@ mod tests {
         assert_eq!(cli.search.budget, Some(200));
         assert_eq!(cli.search.expand, Some(1));
         assert_eq!(cli.search.glob.as_deref(), Some("*.rs"));
-        assert_eq!(cli.search.section.as_deref(), Some("1-8"));
+        assert_eq!(cli.search.section, vec!["1-8"]);
         assert!(cli.search.validate(false).is_ok());
     }
 
