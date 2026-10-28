@@ -113,3 +113,122 @@ fn default_scope_accepts_more_than_twenty_files_and_can_be_narrowed() {
     );
     assert!(!restricted.contains("Similar suggestions"), "{restricted}");
 }
+
+#[test]
+fn similar_filenames_work_in_large_scopes_without_previewing_files() {
+    let dir = tempfile::tempdir().unwrap();
+    for index in 0..500 {
+        std::fs::write(dir.path().join(format!("filler_{index}.txt")), "").unwrap();
+    }
+    let candidate = dir.path().join("catalog_digest.py");
+    std::fs::File::create(&candidate)
+        .unwrap()
+        .set_len(1_000_001)
+        .unwrap();
+    for extra in [&[][..], &["--similarity-max-files", "1"][..]] {
+        let mut args = vec!["catalog_digests", "--budget", "2000"];
+        args.extend_from_slice(extra);
+        let out = output(dir.path(), &args);
+        assert!(
+            out.contains("WARNING: No exact matches")
+                && out.contains("[filename]")
+                && out.contains("catalog_digest.py"),
+            "{out}"
+        );
+        assert!(!out.contains("```"), "{out}");
+    }
+}
+
+#[test]
+fn filename_suggestions_respect_paging_globs_thresholds_and_exact_hits() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("catalog_digest.py"),
+        "SECRET_SOURCE_MARKER\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("catalog_digest.rs"),
+        "OTHER_SOURCE_MARKER\n",
+    )
+    .unwrap();
+    let first = output(dir.path(), &["catalog_digests", "--limit", "1"]);
+    let second = output(
+        dir.path(),
+        &["catalog_digests", "--offset", "1", "--limit", "1"],
+    );
+    assert!(
+        first.contains("suggestions 1-1 of 2") && second.contains("suggestions 2-2 of 2"),
+        "{first}\n{second}"
+    );
+    assert!(
+        !first.contains("SOURCE_MARKER") && !second.contains("SOURCE_MARKER"),
+        "{first}\n{second}"
+    );
+    let dot = output(
+        dir.path(),
+        &["--query", "./catalog_digests.rs", "--kind", "symbol"],
+    );
+    assert!(
+        dot.contains("catalog_digest.rs") && dot.contains("[filename]"),
+        "{dot}"
+    );
+    let absolute_query = dir.path().join("catalog_digests.rs");
+    let absolute = output(
+        dir.path(),
+        &[
+            "--query",
+            absolute_query.to_str().unwrap(),
+            "--kind",
+            "symbol",
+        ],
+    );
+    assert!(
+        absolute.contains("catalog_digest.rs") && absolute.contains("[filename]"),
+        "{absolute}"
+    );
+    let filtered = output(dir.path(), &["catalog_digests", "--glob", "*.rs"]);
+    assert!(
+        filtered.contains("catalog_digest.rs") && !filtered.contains("catalog_digest.py"),
+        "{filtered}"
+    );
+    let strict = output(
+        dir.path(),
+        &["catalog_digests", "--similarity-threshold", "0.99"],
+    );
+    assert!(!strict.contains("[filename]"), "{strict}");
+    std::fs::write(dir.path().join("other.rs"), "fn catalog_digests() {}\n").unwrap();
+    let exact = output(dir.path(), &["catalog_digests"]);
+    assert!(!exact.contains("[filename]"), "{exact}");
+}
+
+#[test]
+fn exact_filename_stem_suppresses_fuzzy_suggestions_per_query() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("catalog_digest.py"),
+        "def unrelated():\n    return 42\n",
+    )
+    .unwrap();
+    let exact = output(dir.path(), &["catalog_digest"]);
+    assert!(
+        exact.contains("File overview") && !exact.contains("Similar suggestions"),
+        "{exact}"
+    );
+    let batch = output(
+        dir.path(),
+        &["-q", "catalog_digest", "-q", "catalog_digests"],
+    );
+    assert!(
+        !batch.contains("Similar suggestions for \"catalog_digest\"")
+            && batch.contains("Similar suggestions for \"catalog_digests\""),
+        "{batch}"
+    );
+    std::fs::write(dir.path().join("catalog_export.bin"), [0, 255, 0]).unwrap();
+    std::fs::write(dir.path().join("catalog_exports.py"), "").unwrap();
+    let binary = output(
+        dir.path(),
+        &["--query", "catalog_export", "--kind", "symbol"],
+    );
+    assert!(!binary.contains("Similar suggestions"), "{binary}");
+}

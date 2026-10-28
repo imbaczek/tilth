@@ -1994,3 +1994,42 @@ mod similarity_integration_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod filename_similarity_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn mcp_suggests_filenames_without_source_and_excludes_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("catalog_digest.py"),
+            "SECRET_SOURCE_MARKER\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("other.txt"), "padding\n").unwrap();
+        let search = |args: Value| {
+            tool_search(
+                &args,
+                &OutlineCache::new(),
+                &Session::new(),
+                &Arc::new(BloomFilterCache::new()),
+            )
+            .unwrap()
+        };
+        let out = search(
+            json!({"root":dir.path(), "query":"catalog_digests", "similarity_max_files":1, "expand":10}),
+        );
+        assert!(
+            out.contains("[filename]") && out.contains("catalog_digest.py"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("SECRET_SOURCE_MARKER") && !out.contains("-- calls --"),
+            "{out}"
+        );
+        let regex = search(json!({"root":dir.path(), "query":"catalog_digests", "kind":"regex"}));
+        assert!(!regex.contains("[filename]"), "{regex}");
+    }
+}

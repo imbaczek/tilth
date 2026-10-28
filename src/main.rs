@@ -114,15 +114,15 @@ struct SearchOptions {
     #[arg(long)]
     glob: Option<String>,
 
-    /// Minimum normalized similarity for zero-hit narrow searches (default 0.80).
+    /// Minimum normalized similarity for zero-hit suggestions (default 0.80).
     #[arg(long)]
     similarity_threshold: Option<f64>,
 
-    /// Maximum number of files eligible for similar suggestions (default 500, inclusive).
+    /// Maximum number of files eligible for content similarity (default 500, inclusive).
     #[arg(long)]
     similarity_max_files: Option<std::num::NonZeroUsize>,
 
-    /// Maximum total file bytes eligible for similar suggestions (default 20000000, inclusive).
+    /// Maximum total file bytes eligible for content similarity (default 20000000, inclusive).
     #[arg(long)]
     similarity_max_bytes: Option<std::num::NonZeroU64>,
 

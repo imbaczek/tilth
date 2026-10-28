@@ -1,4 +1,4 @@
-//! Approximate suggestions for complete zero-hit narrow searches.
+//! Approximate suggestions for complete zero-hit searches.
 //!
 //! These are deliberately not `Match` records: they must never become
 //! definitions, expansion targets, or inputs to relationship searches.
@@ -10,6 +10,7 @@ use crate::listing::Page;
 
 const MAX_WORK: usize = 1_000_000_000;
 const MAX_SUGGESTIONS: usize = 100_000;
+const MAX_FILENAME_ENTRIES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Options {
@@ -57,7 +58,7 @@ impl Options {
 #[derive(Debug)]
 struct Suggestion {
     path: PathBuf,
-    line: usize,
+    line: Option<usize>,
     candidate: String,
     score: f64,
 }
@@ -70,7 +71,7 @@ struct Inventory {
     incomplete: bool,
 }
 
-/// Collect the entire physical file set before performing approximate matching.
+/// Collect the entire physical file set before performing approximate content matching.
 /// A failed walk or exhausted limit makes the fallback ineligible.
 fn inventory(scopes: &[PathBuf], glob: Option<&str>, options: Options) -> Option<Vec<PathBuf>> {
     let state = Mutex::new(Inventory::default());
@@ -145,6 +146,179 @@ fn normalized_osa(query: &str, candidate: &str) -> f64 {
         return 1.0;
     }
     1.0 - strsim::osa_distance(query, candidate) as f64 / length as f64
+}
+
+#[derive(Default)]
+struct FilenameScan {
+    visited: usize,
+    work: usize,
+    hits: HashMap<PathBuf, Suggestion>,
+    incomplete: bool,
+    exact_name: bool,
+}
+
+/// Compare names from the ignore-aware walk without opening or parsing files.
+/// Physical aliases retain their best observed spelling; ties are deterministic.
+fn filename_suggestions(
+    query: &str,
+    scopes: &[PathBuf],
+    glob: Option<&str>,
+    options: Options,
+) -> (Vec<Suggestion>, bool, bool) {
+    if query.is_empty() || query.contains(['\n', '\r']) {
+        return (Vec::new(), false, false);
+    }
+    let normalized_query: PathBuf = Path::new(query)
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect();
+    let query_path = normalized_query.as_path();
+    let state = Mutex::new(FilenameScan::default());
+    for scope in scopes {
+        let walker = match super::walker(scope, glob) {
+            Ok(walker) => walker,
+            Err(_) => return (Vec::new(), true, false),
+        };
+        let root = if scope.is_file() {
+            scope.parent().unwrap_or(Path::new("."))
+        } else {
+            scope.as_path()
+        };
+        // Compare absolute requests relative to the selected scope; a shared
+        // absolute prefix must not inflate filename similarity.
+        let scoped_query = if query_path.is_absolute() {
+            let absolute_root = if root.is_absolute() {
+                root.to_path_buf()
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(root),
+                    Err(_) => return (Vec::new(), true, false),
+                }
+            };
+            match query_path.strip_prefix(&absolute_root) {
+                Ok(relative) => relative,
+                Err(_) => continue,
+            }
+        } else {
+            query_path
+        };
+        let path_shaped = scoped_query.components().count() > 1;
+        let with_extension = scoped_query.extension().is_some();
+        let query_lower = scoped_query.to_string_lossy().to_lowercase();
+        let query_len = query_lower.chars().count();
+        walker.run(|| {
+            Box::new(|entry| {
+                let mut state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if state.incomplete || state.exact_name {
+                    return ignore::WalkState::Quit;
+                }
+                state.visited = state.visited.saturating_add(1);
+                if state.visited > MAX_FILENAME_ENTRIES {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
+                }
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(_) => {
+                        state.incomplete = true;
+                        return ignore::WalkState::Quit;
+                    }
+                };
+                if !entry.file_type().is_some_and(|kind| kind.is_file()) {
+                    return ignore::WalkState::Continue;
+                }
+                let path = entry.path();
+                let candidate_path = if path_shaped {
+                    match path.strip_prefix(root) {
+                        Ok(relative) => relative.to_path_buf(),
+                        Err(_) => return ignore::WalkState::Continue,
+                    }
+                } else {
+                    match path.file_name() {
+                        Some(name) => PathBuf::from(name),
+                        None => return ignore::WalkState::Continue,
+                    }
+                };
+                let candidate_path = if with_extension {
+                    candidate_path
+                } else {
+                    candidate_path.with_extension("")
+                };
+                let Some(candidate) = candidate_path.to_str() else {
+                    return ignore::WalkState::Continue;
+                };
+                let candidate_lower = candidate.to_lowercase();
+                if candidate_lower == query_lower {
+                    state.exact_name = true;
+                    return ignore::WalkState::Quit;
+                }
+                let candidate_len = candidate_lower.chars().count();
+                let longest = query_len.max(candidate_len);
+                if longest == 0
+                    || query_len.min(candidate_len) as f64 / (longest as f64) < options.threshold
+                {
+                    return ignore::WalkState::Continue;
+                }
+                state.work = state
+                    .work
+                    .saturating_add(query_len.saturating_mul(candidate_len));
+                if state.work > MAX_WORK {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
+                }
+                let score = normalized_osa(&query_lower, &candidate_lower);
+                if score < options.threshold {
+                    return ignore::WalkState::Continue;
+                }
+                let identity = match path.canonicalize() {
+                    Ok(path) => path,
+                    Err(_) => {
+                        state.incomplete = true;
+                        return ignore::WalkState::Quit;
+                    }
+                };
+                let hit = Suggestion {
+                    path: path.to_path_buf(),
+                    line: None,
+                    candidate: candidate.to_owned(),
+                    score,
+                };
+                state
+                    .hits
+                    .entry(identity)
+                    .and_modify(|current| {
+                        if hit.score > current.score
+                            || (hit.score == current.score && hit.path < current.path)
+                        {
+                            current.path = hit.path.clone();
+                            current.candidate = hit.candidate.clone();
+                            current.score = hit.score;
+                        }
+                    })
+                    .or_insert(hit);
+                ignore::WalkState::Continue
+            })
+        });
+        let done = {
+            let state = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.incomplete || state.exact_name
+        };
+        if done {
+            break;
+        }
+    }
+    let state = state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.incomplete || state.exact_name {
+        (Vec::new(), state.incomplete, state.exact_name)
+    } else {
+        (state.hits.into_values().collect(), false, false)
+    }
 }
 
 fn word_char(c: char) -> bool {
@@ -228,29 +402,57 @@ fn best_substring(
 
 /// Return a warning plus a stable page, or `None` if no suggestion is useful.
 /// A work cap is reported rather than treating a partial scan as complete.
-pub(crate) fn suggest(
+fn suggest(
     query: &str,
     kind: &str,
-    scopes: &[PathBuf],
-    glob: Option<&str>,
+    files: Option<&[PathBuf]>,
     options: Options,
+    mut results: Vec<Suggestion>,
+    filename_incomplete: bool,
     page: Page,
     mcp: bool,
 ) -> Option<String> {
     if query.is_empty() || !matches!(kind, "symbol" | "content") {
         return None;
     }
-    let files = inventory(scopes, glob, options)?;
-    let mut results = Vec::new();
+    let filename_count = results.len();
+    // A filename suggestion is metadata only: do not open it to collect text
+    // suggestions or expand its source as part of this fallback.
+    let filename_ids: Result<HashSet<_>, _> =
+        results.iter().map(|hit| hit.path.canonicalize()).collect();
+    let mut content_problem = None;
+    let filename_ids = match filename_ids {
+        Ok(ids) => ids,
+        Err(_) => {
+            content_problem =
+                Some("Content similarity skipped: a filename changed during the search.");
+            HashSet::new()
+        }
+    };
     let query_chars: Vec<char> = query.chars().collect();
     let mut scores = HashMap::new();
     let mut work = 0usize;
     let mut observed_bytes = 0u64;
-    for path in files {
-        let size = std::fs::metadata(&path).ok()?.len();
+    'content: for path in files.unwrap_or_default() {
+        if content_problem.is_some() {
+            break;
+        }
+        let size = match std::fs::metadata(path) {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                content_problem =
+                    Some("Content similarity skipped: a file could not be inspected.");
+                break;
+            }
+        };
         observed_bytes = observed_bytes.saturating_add(size);
         if observed_bytes > options.max_bytes || size > crate::types::MAX_SOURCE_FILE_SIZE {
-            return None;
+            content_problem =
+                Some("Content similarity skipped: the scope changed during the search.");
+            break;
+        }
+        if filename_ids.contains(path) {
+            continue;
         }
         if path
             .file_name()
@@ -259,9 +461,17 @@ pub(crate) fn suggest(
         {
             continue;
         }
-        let bytes = std::fs::read(&path).ok()?;
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                content_problem = Some("Content similarity skipped: a file could not be read.");
+                break;
+            }
+        };
         if bytes.len() as u64 != size {
-            return None;
+            content_problem =
+                Some("Content similarity skipped: the scope changed during the search.");
+            break;
         }
         if bytes.len() as u64 >= crate::lang::detection::MINIFIED_CHECK_THRESHOLD
             && crate::lang::detection::is_minified_by_content(&bytes)
@@ -291,26 +501,45 @@ pub(crate) fn suggest(
             } else {
                 match best_substring(&query_chars, text, options.threshold, &mut work) {
                     Ok(candidate) => candidate.filter(|(_, score)| *score >= options.threshold),
-                    Err(()) => return Some("> Similarity search skipped: work limit exceeded; narrow the scope or query.\n".into()),
+                    Err(()) => {
+                        content_problem = Some("Content similarity skipped: work limit exceeded; narrow the scope or query.");
+                        break 'content;
+                    }
                 }
             };
             if work > MAX_WORK {
-                return Some("> Similarity search skipped: work limit exceeded; narrow the scope or query.\n".into());
+                content_problem = Some(
+                    "Content similarity skipped: work limit exceeded; narrow the scope or query.",
+                );
+                break 'content;
             }
             if let Some((candidate, score)) = best {
                 if results.len() == MAX_SUGGESTIONS {
-                    return Some("> Similarity search skipped: suggestion limit exceeded; narrow the scope.\n".into());
+                    content_problem = Some(
+                        "Content similarity skipped: suggestion limit exceeded; narrow the scope.",
+                    );
+                    break 'content;
                 }
                 results.push(Suggestion {
                     path: path.clone(),
-                    line: line + 1,
+                    line: Some(line + 1),
                     candidate,
                     score,
                 });
             }
         }
     }
-    if results.is_empty() {
+    if content_problem.is_some() {
+        results.truncate(filename_count);
+    }
+    let mut notices = Vec::new();
+    if filename_incomplete {
+        notices.push("Filename similarity skipped: metadata walk or work limit exceeded, or a path could not be inspected.");
+    }
+    if let Some(problem) = content_problem {
+        notices.push(problem);
+    }
+    if results.is_empty() && notices.is_empty() {
         return None;
     }
     results.sort_by(|a, b| {
@@ -322,18 +551,32 @@ pub(crate) fn suggest(
     });
     let rows: Vec<_> = results
         .iter()
-        .map(|m| {
-            format!(
+        .map(|hit| match hit.line {
+            Some(line) => format!(
                 "{}:{}  similarity {:.3}  candidate {:?}",
-                m.path.display(),
-                m.line,
-                m.score,
-                m.candidate
-            )
+                hit.path.display(),
+                line,
+                hit.score,
+                hit.candidate
+            ),
+            None => format!(
+                "{}  [filename] similarity {:.3}  candidate {:?}",
+                hit.path.display(),
+                hit.score,
+                hit.candidate
+            ),
         })
         .collect();
-    let header = format!("# Similar suggestions for {query:?}\n> WARNING: No exact matches. These are approximate suggestions, not verified matches; do not follow, grok, or trace them.");
-    Some(page.render(&header, &rows, "suggestions", mcp))
+    let mut header = format!("# Similar suggestions for {query:?}\n> WARNING: No exact matches. These are approximate suggestions, not verified matches; do not follow, grok, or trace them.");
+    for notice in notices {
+        header.push_str("\n> ");
+        header.push_str(notice);
+    }
+    if rows.is_empty() {
+        Some(header)
+    } else {
+        Some(page.render(&header, &rows, "suggestions", mcp))
+    }
 }
 
 /// Append suggestions only when the complete exact result for that query is zero.
@@ -351,16 +594,26 @@ pub(crate) fn append(
     budget: Option<u64>,
     mcp: bool,
 ) -> String {
-    if !matches!(kind, "symbol" | "content" | "concept" | "fallthrough")
-        || inventory(scopes, glob, options).is_none()
-    {
+    if !matches!(kind, "symbol" | "content" | "concept" | "fallthrough") {
         return base;
     }
+    // The byte and file limits apply to content scanning, not filename metadata.
+    let content_files = inventory(scopes, glob, options);
     let mut output = base;
     let mut appended = false;
     for query in queries {
         if kind == "content" && super::parse_pattern(query).1 {
             continue;
+        }
+        let mut filename_hits = Vec::new();
+        let mut filename_incomplete = false;
+        let mut exact_name = false;
+        if content_files.is_none() {
+            (filename_hits, filename_incomplete, exact_name) =
+                filename_suggestions(query, scopes, glob, options);
+            if exact_name || (filename_hits.is_empty() && !filename_incomplete) {
+                continue;
+            }
         }
         let probe = super::paging::collect(
             query,
@@ -389,6 +642,13 @@ pub(crate) fn append(
         if !complete_zero {
             continue;
         }
+        if content_files.is_some() {
+            (filename_hits, filename_incomplete, exact_name) =
+                filename_suggestions(query, scopes, glob, options);
+        }
+        if exact_name {
+            continue;
+        }
         let effective_kind = if kind == "symbol"
             || (matches!(kind, "concept" | "fallthrough") && !query.contains(' '))
         {
@@ -396,8 +656,16 @@ pub(crate) fn append(
         } else {
             "content"
         };
-        if let Some(suggestions) = suggest(query, effective_kind, scopes, glob, options, page, mcp)
-        {
+        if let Some(suggestions) = suggest(
+            query,
+            effective_kind,
+            content_files.as_deref(),
+            options,
+            filename_hits,
+            filename_incomplete,
+            page,
+            mcp,
+        ) {
             output.push_str("\n\n---\n\n");
             output.push_str(&suggestions);
             appended = true;
@@ -535,5 +803,87 @@ mod tests {
     fn work_limit_is_reported_without_partial_results() {
         let mut work = MAX_WORK;
         assert!(best_substring(&['a'], "a", 0.8, &mut work).is_err());
+    }
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::*;
+
+    #[test]
+    fn filename_metadata_respects_filters_and_compares_stems_and_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("catalog_digest.rs"), "private marker").unwrap();
+        std::fs::write(nested.join("catalog_digest.py"), "other marker").unwrap();
+        let roots = [dir.path().to_path_buf()];
+        let strict_content_limits = Options {
+            max_files: 1,
+            max_bytes: 1,
+            ..Options::default()
+        };
+        let (stems, incomplete, exact_name) =
+            filename_suggestions("catalog_digests", &roots, None, strict_content_limits);
+        assert!(!incomplete && !exact_name);
+        assert_eq!(stems.len(), 2);
+        let (dot, incomplete, exact_name) =
+            filename_suggestions("./catalog_digests", &roots, None, strict_content_limits);
+        assert!(!incomplete && !exact_name && dot.len() == 2);
+        let absolute_query = nested.join("catalog_digests.rs");
+        let (absolute, incomplete, exact_name) = filename_suggestions(
+            absolute_query.to_str().unwrap(),
+            &roots,
+            None,
+            strict_content_limits,
+        );
+        assert!(
+            !incomplete
+                && !exact_name
+                && absolute
+                    .iter()
+                    .any(|hit| hit.path.ends_with("catalog_digest.rs"))
+        );
+        let (filtered, incomplete, exact_name) = filename_suggestions(
+            "catalog_digests",
+            &roots,
+            Some("*.rs"),
+            strict_content_limits,
+        );
+        assert!(!incomplete && !exact_name);
+        assert_eq!(filtered.len(), 1);
+        assert!(filtered[0].path.ends_with("catalog_digest.rs"));
+        let (path_hits, incomplete, exact_name) = filename_suggestions(
+            "nested/catalog_digests.rs",
+            &roots,
+            None,
+            strict_content_limits,
+        );
+        assert!(!incomplete && !exact_name);
+        assert!(path_hits
+            .iter()
+            .any(|hit| hit.path.ends_with("catalog_digest.rs")));
+        let (wrong_dir, incomplete, exact_name) = filename_suggestions(
+            "entirely_different_and_unrelated_directory/catalog_digests.rs",
+            &roots,
+            None,
+            strict_content_limits,
+        );
+        assert!(!incomplete && !exact_name && wrong_dir.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn aliases_are_compared_before_physical_deduplication() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("unrelated.bin");
+        std::fs::write(&target, "secret").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("catalog_digest.rs")).unwrap();
+        let roots = [dir.path().to_path_buf(), dir.path().to_path_buf()];
+        let (hits, incomplete, exact_name) =
+            filename_suggestions("catalog_digests", &roots, None, Options::default());
+        assert!(!incomplete && !exact_name);
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].path.ends_with("catalog_digest.rs"));
     }
 }
