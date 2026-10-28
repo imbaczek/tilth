@@ -91,3 +91,52 @@ fn exact_filename_does_not_hide_independent_substring_results() {
     );
     assert!(!out.contains("# Similar suggestions"), "{out}");
 }
+
+#[test]
+fn substring_locations_use_full_counts_and_direct_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["alpha", "beta", "alpha/nested"] {
+        std::fs::create_dir_all(dir.path().join(name)).unwrap();
+    }
+    for (name, count) in [
+        ("alpha/a.rs", 4),
+        ("alpha/b.rs", 2),
+        ("beta/c.rs", 3),
+        ("alpha/nested/d.rs", 1),
+    ] {
+        std::fs::write(dir.path().join(name), "needle_suffix();\n".repeat(count)).unwrap();
+    }
+    let out = search(
+        dir.path(),
+        &[
+            "-q", "needle", "--kind", "symbol", "--limit", "1", "--scope", ".", "--scope", "alpha",
+        ],
+    );
+    assert!(
+        out.contains("> Files: alpha/a.rs (4), beta/c.rs (3), alpha/b.rs (2)"),
+        "{out}"
+    );
+    assert!(
+        out.contains("> Directories (direct): alpha (6), beta (3), alpha/nested (1)"),
+        "{out}"
+    );
+    assert!(out.contains("10 matching lines in 4 files"), "{out}");
+    let page = search(
+        dir.path(),
+        &[
+            "-q", "needle", "--kind", "symbol", "--limit", "1", "--offset", "10",
+        ],
+    );
+    assert!(
+        page.contains("> Files: alpha/a.rs (4), beta/c.rs (3), alpha/b.rs (2)"),
+        "{page}"
+    );
+    let scoped = search(
+        dir.path(),
+        &["-q", "needle", "--kind", "symbol", "--scope", "alpha/a.rs"],
+    );
+    assert!(
+        scoped.contains("> Files: a.rs (4)") && scoped.contains("> Directories (direct): . (4)"),
+        "{scoped}"
+    );
+}

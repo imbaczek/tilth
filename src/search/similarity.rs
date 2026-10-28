@@ -700,7 +700,48 @@ fn substring_suggestions(
     };
     let tests = result.facet_totals.tests;
     let files = result.file_ledger.as_ref().map_or(0, |ledger| ledger.len());
-    let header = format!("# Substring matches for {query:?}: {} matching lines in {files} files ({tests} test-associated, {} other){sample_note}", result.total_found, result.total_found.saturating_sub(tests));
+    let mut header = format!("# Substring matches for {query:?}: {} matching lines in {files} files ({tests} test-associated, {} other){sample_note}", result.total_found, result.total_found.saturating_sub(tests));
+    if let Some(ledger) = &result.file_ledger {
+        // Ledger totals cover the complete search, not just the candidate sample.
+        let root = if result.scope.is_file() {
+            result.scope.parent().unwrap_or(&result.scope)
+        } else {
+            &result.scope
+        };
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut locations: Vec<_> = ledger
+            .iter()
+            .map(|(path, totals)| {
+                let relative = path.strip_prefix(&root).unwrap_or(path);
+                (relative.to_path_buf(), totals.hits)
+            })
+            .collect();
+        let mut directories: HashMap<PathBuf, usize> = HashMap::new();
+        for (path, count) in &locations {
+            let dir = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            *directories.entry(dir.to_path_buf()).or_default() += count;
+        }
+        let mut directories: Vec<_> = directories.into_iter().collect();
+        let sort = |entries: &mut Vec<(PathBuf, usize)>| {
+            entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            entries.truncate(3);
+        };
+        sort(&mut locations);
+        sort(&mut directories);
+        for (label, entries) in [("Files", locations), ("Directories (direct)", directories)] {
+            if !entries.is_empty() {
+                let summary = entries
+                    .into_iter()
+                    .map(|(path, count)| format!("{} ({count})", path.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                header.push_str(&format!("\n> {label}: {summary}"));
+            }
+        }
+    }
     let rows: Vec<_> = candidates
         .into_iter()
         .map(|(name, count, _)| {
