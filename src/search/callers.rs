@@ -370,7 +370,7 @@ pub(crate) fn find_callers_treesitter_batch(
     callers
 }
 
-fn js_receiver_type(
+pub(crate) fn js_receiver_type(
     object: tree_sitter::Node,
     call: tree_sitter::Node,
     bytes: &[u8],

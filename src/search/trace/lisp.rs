@@ -292,6 +292,7 @@ fn visit(
                 concerns.push("dynamic Lisp invocation is not resolved");
             }
             out.push(Call {
+                receiver: None,
                 name,
                 byte: first.start_byte(),
                 line: first.start_position().row as u32 + 1,

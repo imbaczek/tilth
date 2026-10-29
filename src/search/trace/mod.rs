@@ -1,6 +1,7 @@
 //! Stateless bounded traces over a static, name-resolved call graph.
 mod extract;
 mod lisp;
+mod typescript;
 use crate::{
     cache::OutlineCache,
     lang::declarations::Declaration,
@@ -95,6 +96,7 @@ impl Issues {
 #[derive(Default)]
 struct Graph {
     nodes: Vec<Declaration>,
+    ts_sources: HashMap<std::path::PathBuf, std::sync::Arc<crate::cache::ParsedFile>>,
     edges: Vec<Edge>,
     issues: Issues,
     node_issues: HashMap<usize, Issues>,
@@ -328,6 +330,9 @@ fn index_sources(
         if extract::has_rust_cfg(&parsed) {
             cfg_files.insert(path.clone());
         }
+        if typescript::supported(parsed.lang) {
+            graph.ts_sources.insert(path.clone(), parsed.clone());
+        }
         let first = graph.nodes.len();
         for declaration in crate::lang::declarations::collect(&path, &parsed)
             .into_iter()
@@ -466,12 +471,24 @@ fn resolve_calls(
                 .push(id);
         }
     }
+    let ts_index = typescript::Index::new(&graph.ts_sources, &graph.nodes);
     let mut seen_edges = HashSet::new();
     for PendingCall { owner, call } in pending {
         let node = &graph.nodes[owner];
         let issues = graph.node_issues.entry(owner).or_default();
         for reason in &call.concerns {
+            if typescript::supported(node.parsed.lang)
+                && call.receiver.is_some()
+                && *reason == "receiver dispatch is resolved by name only"
+            {
+                continue;
+            }
             issues.add(*reason);
+        }
+        if typescript::supported(node.parsed.lang) && call.receiver.is_some() {
+            issues.add(
+                "receiver binding is inferred syntactically; runtime overrides are not evaluated",
+            );
         }
         if call.concerns.iter().any(|reason| {
             matches!(
@@ -496,8 +513,21 @@ fn resolve_calls(
         let receiver = call
             .concerns
             .contains(&"receiver dispatch is resolved by name only");
-        let candidates = if node.parsed.lang == Lang::Rust && !call.name.contains("::") && !receiver
-        {
+        let candidates = if typescript::supported(node.parsed.lang) && call.receiver.is_some() {
+            match typescript::resolve_member(&graph.ts_sources, &ts_index, node, &call) {
+                Ok(targets) => {
+                    filtered = targets;
+                    filtered.as_slice()
+                }
+                Err(reason) => {
+                    issues.example(
+                        reason,
+                        format!("{}.{}", call.receiver.as_deref().unwrap_or("?"), call.name),
+                    );
+                    continue;
+                }
+            }
+        } else if node.parsed.lang == Lang::Rust && !call.name.contains("::") && !receiver {
             let (module, _) = rust_context(node);
             filtered = candidates
                 .iter()
@@ -514,6 +544,11 @@ fn resolve_calls(
         match candidates {
             [target] => {
                 let mut concerns = call.concerns.clone();
+                if typescript::supported(node.parsed.lang) && call.receiver.is_some() {
+                    concerns
+                        .retain(|reason| *reason != "receiver dispatch is resolved by name only");
+                    concerns.push("receiver binding is inferred syntactically; runtime overrides are not evaluated");
+                }
                 if cfg_files.contains(&node.path) || cfg_files.contains(&graph.nodes[*target].path)
                 {
                     concerns

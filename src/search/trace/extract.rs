@@ -4,6 +4,7 @@ use streaming_iterator::StreamingIterator;
 
 pub(super) struct Call {
     pub name: String,
+    pub receiver: Option<String>,
     pub byte: usize,
     pub line: u32,
     pub concerns: Vec<&'static str>,
@@ -49,6 +50,7 @@ pub(super) fn calls(parsed: &ParsedFile) -> (Vec<Call>, Vec<String>) {
                     .unwrap_or("")
                     .to_owned();
                 let mut concerns = Vec::new();
+                let mut receiver = None;
                 if let Some(parent) = node.parent() {
                     if parsed.lang == Lang::Rust
                         && parent.kind() == "field_expression"
@@ -69,6 +71,10 @@ pub(super) fn calls(parsed: &ParsedFile) -> (Vec<Call>, Vec<String>) {
                         | "attribute"
                         | "selector_expression"
                         | "navigation_expression" => {
+                            receiver = parent
+                                .child_by_field_name("object")
+                                .and_then(|n| n.utf8_text(parsed.content.as_bytes()).ok())
+                                .map(str::to_owned);
                             concerns.push("receiver dispatch is resolved by name only");
                         }
                         "macro_invocation" => concerns
@@ -88,6 +94,7 @@ pub(super) fn calls(parsed: &ParsedFile) -> (Vec<Call>, Vec<String>) {
                 }
                 calls.push(Call {
                     name,
+                    receiver,
                     byte: node.start_byte(),
                     line: node.start_position().row as u32 + 1,
                     concerns,
@@ -279,6 +286,7 @@ fn rust_uncaptured(
             }
             calls.push(Call {
                 name,
+                receiver: None,
                 byte: function.start_byte(),
                 line: function.start_position().row as u32 + 1,
                 concerns,

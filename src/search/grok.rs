@@ -1611,7 +1611,7 @@ fn ts_class_matches(
     aliases.contains(base)
 }
 
-fn ts_local_binding<'a>(
+pub(crate) fn ts_local_binding<'a>(
     node: tree_sitter::Node<'a>,
     name: &str,
     bytes: &[u8],
@@ -1634,6 +1634,35 @@ fn ts_local_binding<'a>(
             == Some(name)
         {
             return Some(node);
+        }
+        if matches!(
+            node.kind(),
+            "identifier" | "object_pattern" | "array_pattern" | "assignment_pattern"
+        ) && node
+            .parent()
+            .is_some_and(|n| n.kind() == "formal_parameters")
+            && crate::lang::walk::named_descendants(node).any(|n| {
+                matches!(
+                    n.kind(),
+                    "identifier" | "shorthand_property_identifier_pattern"
+                ) && n.utf8_text(bytes).ok() == Some(name)
+            })
+        {
+            return Some(node);
+        }
+        if node.kind() == "variable_declarator" {
+            if let Some(pattern) = node.child_by_field_name("name") {
+                if matches!(pattern.kind(), "object_pattern" | "array_pattern")
+                    && crate::lang::walk::named_descendants(pattern).any(|n| {
+                        matches!(
+                            n.kind(),
+                            "identifier" | "shorthand_property_identifier_pattern"
+                        ) && n.utf8_text(bytes).ok() == Some(name)
+                    })
+                {
+                    return Some(node);
+                }
+            }
         }
         if matches!(node.kind(), "required_parameter" | "optional_parameter") {
             let parameter = node
@@ -1670,6 +1699,9 @@ fn ts_local_binding<'a>(
             "program"
                 | "statement_block"
                 | "function_declaration"
+                | "function_expression"
+                | "generator_function"
+                | "generator_function_declaration"
                 | "method_definition"
                 | "arrow_function"
         ) {

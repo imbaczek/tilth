@@ -417,3 +417,177 @@ fn unresolved_callees_are_visible_among_many_lisp_limitations() {
         "{out}"
     );
 }
+
+#[test]
+fn typescript_receivers_disambiguate_this_super_static_and_instances() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.ts"),
+        r#"
+class Base { method() {} static ping() {} }
+class Other { method() {} static ping() {} }
+class Child extends Base {
+  method() { super.method(); }
+  start() { this.method(); }
+  static startStatic() { this.ping(); super.ping(); }
+}
+function instance() { const child = new Child(); child.method(); }
+function typed(child: Child) { child.method(); }
+function directStatic() { Child.ping(); }
+"#,
+    )
+    .unwrap();
+    for (from, to) in [
+        ("Child::start", "Child::method"),
+        ("Child::method", "Base::method"),
+        ("Child::startStatic", "Base::ping"),
+        ("instance", "Child::method"),
+        ("typed", "Child::method"),
+        ("directStatic", "Base::ping"),
+    ] {
+        let out = text(run(dir.path(), &[from, "--to", to, "--depth", "1"]));
+        assert!(out.contains("Path found"), "{from} -> {to}: {out}");
+    }
+    let out = text(run(
+        dir.path(),
+        &["Child::method", "--direction", "callers", "--depth", "1"],
+    ));
+    assert!(
+        out.contains("Child::start") && out.contains("instance") && out.contains("typed"),
+        "{out}"
+    );
+}
+#[test]
+fn typescript_unknown_shadowed_and_wrong_dispatch_receivers_do_not_fabricate_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.ts"),
+        r#"
+class Target { method() {} static ping() {} }
+function unknown(value: any) { value.method(); }
+function shadowed(Target: any) { Target.ping(); }
+function wrongStatic() { Target.method(); }
+function wrongInstance() { const value = new Target(); value.ping(); }
+class Nested { start() { function callback() { this.method(); } } method() {} }
+"#,
+    )
+    .unwrap();
+    for name in [
+        "unknown",
+        "shadowed",
+        "wrongStatic",
+        "wrongInstance",
+        "Nested::start",
+    ] {
+        let out = text(run(dir.path(), &[name, "--depth", "1"]));
+        assert!(!out.contains("call site"), "{name}: {out}");
+        assert!(out.contains("receiver"), "{name}: {out}");
+    }
+}
+#[test]
+fn typescript_import_aliases_namespace_and_reexports_resolve_within_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("base.ts"),
+        "export class Base { static ping() {} method() {} }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("barrel.ts"),
+        "export { Base as Renamed } from './base.js';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("app.ts"),
+        r#"
+import { Renamed as Alias } from './barrel.js';
+import * as ns from './base.js';
+function named() { Alias.ping(); }
+function namespaced() { ns.Base.ping(); }
+class Child extends Alias { start() { super.method(); } }
+"#,
+    )
+    .unwrap();
+    for (from, to) in [
+        ("named", "Base::ping"),
+        ("namespaced", "Base::ping"),
+        ("Child::start", "Base::method"),
+    ] {
+        let out = text(run(dir.path(), &[from, "--to", to, "--depth", "1"]));
+        assert!(out.contains("Path found"), "{from}: {out}");
+    }
+}
+
+#[test]
+fn javascript_shadowing_accessors_and_reassignments_are_not_method_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.js"),
+        r#"
+class Target { method() {} static ping() {} get factory() { return () => {}; } }
+class Other { method() {} }
+function shadowed(Target) { Target.ping(); }
+function destructured({Target}) { Target.ping(); }
+function reassigned() { let x = new Target(); x = new Other(); x.method(); }
+function getter() { const x = new Target(); x.factory(); }
+"#,
+    )
+    .unwrap();
+    for name in ["shadowed", "destructured", "reassigned", "getter"] {
+        let out = text(run(dir.path(), &[name, "--depth", "1"]));
+        assert!(!out.contains("call site"), "{name}: {out}");
+        assert!(out.contains("receiver"), "{name}: {out}");
+    }
+}
+#[test]
+fn typescript_union_receiver_does_not_pick_first_type() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.ts"), "class A { method() {} }\nclass B { method() {} }\nfunction start(value: A | B) { value.method(); }\n").unwrap();
+    let out = text(run(dir.path(), &["start"]));
+    assert!(
+        !out.contains("call site") && out.contains("compound or dynamic"),
+        "{out}"
+    );
+}
+
+#[test]
+fn destructuring_assignment_invalidates_receiver_inference() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.js"), "class A { method() {} }\nclass B { method() {} }\nfunction start() { let x = new A(); ({x} = {x: new B()}); x.method(); }\n").unwrap();
+    let out = text(run(dir.path(), &["start"]));
+    assert!(
+        !out.contains("call site") && out.contains("reassigned"),
+        "{out}"
+    );
+}
+
+#[test]
+fn export_stars_resolve_unique_classes_and_reject_namespace_or_conflicting_values() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("base.ts"),
+        "export class Base { static ping() {} }\n",
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("other.ts"), "export function Base() {}\n").unwrap();
+    for (barrel, expected) in [
+        ("export * from './base.js';", true),
+        ("export * as ns from './base.js';", false),
+        (
+            "export * from './base.js'; export * from './other.js';",
+            false,
+        ),
+    ] {
+        std::fs::write(dir.path().join("barrel.ts"), barrel).unwrap();
+        std::fs::write(
+            dir.path().join("app.ts"),
+            "import { Base } from './barrel.js';\nfunction start() { Base.ping(); }\n",
+        )
+        .unwrap();
+        let out = text(run(
+            dir.path(),
+            &["start", "--to", "Base::ping", "--depth", "1"],
+        ));
+        assert_eq!(out.contains("Path found"), expected, "{barrel}: {out}");
+    }
+}
