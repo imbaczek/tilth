@@ -516,6 +516,37 @@ pub(super) fn declarations(
     limit: usize,
 ) -> Vec<Declaration> {
     let mut declarations = crate::lang::declarations::collect(path, parsed);
+    // Public outlines may own the export wrapper. Trace callable identity must
+    // use the inner function span, shared with lexical binding and call ownership.
+    for declaration in &mut declarations {
+        if declaration.entry.kind != crate::types::OutlineKind::Function {
+            continue;
+        }
+        let Some((start, end)) = declaration.span else {
+            continue;
+        };
+        let Some(node) = parsed
+            .tree
+            .root_node()
+            .descendant_for_byte_range(start, end)
+        else {
+            continue;
+        };
+        if node.kind() == "export_statement" {
+            let mut cursor = node.walk();
+            let function = node.named_children(&mut cursor).find(|n| {
+                matches!(
+                    n.kind(),
+                    "function_declaration" | "generator_function_declaration"
+                )
+            });
+            if let Some(function) = function {
+                declaration.span = Some((function.start_byte(), function.end_byte()));
+                declaration.entry.start_line = function.start_position().row as u32 + 1;
+                declaration.entry.end_line = function.end_position().row as u32 + 1;
+            }
+        }
+    }
     let original_len = declarations.len();
     let mut spans: std::collections::HashSet<_> = declarations
         .iter()

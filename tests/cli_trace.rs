@@ -807,3 +807,21 @@ function reassigned() { Target = other; Target.ping(); }
         assert!(!out.contains("call site"), "{name}: {out}");
     }
 }
+
+#[test]
+fn exported_function_wrappers_do_not_duplicate_callable_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.ts"), "export async function start() { await finish(); }\nexport async function finish() {}\nexport default function defaultFn() { finish(); }\nexport function* generator() { finish(); }\nexport\nasync function multiline() { finish(); }\n").unwrap();
+    for name in ["start", "defaultFn", "generator", "multiline@6", "a.ts:6"] {
+        let out = text(run(dir.path(), &[name, "--to", "finish", "--depth", "1"]));
+        assert!(
+            out.contains("Path found") && out.matches("call site").count() == 1,
+            "{name}: {out}"
+        );
+    }
+    let out = text(run(
+        dir.path(),
+        &["finish", "--direction", "callers", "--depth", "1"],
+    ));
+    assert_eq!(out.matches("call site").count(), 4, "{out}");
+}
