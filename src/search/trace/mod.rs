@@ -664,7 +664,10 @@ fn resolve(graph: &Graph, target: &str, scope: &Path) -> Vec<usize> {
                     .display(),
                 node.entry.start_line
             );
-            (eq(name, &node.entry.name) || eq(name, &node.qualified) || target == location)
+            let alias = typescript::supported(node.parsed.lang)
+                && crate::lang::declarations::qualified_parts(name).is_some()
+                && eq(&name.replace('.', "::"), &node.qualified);
+            (eq(name, &node.entry.name) || eq(name, &node.qualified) || alias || target == location)
                 && line.is_none_or(|line| node.entry.start_line == line)
         })
         .map(|(id, _)| id)

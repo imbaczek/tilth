@@ -111,8 +111,8 @@ pub(super) fn calls(parsed: &ParsedFile) -> (Vec<Call>, Vec<String>) {
         drop(matches);
         if parsed.lang == Lang::Rust {
             rust_uncaptured(parsed, &mut calls, &mut problems, &bindings);
-        } else if uncovered_call_syntax(parsed, &calls) {
-            problems.push("call-like syntax is not covered by the language query".into());
+        } else {
+            problems.extend(uncovered_call_issues(parsed, &calls));
         }
         if cursor.did_exceed_match_limit() {
             problems.push("tree-sitter query match limit reached".into());
@@ -311,7 +311,7 @@ pub(super) fn has_rust_cfg(parsed: &ParsedFile) -> bool {
     false
 }
 
-fn uncovered_call_syntax(parsed: &ParsedFile, calls: &[Call]) -> bool {
+fn uncovered_call_issues(parsed: &ParsedFile, calls: &[Call]) -> Vec<String> {
     let is_call = |kind: &str| {
         matches!(
             kind,
@@ -327,12 +327,27 @@ fn uncovered_call_syntax(parsed: &ParsedFile, calls: &[Call]) -> bool {
         )
     };
     let captured = captured_call_positions(parsed, calls, is_call);
+    let mut issues = std::collections::BTreeSet::new();
     for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
         if is_call(node.kind()) && !captured.contains(&node.start_byte()) {
-            return true;
+            let reason = if super::typescript::supported(parsed.lang) {
+                if node.kind() == "new_expression" {
+                    "constructor calls are not traced"
+                } else if node
+                    .child_by_field_name("function")
+                    .is_some_and(|n| n.kind() == "subscript_expression")
+                {
+                    "computed member calls are not resolved"
+                } else {
+                    "dynamic or immediately invoked callable expressions are not traced"
+                }
+            } else {
+                "call-like syntax is not covered by the language query"
+            };
+            issues.insert(reason.to_owned());
         }
     }
-    false
+    issues.into_iter().collect()
 }
 
 fn is_cfg_attribute(node: tree_sitter::Node<'_>, source: &str) -> bool {

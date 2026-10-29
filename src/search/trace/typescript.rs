@@ -108,6 +108,12 @@ fn class_context<'a>(
             | "generator_function"
             | "generator_function_declaration" => return None,
             "method_definition" | "public_field_definition" | "field_definition" => {
+                if node
+                    .parent()
+                    .is_none_or(|parent| parent.kind() != "class_body")
+                {
+                    return None;
+                }
                 static_context = is_static(node);
             }
             "class_static_block" => static_context = true,
@@ -467,6 +473,13 @@ fn resolve_member_inner(
                 false,
             )
         } else {
+            if index.writes.get(&owner.path).is_some_and(|writes| {
+                writes
+                    .iter()
+                    .any(|(byte, name)| *byte < call.byte && name == receiver)
+            }) {
+                return Err("receiver class binding is reassigned; target unresolved");
+            }
             (
                 local_class(sources, index, &owner.path, at, receiver, 0)
                     .ok_or("receiver class is outside scope or unresolved")?,

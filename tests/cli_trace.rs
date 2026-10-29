@@ -725,3 +725,85 @@ function blocks() { {const cb = () => target(); cb();} {const cb = () => target(
         .collect();
     assert_eq!(labels.len(), 2, "{out}");
 }
+
+#[test]
+fn dotted_and_structural_selectors_choose_the_same_trace_declarations() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.ts"),
+        "class A { start() { this.finish(); } finish() {} }\nclass B { start() {} finish() {} }\n",
+    )
+    .unwrap();
+    for (from, to) in [
+        ("A.start", "A.finish"),
+        ("A::start", "A::finish"),
+        ("A.start@1", "A::finish@1"),
+        ("a.ts:1", "A.finish"),
+    ] {
+        let out = text(run(dir.path(), &[from, "--to", to, "--depth", "1"]));
+        // file:line is deliberately ambiguous when multiple declarations share it.
+        if from == "a.ts:1" {
+            assert!(out.contains("ambiguous"), "{out}");
+        } else {
+            assert!(out.contains("Path found"), "{from}: {out}");
+        }
+    }
+}
+
+#[test]
+fn javascript_unsupported_call_shapes_have_specific_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.js"), "function target() {}\nfunction start(object, key) { new Date(); object[key](); (() => target())(); }\n").unwrap();
+    let out = text(run(dir.path(), &["start"]));
+    assert!(
+        out.contains("constructor calls are not traced")
+            && out.contains("computed member calls are not resolved")
+            && out.contains("immediately invoked"),
+        "{out}"
+    );
+    assert!(!out.contains("call site"), "{out}");
+}
+
+#[test]
+fn private_method_aliases_and_positive_path_limitations_are_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.ts"), "class Target { start(object: any, key: string) { this.#finish(); object[key](); (() => this.#finish())(); } #finish() {} }\n").unwrap();
+    let out = text(run(
+        dir.path(),
+        &["Target.start", "--to", "Target.#finish", "--depth", "1"],
+    ));
+    assert!(
+        out.contains("Path found")
+            && out.contains("computed member")
+            && out.contains("immediately invoked"),
+        "{out}"
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_tilth"))
+        .current_dir(dir.path())
+        .args(["search", "Target.#finish", "--select", "signatures"])
+        .output()
+        .unwrap();
+    let out = text(out);
+    assert!(
+        out.contains("definitions 1-1 of 1") && out.contains("#finish()"),
+        "{out}"
+    );
+}
+
+#[test]
+fn object_literal_this_and_reassigned_class_bindings_do_not_inherit_outer_class_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.js"),
+        r#"
+class Outer { method() {} start() { const object = { invoke() { this.method(); } }; } }
+class Target { static ping() {} }
+function reassigned() { Target = other; Target.ping(); }
+"#,
+    )
+    .unwrap();
+    for name in ["Outer::start", "reassigned"] {
+        let out = text(run(dir.path(), &[name, "--depth", "1"]));
+        assert!(!out.contains("call site"), "{name}: {out}");
+    }
+}

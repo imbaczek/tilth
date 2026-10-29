@@ -1458,7 +1458,9 @@ fn declaration_owner_path_matches(
     // Qualifiers can start with semantic modules/packages absent from this
     // file's AST (e.g. api::Type in api.rs). Compare the available owner suffix,
     // while still distinguishing full nested owners such as Left.Inner/Right.Inner.
-    if actual.len() < expected.len() {
+    if matches!(lang, Lang::TypeScript | Lang::Tsx | Lang::JavaScript) {
+        actual.ends_with(&expected)
+    } else if actual.len() < expected.len() {
         expected.ends_with(&actual)
     } else {
         actual.ends_with(&expected)

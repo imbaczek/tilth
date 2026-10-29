@@ -121,13 +121,26 @@ pub(crate) fn collect(path: &Path, parsed: &std::sync::Arc<ParsedFile>) -> Vec<D
 pub(crate) fn signature_text(declaration: &Declaration) -> Option<String> {
     let (start, source_end) = declaration.span?;
     let end = declaration.entry.signature_end?;
-    let line_start = declaration
-        .parsed
-        .content
-        .split_inclusive('\n')
-        .take(end.line.saturating_sub(1) as usize)
-        .map(str::len)
-        .sum::<usize>();
+    let line_delta = end.line.checked_sub(declaration.entry.start_line)?;
+    let line_start = if line_delta == 0 {
+        declaration
+            .parsed
+            .content
+            .get(..start)?
+            .rfind('\n')
+            .map_or(0, |at| at + 1)
+    } else {
+        start.checked_add(
+            declaration
+                .parsed
+                .content
+                .get(start..source_end)?
+                .split_inclusive('\n')
+                .take(line_delta as usize)
+                .map(str::len)
+                .sum::<usize>(),
+        )?
+    };
     let end = line_start.checked_add(end.column)?;
     if end < start || end > source_end {
         return None;
@@ -137,4 +150,33 @@ pub(crate) fn signature_text(declaration: &Declaration) -> Option<String> {
         .content
         .get(start..end)
         .map(|text| text.trim_end().to_owned())
+}
+
+/// Parse a qualified code identifier, without interpreting file paths or locations.
+/// Both JS dotted spelling and the structural `::` spelling select the same owner.
+pub(crate) fn qualified_parts(query: &str) -> Option<(&str, &str)> {
+    let cut = query.rfind([':', '.'])?;
+    let owner_end = if query.as_bytes()[cut] == b':' {
+        if cut == 0 || query.as_bytes()[cut - 1] != b':' {
+            return None;
+        }
+        cut - 1
+    } else {
+        cut
+    };
+    let owner = &query[..owner_end];
+    let name = &query[cut + 1..];
+    let identifier = |s: &str| {
+        let mut chars = s.chars();
+        chars
+            .next()
+            .is_some_and(|c| c.is_alphabetic() || matches!(c, '_' | '$'))
+            && chars.all(|c| c.is_alphanumeric() || matches!(c, '_' | '$'))
+    };
+    if !identifier(name.strip_prefix('#').unwrap_or(name))
+        || !owner.replace("::", ".").split('.').all(identifier)
+    {
+        return None;
+    }
+    Some((owner, name))
 }

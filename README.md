@@ -745,6 +745,10 @@ tilth trace execute_query --direction callers --depth 3 --budget 2000
 scope. It returns a shortest discovered path to `--to`, or a bounded neighborhood
 without it. Endpoints accept function names, qualified names, `name@line`, or
 scope-relative `file:line`. Ambiguity returns candidates rather than picking one.
+For JavaScript and TypeScript, `Class.method` and `Class::method` are equivalent
+trace selectors and both find owner-qualified definitions in symbol search,
+including signature projections. Owner filtering happens before search paging.
+
 MCP exposes `tilth_trace` with `from`, optional `to`, `direction`, `depth`, `scope`,
 `root`, and `budget`. Depth is 1–16 (default 2).
 
@@ -756,6 +760,24 @@ reader conditionals, package shadowing of unqualified Lisp operators, and evalua
 phases can leave gaps or heuristic bindings.
 HTML/Vue template bindings, HTTP routes and cross-language runtime bridges are
 not inferred. Use content projections and batch slices for those sources.
+
+JavaScript/TypeScript member calls retain their receiver. `this` uses lexical class
+context (arrows inherit it; ordinary functions do not), `super` starts at the base
+class, and class calls select static members. Simple constructed/annotated locals,
+class fields and constructor parameter properties provide instance-type evidence.
+Local imports, aliases and unambiguous re-exports can establish class identity when
+their source files are in scope. Unknown receivers, reassigned bindings, compound
+types, accessors and incompatible static/instance targets do not fall back to an
+unrelated method with the same name. Runtime overrides remain heuristic.
+
+Callback bodies have separate, location-distinct trace identities and appear in
+reverse traces. Registration does not create an invocation edge into the callback.
+Named local callables require lexical binding evidence. Constructor calls,
+computed member calls and unsupported immediate/dynamic invocations report their
+own limitations. Receiver module lookup is bounded to 256 steps per call and
+inheritance/import traversal to 16 levels. Package imports whose local source
+cannot be established (including workspace packages without applicable path
+aliases) remain unresolved.
 
 Observed limitations appear ahead of results. A clean, same-file Rust path can
 suppress warnings about unrelated files; path-local parse/binding concerns and

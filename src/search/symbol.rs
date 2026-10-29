@@ -294,7 +294,9 @@ pub(super) fn find_definitions(
     let skipped_eligible = AtomicBool::new(false);
     let seen = Mutex::new(HashSet::new());
     let observed_paths = Mutex::new(HashMap::new());
-    let needle = query.as_bytes();
+    let needle = crate::lang::declarations::qualified_parts(query)
+        .map_or(query, |(_, name)| name)
+        .as_bytes();
 
     let walker = super::walker(scope, glob)?;
 
@@ -451,6 +453,45 @@ fn find_defs_treesitter(
     file_lines: u32,
     mtime: SystemTime,
 ) -> Vec<Match> {
+    let lines: Vec<&str> = content.lines().collect();
+    if let Some(lang) = lang.filter(|lang| {
+        matches!(
+            lang,
+            crate::types::Lang::TypeScript
+                | crate::types::Lang::Tsx
+                | crate::types::Lang::JavaScript
+        )
+    }) {
+        if let Some((owner, name)) = crate::lang::declarations::qualified_parts(query) {
+            return crate::lang::outline::qualified_declarations(
+                content,
+                lang,
+                owner,
+                Some(name),
+                true,
+            )
+            .into_iter()
+            .map(|(entry, _)| Match {
+                path: path.to_owned(),
+                line: entry.start_line,
+                text: lines
+                    .get(entry.start_line as usize - 1)
+                    .copied()
+                    .unwrap_or("")
+                    .trim_end()
+                    .to_owned(),
+                is_definition: true,
+                exact: true,
+                file_lines,
+                mtime,
+                def_range: Some((entry.start_line, entry.end_line)),
+                def_name: Some(entry.name),
+                def_weight: 80,
+                impl_target: None,
+            })
+            .collect();
+        }
+    }
     let mut parser = tree_sitter::Parser::new();
     if parser.set_language(ts_lang).is_err() {
         return Vec::new();
@@ -460,7 +501,6 @@ fn find_defs_treesitter(
         return Vec::new();
     };
 
-    let lines: Vec<&str> = content.lines().collect();
     let root = tree.root_node();
     let mut defs = Vec::new();
     if lang == Some(crate::types::Lang::CommonLisp) {

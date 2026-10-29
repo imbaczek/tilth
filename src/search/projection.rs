@@ -126,7 +126,7 @@ pub(crate) fn run(
                 .map(|m| {
                     let path = m.path.strip_prefix(display_root).unwrap_or(&m.path);
                     let text = if select == Some("signatures") {
-                        signature(m, cache, &mut signatures)
+                        signature(m, query, cache, &mut signatures)
                     } else {
                         m.text.trim().to_owned()
                     };
@@ -163,8 +163,9 @@ pub(crate) fn run(
 
 fn signature(
     m: &Match,
+    query: &str,
     cache: &OutlineCache,
-    catalog: &mut HashMap<PathBuf, Vec<crate::lang::declarations::Declaration>>,
+    catalog: &mut HashMap<(PathBuf, String), Vec<crate::lang::declarations::Declaration>>,
 ) -> String {
     let unavailable = || {
         format!(
@@ -172,12 +173,44 @@ fn signature(
             m.def_name.as_deref().unwrap_or("declaration")
         )
     };
-    let declarations = catalog.entry(m.path.clone()).or_insert_with(|| {
-        cache
-            .get_or_parse(&m.path)
-            .map(|parsed| crate::lang::declarations::collect(&m.path, &parsed))
-            .unwrap_or_default()
-    });
+    let declarations = catalog
+        .entry((m.path.clone(), query.to_owned()))
+        .or_insert_with(|| {
+            cache
+                .get_or_parse(&m.path)
+                .map(|parsed| {
+                    if let Some((owner, name)) = crate::lang::declarations::qualified_parts(query)
+                        .filter(|_| {
+                            matches!(
+                                parsed.lang,
+                                crate::types::Lang::TypeScript
+                                    | crate::types::Lang::Tsx
+                                    | crate::types::Lang::JavaScript
+                            )
+                        })
+                    {
+                        crate::lang::outline::qualified_declarations(
+                            &parsed.content,
+                            parsed.lang,
+                            owner,
+                            Some(name),
+                            true,
+                        )
+                        .into_iter()
+                        .map(|(entry, span)| crate::lang::declarations::Declaration {
+                            path: m.path.clone(),
+                            qualified: query.into(),
+                            entry,
+                            parsed: parsed.clone(),
+                            span: Some((span.start, span.end)),
+                        })
+                        .collect()
+                    } else {
+                        crate::lang::declarations::collect(&m.path, &parsed)
+                    }
+                })
+                .unwrap_or_default()
+        });
     let candidates: Vec<_> = declarations
         .iter()
         .filter(|d| {
@@ -322,5 +355,65 @@ mod regression_tests {
         )
         .unwrap();
         assert!(!out.contains("hidden"), "{out}");
+    }
+}
+
+#[cfg(test)]
+mod qualified_tests {
+    use super::*;
+    #[test]
+    fn qualified_methods_filter_before_paging_and_preserve_signatures() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut source = String::new();
+        for n in 0..120 {
+            source.push_str(&format!("class Other{n} {{ method() {{}} }}\n"));
+        }
+        source.push_str("class Target { method(value: number): number { return value; } }\n");
+        source.push_str("namespace Left { export class Inner { method() {} } }\nnamespace Right { export class Inner { method() {} } }\n");
+        std::fs::write(dir.path().join("a.ts"), source).unwrap();
+        for query in [
+            "Target.method",
+            "Target::method",
+            "Left.Inner.method",
+            "Left::Inner::method",
+        ] {
+            let out = run(
+                &[query.into()],
+                "symbol",
+                Some("signatures"),
+                &[dir.path().to_owned()],
+                None,
+                None,
+                Page::new(0, 1).unwrap(),
+                None,
+                false,
+                &OutlineCache::new(),
+            )
+            .unwrap();
+            assert!(
+                out.contains("definitions 1-1 of 1") && out.contains("method("),
+                "{query}: {out}"
+            );
+            if query.starts_with("Target") {
+                assert!(
+                    out.contains("value: number") && !out.contains("return value"),
+                    "{out}"
+                );
+            }
+        }
+        let out = run(
+            &["Missing.Target.method".into()],
+            "symbol",
+            Some("count"),
+            &[dir.path().to_owned()],
+            None,
+            None,
+            Page::new(0, 1).unwrap(),
+            None,
+            false,
+            &OutlineCache::new(),
+        )
+        .unwrap();
+        assert!(out.contains("0 matches"), "{out}");
     }
 }
