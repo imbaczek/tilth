@@ -1875,9 +1875,9 @@ mod similarity_integration_tests {
     use super::*;
     use serde_json::json;
 
-    fn search(args: Value) -> Result<String, String> {
+    fn search(args: &Value) -> Result<String, String> {
         tool_search(
-            &args,
+            args,
             &OutlineCache::new(),
             &Session::new(),
             &Arc::new(BloomFilterCache::new()),
@@ -1892,7 +1892,7 @@ mod similarity_integration_tests {
     #[test]
     fn substring_summary_works_with_projection_and_budget() {
         let dir = fixture();
-        let out = search(json!({"root": dir.path(), "query": "search_collect", "select": "count", "similarity_max_files": 1})).unwrap();
+        let out = search(&json!({"root": dir.path(), "query": "search_collect", "select": "count", "similarity_max_files": 1})).unwrap();
         assert!(
             out.contains("0 matches")
                 && out.contains("# Substring matches")
@@ -1900,13 +1900,13 @@ mod similarity_integration_tests {
             "{out}"
         );
         let limited =
-            search(json!({"root": dir.path(), "query": "search_collect", "budget": 20})).unwrap();
+            search(&json!({"root": dir.path(), "query": "search_collect", "budget": 20})).unwrap();
         assert!(
             crate::types::estimate_tokens(limited.len() as u64) <= 20,
             "{limited}"
         );
         let no_substring =
-            search(json!({"root": dir.path(), "query": "unrelated_needle"})).unwrap();
+            search(&json!({"root": dir.path(), "query": "unrelated_needle"})).unwrap();
         assert!(
             !no_substring.contains("# Substring matches"),
             "{no_substring}"
@@ -1917,7 +1917,7 @@ mod similarity_integration_tests {
     fn zero_hit_symbol_pages_are_labeled_and_ranked() {
         let dir = fixture();
         let args = json!({"root":dir.path(), "query":"serach_collected", "expand":5, "offset":0, "limit":1});
-        let first = search(args.clone()).unwrap();
+        let first = search(&args).unwrap();
         assert!(
             first.contains("# Similar suggestions")
                 && !first.contains("WARNING:")
@@ -1935,7 +1935,7 @@ mod similarity_integration_tests {
         );
         let mut next = args.clone();
         next["offset"] = json!(1);
-        let second = search(next).unwrap();
+        let second = search(&next).unwrap();
         assert!(second.contains("suggestions 2-2 of 2"), "{second}");
         assert!(
             first.contains("a.rs:1") && second.contains("a.rs:2"),
@@ -1943,7 +1943,7 @@ mod similarity_integration_tests {
         );
         let mut high = args;
         high["similarity_threshold"] = json!(0.99);
-        assert!(!search(high).unwrap().contains("Similar suggestions"));
+        assert!(!search(&high).unwrap().contains("Similar suggestions"));
     }
 
     #[test]
@@ -1951,7 +1951,7 @@ mod similarity_integration_tests {
         let dir = fixture();
         let second = tempfile::tempdir().unwrap();
         std::fs::write(second.path().join("b.rs"), "fn serach_collected() {}\n").unwrap();
-        let out = search(json!({"root":dir.path(), "scopes":[dir.path(), second.path()], "query":"serach_collected", "offset":100, "limit":1})).unwrap();
+        let out = search(&json!({"root":dir.path(), "scopes":[dir.path(), second.path()], "query":"serach_collected", "offset":100, "limit":1})).unwrap();
         assert!(!out.contains("Similar suggestions"), "{out}");
         assert!(out.contains("0 of") || out.contains("matches 0"), "{out}");
     }
@@ -1960,7 +1960,7 @@ mod similarity_integration_tests {
     fn literal_regex_projections_and_batches_keep_their_semantics() {
         let dir = fixture();
         let content =
-            search(json!({"root":dir.path(), "query":"little brown box", "kind":"content"}))
+            search(&json!({"root":dir.path(), "query":"little brown box", "kind":"content"}))
                 .unwrap();
         assert!(
             content.contains("# Similar suggestions") && content.contains("little brown fox"),
@@ -1968,18 +1968,18 @@ mod similarity_integration_tests {
         );
         for kind in ["regex", "content"] {
             let regex =
-                search(json!({"root":dir.path(), "query":"/serach_collecte./", "kind":kind}))
+                search(&json!({"root":dir.path(), "query":"/serach_collecte./", "kind":kind}))
                     .unwrap();
             assert!(!regex.contains("Similar suggestions"), "{regex}");
         }
         let projection =
-            search(json!({"root":dir.path(), "query":"serach_collected", "select":"count"}))
+            search(&json!({"root":dir.path(), "query":"serach_collected", "select":"count"}))
                 .unwrap();
         assert!(
             projection.contains("0 matches") && projection.contains("# Similar suggestions"),
             "{projection}"
         );
-        let batch = search(json!({"root":dir.path(), "queries":["search_collected","serach_collected"], "expand":0})).unwrap();
+        let batch = search(&json!({"root":dir.path(), "queries":["search_collected","serach_collected"], "expand":0})).unwrap();
         assert_eq!(batch.matches("# Similar suggestions").count(), 1, "{batch}");
         assert!(
             batch.contains("# Similar suggestions for \"serach_collected\""),
@@ -1991,7 +1991,7 @@ mod similarity_integration_tests {
     fn binary_files_do_not_hide_text_suggestions() {
         let dir = fixture();
         std::fs::write(dir.path().join("image.png"), [137, 80, 78, 71, 255, 0]).unwrap();
-        let out = search(json!({"root":dir.path(),"query":"serach_collected"})).unwrap();
+        let out = search(&json!({"root":dir.path(),"query":"serach_collected"})).unwrap();
         assert!(
             out.contains("Similar suggestions") && out.contains("search_collected"),
             "{out}"
@@ -2003,32 +2003,32 @@ mod similarity_integration_tests {
         let dir = fixture();
         std::fs::write(dir.path().join("b.txt"), "extra\n").unwrap();
         let strict =
-            search(json!({"root":dir.path(),"query":"serach_collected","similarity_max_files":1}))
+            search(&json!({"root":dir.path(),"query":"serach_collected","similarity_max_files":1}))
                 .unwrap();
         assert!(!strict.contains("Similar suggestions"), "{strict}");
         let relaxed =
-            search(json!({"root":dir.path(),"query":"serach_collected","similarity_max_files":2}))
+            search(&json!({"root":dir.path(),"query":"serach_collected","similarity_max_files":2}))
                 .unwrap();
         assert!(relaxed.contains("Similar suggestions"), "{relaxed}");
         let too_small =
-            search(json!({"root":dir.path(),"query":"serach_collected","similarity_max_bytes":1}))
+            search(&json!({"root":dir.path(),"query":"serach_collected","similarity_max_bytes":1}))
                 .unwrap();
         assert!(!too_small.contains("Similar suggestions"), "{too_small}");
         let enough = search(
-            json!({"root":dir.path(),"query":"serach_collected","similarity_max_bytes":1000}),
+            &json!({"root":dir.path(),"query":"serach_collected","similarity_max_bytes":1000}),
         )
         .unwrap();
         assert!(enough.contains("Similar suggestions"), "{enough}");
-        let filtered = search(json!({"root":dir.path(),"query":"serach_collected","glob":"*.rs","similarity_max_files":1})).unwrap();
+        let filtered = search(&json!({"root":dir.path(),"query":"serach_collected","glob":"*.rs","similarity_max_files":1})).unwrap();
         assert!(filtered.contains("Similar suggestions"), "{filtered}");
         let partial = search(
-            json!({"root":dir.path(),"scopes":[dir.path(),dir.path().join("missing")],"query":"serach_collected"}),
+            &json!({"root":dir.path(),"scopes":[dir.path(),dir.path().join("missing")],"query":"serach_collected"}),
         );
         if let Ok(out) = partial {
             assert!(!out.contains("Similar suggestions"), "{out}");
         }
         assert!(
-            search(json!({"root":dir.path(),"query":"anything","similarity_threshold":1.2}))
+            search(&json!({"root":dir.path(),"query":"anything","similarity_threshold":1.2}))
                 .is_err()
         );
     }

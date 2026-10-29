@@ -366,7 +366,7 @@ mod qualified_tests {
         let dir = tempfile::tempdir().unwrap();
         let mut source = String::new();
         for n in 0..120 {
-            source.push_str(&format!("class Other{n} {{ method() {{}} }}\n"));
+            writeln!(source, "class Other{n} {{ method() {{}} }}").unwrap();
         }
         source.push_str("class Target { method(value: number): number { return value; } }\n");
         source.push_str("namespace Left { export class Inner { method() {} } }\nnamespace Right { export class Inner { method() {} } }\n");

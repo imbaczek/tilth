@@ -3,6 +3,7 @@
 //! These are deliberately not `Match` records: they must never become
 //! definitions, expansion targets, or inputs to relationship searches.
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -85,33 +86,26 @@ fn inventory(scopes: &[PathBuf], glob: Option<&str>, options: Options) -> Option
                 if state.incomplete {
                     return ignore::WalkState::Quit;
                 }
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(_) => {
-                        state.incomplete = true;
-                        return ignore::WalkState::Quit;
-                    }
+                let Ok(entry) = entry else {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
                 };
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     return ignore::WalkState::Continue;
                 }
                 let path = entry.path();
-                let identity = match path.canonicalize() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        state.incomplete = true;
-                        return ignore::WalkState::Quit;
-                    }
+                let Ok(identity) = path.canonicalize() else {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
                 };
                 if !state.seen.insert(identity.clone()) {
                     return ignore::WalkState::Continue;
                 }
-                let size = match std::fs::metadata(path) {
-                    Ok(m) => m.len(),
-                    Err(_) => {
-                        state.incomplete = true;
-                        return ignore::WalkState::Quit;
-                    }
+                let size = if let Ok(m) = std::fs::metadata(path) {
+                    m.len()
+                } else {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
                 };
                 state.bytes = state.bytes.saturating_add(size);
                 state.files.push(identity);
@@ -140,6 +134,8 @@ fn inventory(scopes: &[PathBuf], glob: Option<&str>, options: Options) -> Option
     Some(state.files)
 }
 
+// Counts describe in-memory strings or bounded search work; f64 precision is sufficient for ranking.
+#[allow(clippy::cast_precision_loss)]
 fn normalized_osa(query: &str, candidate: &str) -> f64 {
     let length = query.chars().count().max(candidate.chars().count());
     if length == 0 {
@@ -159,6 +155,8 @@ struct FilenameScan {
 
 /// Compare names from the ignore-aware walk without opening or parsing files.
 /// Physical aliases retain their best observed spelling; ties are deterministic.
+// Counts describe in-memory strings or bounded search work; f64 precision is sufficient for ranking.
+#[allow(clippy::cast_precision_loss)]
 fn filename_suggestions(
     query: &str,
     scopes: &[PathBuf],
@@ -175,9 +173,8 @@ fn filename_suggestions(
     let query_path = normalized_query.as_path();
     let state = Mutex::new(FilenameScan::default());
     for scope in scopes {
-        let walker = match super::walker(scope, glob) {
-            Ok(walker) => walker,
-            Err(_) => return (Vec::new(), true, false),
+        let Ok(walker) = super::walker(scope, glob) else {
+            return (Vec::new(), true, false);
         };
         let root = if scope.is_file() {
             scope.parent().unwrap_or(Path::new("."))
@@ -219,12 +216,9 @@ fn filename_suggestions(
                     state.incomplete = true;
                     return ignore::WalkState::Quit;
                 }
-                let entry = match entry {
-                    Ok(entry) => entry,
-                    Err(_) => {
-                        state.incomplete = true;
-                        return ignore::WalkState::Quit;
-                    }
+                let Ok(entry) = entry else {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
                 };
                 if !entry.file_type().is_some_and(|kind| kind.is_file()) {
                     return ignore::WalkState::Continue;
@@ -272,12 +266,9 @@ fn filename_suggestions(
                 if score < options.threshold {
                     return ignore::WalkState::Continue;
                 }
-                let identity = match path.canonicalize() {
-                    Ok(path) => path,
-                    Err(_) => {
-                        state.incomplete = true;
-                        return ignore::WalkState::Quit;
-                    }
+                let Ok(identity) = path.canonicalize() else {
+                    state.incomplete = true;
+                    return ignore::WalkState::Quit;
                 };
                 let hit = Suggestion {
                     path: path.to_path_buf(),
@@ -290,10 +281,11 @@ fn filename_suggestions(
                     .entry(identity)
                     .and_modify(|current| {
                         if hit.score > current.score
-                            || (hit.score == current.score && hit.path < current.path)
+                            || (hit.score.total_cmp(&current.score).is_eq()
+                                && hit.path < current.path)
                         {
-                            current.path = hit.path.clone();
-                            current.candidate = hit.candidate.clone();
+                            current.path.clone_from(&hit.path);
+                            current.candidate.clone_from(&hit.candidate);
                             current.score = hit.score;
                         }
                     })
@@ -327,6 +319,8 @@ fn word_char(c: char) -> bool {
 
 /// Find the closest substring using OSA dynamic programming with free prefix.
 /// Work is bounded across the entire request; aborting is disclosed to callers.
+// Counts describe in-memory strings or bounded search work; f64 precision is sufficient for ranking.
+#[allow(clippy::cast_precision_loss)]
 fn best_substring(
     query: &[char],
     line: &str,
@@ -421,13 +415,11 @@ fn suggest(
     let filename_ids: Result<HashSet<_>, _> =
         results.iter().map(|hit| hit.path.canonicalize()).collect();
     let mut content_problem = None;
-    let filename_ids = match filename_ids {
-        Ok(ids) => ids,
-        Err(_) => {
-            content_problem =
-                Some("Content similarity skipped: a filename changed during the search.");
-            HashSet::new()
-        }
+    let filename_ids = if let Ok(ids) = filename_ids {
+        ids
+    } else {
+        content_problem = Some("Content similarity skipped: a filename changed during the search.");
+        HashSet::new()
     };
     let query_chars: Vec<char> = query.chars().collect();
     let mut scores = HashMap::new();
@@ -437,13 +429,11 @@ fn suggest(
         if content_problem.is_some() {
             break;
         }
-        let size = match std::fs::metadata(path) {
-            Ok(metadata) => metadata.len(),
-            Err(_) => {
-                content_problem =
-                    Some("Content similarity skipped: a file could not be inspected.");
-                break;
-            }
+        let size = if let Ok(metadata) = std::fs::metadata(path) {
+            metadata.len()
+        } else {
+            content_problem = Some("Content similarity skipped: a file could not be inspected.");
+            break;
         };
         observed_bytes = observed_bytes.saturating_add(size);
         if observed_bytes > options.max_bytes || size > crate::types::MAX_SOURCE_FILE_SIZE {
@@ -461,12 +451,9 @@ fn suggest(
         {
             continue;
         }
-        let bytes = match std::fs::read(path) {
-            Ok(bytes) => bytes,
-            Err(_) => {
-                content_problem = Some("Content similarity skipped: a file could not be read.");
-                break;
-            }
+        let Ok(bytes) = std::fs::read(path) else {
+            content_problem = Some("Content similarity skipped: a file could not be read.");
+            break;
         };
         if bytes.len() as u64 != size {
             content_problem =
@@ -498,14 +485,15 @@ fn suggest(
                         (score >= options.threshold).then(|| (candidate.to_owned(), score))
                     })
                     .max_by(|a, b| a.1.total_cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
+            } else if let Ok(candidate) =
+                best_substring(&query_chars, text, options.threshold, &mut work)
+            {
+                candidate.filter(|(_, score)| *score >= options.threshold)
             } else {
-                match best_substring(&query_chars, text, options.threshold, &mut work) {
-                    Ok(candidate) => candidate.filter(|(_, score)| *score >= options.threshold),
-                    Err(()) => {
-                        content_problem = Some("Content similarity skipped: work limit exceeded; narrow the scope or query.");
-                        break 'content;
-                    }
-                }
+                content_problem = Some(
+                    "Content similarity skipped: work limit exceeded; narrow the scope or query.",
+                );
+                break 'content;
             };
             if work > MAX_WORK {
                 content_problem = Some(
@@ -625,6 +613,8 @@ fn finish_with_token_footer(output: &str, budget: Option<u64>) -> String {
 /// Summarize literal substring hits independently of approximate suggestions.
 /// Candidate frequencies count lines, not occurrences, and large result sets use
 /// a deterministic capped sample while retaining the complete search totals.
+// Counts describe in-memory strings or bounded search work; f64 precision is sufficient for ranking.
+#[allow(clippy::cast_precision_loss)]
 fn substring_suggestions(
     query: &str,
     scopes: &[PathBuf],
@@ -699,7 +689,10 @@ fn substring_suggestions(
         String::new()
     };
     let tests = result.facet_totals.tests;
-    let files = result.file_ledger.as_ref().map_or(0, |ledger| ledger.len());
+    let files = result
+        .file_ledger
+        .as_ref()
+        .map_or(0, std::collections::HashMap::len);
     let mut header = format!("# Substring matches for {query:?}: {} matching lines in {files} files ({tests} test-associated, {} other){sample_note}", result.total_found, result.total_found.saturating_sub(tests));
     if let Some(ledger) = &result.file_ledger {
         // Ledger totals cover the complete search, not just the candidate sample.
@@ -738,7 +731,7 @@ fn substring_suggestions(
                     .map(|(path, count)| format!("{} ({count})", path.display()))
                     .collect::<Vec<_>>()
                     .join(", ");
-                header.push_str(&format!("\n> {label}: {summary}"));
+                let _ = write!(header, "\n> {label}: {summary}");
             }
         }
     }

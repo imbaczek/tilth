@@ -782,12 +782,7 @@ fn run_inner_scopes(
                     continue;
                 };
                 let read = if path.is_dir() {
-                    if !sections.is_empty() {
-                        Err(TilthError::InvalidQuery {
-                            query: query.to_string(),
-                            reason: "section is not supported for directory listings".into(),
-                        })
-                    } else {
+                    if sections.is_empty() {
                         let (offset, limit) = listing_page.unwrap_or((0, None));
                         let page =
                             listing::Page::new(offset, limit.unwrap_or(listing::DEFAULT_LIMIT))
@@ -796,6 +791,11 @@ fn run_inner_scopes(
                                     reason,
                                 })?;
                         read::list_directory(&path, page, false)
+                    } else {
+                        Err(TilthError::InvalidQuery {
+                            query: query.to_string(),
+                            reason: "section is not supported for directory listings".into(),
+                        })
                     }
                 } else if let Some(value) = listing_page {
                     let page = listing::Page::from_tuple(value).map_err(|reason| {
@@ -804,10 +804,10 @@ fn run_inner_scopes(
                             reason,
                         }
                     })?;
-                    if !sections.is_empty() {
-                        read::read_ranges_page(&path, sections, false, page, false)
-                    } else {
+                    if sections.is_empty() {
                         read::read_file_page(&path, full, cache, false, page, false)
+                    } else {
+                        read::read_ranges_page(&path, sections, false, page, false)
                     }
                 } else if sections.len() > 1 {
                     match budget_tokens {

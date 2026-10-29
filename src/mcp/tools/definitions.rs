@@ -49,7 +49,7 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "similarity_threshold": {"type":"number", "minimum":0, "maximum":1, "default":0.8, "description":"Minimum normalized OSA similarity for approximate zero-hit suggestions."},
                     "similarity_max_files": {"type":"integer", "minimum":1, "default":500, "description":"Inclusive maximum number of distinct scoped files eligible for content similarity."},
-                    "similarity_max_bytes": {"type":"integer", "minimum":1, "default":20000000, "description":"Inclusive maximum total bytes of distinct scoped files eligible for content similarity."},
+                    "similarity_max_bytes": {"type":"integer", "minimum":1, "default":20_000_000, "description":"Inclusive maximum total bytes of distinct scoped files eligible for content similarity."},
                     "expand": {
                         "type": "number",
                         "default": 2,
