@@ -334,7 +334,12 @@ fn index_sources(
             graph.ts_sources.insert(path.clone(), parsed.clone());
         }
         let first = graph.nodes.len();
-        for declaration in crate::lang::declarations::collect(&path, &parsed)
+        let declarations = if typescript::supported(parsed.lang) {
+            typescript::declarations(&path, &parsed, node_limit.saturating_sub(graph.nodes.len()))
+        } else {
+            crate::lang::declarations::collect(&path, &parsed)
+        };
+        for declaration in declarations
             .into_iter()
             .filter(|d| d.entry.kind == OutlineKind::Function)
         {
@@ -524,6 +529,17 @@ fn resolve_calls(
                         reason,
                         format!("{}.{}", call.receiver.as_deref().unwrap_or("?"), call.name),
                     );
+                    continue;
+                }
+            }
+        } else if typescript::supported(node.parsed.lang) {
+            match typescript::bare_candidates(&graph.nodes, &ts_index, node, &call, candidates) {
+                Ok(targets) => {
+                    filtered = targets;
+                    filtered.as_slice()
+                }
+                Err(reason) => {
+                    issues.example(reason, call.name.clone());
                     continue;
                 }
             }

@@ -477,7 +477,7 @@ class Nested { start() { function callback() { this.method(); } } method() {} }
         "shadowed",
         "wrongStatic",
         "wrongInstance",
-        "Nested::start",
+        "callback",
     ] {
         let out = text(run(dir.path(), &[name, "--depth", "1"]));
         assert!(!out.contains("call site"), "{name}: {out}");
@@ -590,4 +590,138 @@ fn export_stars_resolve_unique_classes_and_reject_namespace_or_conflicting_value
         ));
         assert_eq!(out.contains("Path found"), expected, "{barrel}: {out}");
     }
+}
+
+#[test]
+fn typescript_callbacks_are_callers_without_registration_edges() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.ts"),
+        r#"
+class Zone { static run() {} }
+function register() {
+  it('first', () => { Zone.run(); });
+  it('second', function () { Zone.run(); });
+}
+const direct = () => { Zone.run(); };
+function invoke() { direct(); }
+"#,
+    )
+    .unwrap();
+    let out = text(run(
+        dir.path(),
+        &["Zone::run", "--direction", "callers", "--depth", "1"],
+    ));
+    assert_eq!(out.matches("call site").count(), 3, "{out}");
+    assert!(
+        out.contains("it('first') callback")
+            && out.contains("it('second') callback")
+            && out.contains("direct"),
+        "{out}"
+    );
+    let out = text(run(
+        dir.path(),
+        &["register", "--to", "Zone::run", "--depth", "4"],
+    ));
+    assert!(
+        !out.contains("Path found") && !out.contains("call site"),
+        "{out}"
+    );
+    let out = text(run(
+        dir.path(),
+        &["invoke", "--to", "Zone::run", "--depth", "2"],
+    ));
+    assert!(
+        out.contains("Path found") && out.matches("call site").count() == 2,
+        "{out}"
+    );
+}
+#[test]
+fn callback_this_is_lexical_only_in_arrows_and_same_line_callbacks_are_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.ts"), r#"
+class Target {
+  method() {}
+  register() { it('same', () => this.method()); it('same', () => this.method()); it('dynamic', function () { this.method(); }); }
+}
+"#).unwrap();
+    let out = text(run(
+        dir.path(),
+        &["Target::method", "--direction", "callers", "--depth", "1"],
+    ));
+    assert_eq!(out.matches("call site").count(), 2, "{out}");
+    assert!(out.contains("it('same') callback"), "{out}");
+    let labels: std::collections::HashSet<_> = out
+        .lines()
+        .filter(|line| line.contains("-> Target::method"))
+        .collect();
+    assert_eq!(
+        labels.len(),
+        2,
+        "same-line callbacks need distinct identities: {out}"
+    );
+    let out = text(run(
+        dir.path(),
+        &["Target::register", "--to", "Target::method", "--depth", "4"],
+    ));
+    assert!(!out.contains("Path found"), "{out}");
+}
+
+#[test]
+fn callback_bindings_are_lexical_and_do_not_leak_to_other_functions() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.js"),
+        r#"
+function target() {}
+function local() { const cb = () => target(); cb(); }
+function outside() { cb(); hidden(); }
+const named = function hidden() { target(); };
+function shadowed(cb) { cb(); }
+"#,
+    )
+    .unwrap();
+    for name in ["outside", "shadowed"] {
+        let out = text(run(dir.path(), &[name, "--to", "target", "--depth", "3"]));
+        assert!(
+            !out.contains("Path found") && !out.contains("call site"),
+            "{name}: {out}"
+        );
+    }
+    let out = text(run(
+        dir.path(),
+        &["local", "--to", "target", "--depth", "2"],
+    ));
+    assert!(out.contains("Path found"), "{out}");
+}
+
+#[test]
+fn callback_tdz_is_unresolved_and_duplicate_named_callbacks_have_distinct_labels() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.ts"),
+        r#"
+function target() {}
+function later() { cb(); const cb = () => target(); }
+function blocks() { {const cb = () => target(); cb();} {const cb = () => target(); cb();} }
+"#,
+    )
+    .unwrap();
+    let out = text(run(
+        dir.path(),
+        &["later", "--to", "target", "--depth", "2"],
+    ));
+    assert!(
+        !out.contains("Path found") && out.contains("declared later"),
+        "{out}"
+    );
+    let out = text(run(
+        dir.path(),
+        &["target", "--direction", "callers", "--depth", "1"],
+    ));
+    let labels: std::collections::HashSet<_> = out
+        .lines()
+        .filter(|line| line.starts_with("blocks::cb") && line.contains("-> target"))
+        .collect();
+    assert_eq!(labels.len(), 2, "{out}");
 }

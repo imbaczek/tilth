@@ -494,3 +494,248 @@ pub(super) fn resolve_member(
         result
     }
 }
+
+/// Trace identities for deferred callable bodies absent from the public outline.
+/// Exact expression spans keep registration/initialization separate from execution.
+pub(super) fn declarations(
+    path: &Path,
+    parsed: &Arc<ParsedFile>,
+    limit: usize,
+) -> Vec<Declaration> {
+    let mut declarations = crate::lang::declarations::collect(path, parsed);
+    let original_len = declarations.len();
+    let mut spans: std::collections::HashSet<_> = declarations
+        .iter()
+        .filter(|d| d.entry.kind == crate::types::OutlineKind::Function)
+        .filter_map(|d| d.span)
+        .collect();
+    let mut owners: HashMap<_, _> = declarations
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.entry.kind,
+                crate::types::OutlineKind::Function | crate::types::OutlineKind::Class
+            )
+        })
+        .filter_map(|d| d.span.map(|s| (s, d.qualified.clone())))
+        .collect();
+    let mut count = spans.len();
+    let lines: Vec<_> = parsed.content.lines().collect();
+    for node in crate::lang::walk::named_descendants(parsed.tree.root_node()) {
+        if !matches!(
+            node.kind(),
+            "arrow_function"
+                | "function_expression"
+                | "generator_function"
+                | "function_declaration"
+                | "generator_function_declaration"
+        ) {
+            continue;
+        }
+        let span = (node.start_byte(), node.end_byte());
+        if !spans.insert(span) {
+            continue;
+        }
+        if count >= limit {
+            break;
+        }
+        count += 1;
+        let line = node.start_position().row as u32 + 1;
+        let column = node.start_position().column + 1;
+        let bound_name = node
+            .child_by_field_name("name")
+            .map(|n| text(n, parsed).to_owned())
+            .or_else(|| {
+                node.parent()
+                    .filter(|n| n.kind() == "variable_declarator")
+                    .and_then(|n| n.child_by_field_name("name"))
+                    .filter(|n| n.kind() == "identifier")
+                    .map(|n| text(n, parsed).to_owned())
+            });
+        let name = bound_name.unwrap_or_else(|| {
+            let label =
+                crate::search::scope::walk_to_enclosing_definition(node, &lines, parsed.lang)
+                    .map_or_else(|| "<anonymous>".into(), |(_, name, _)| name);
+            format!("{label} [{line}:{column}]")
+        });
+        let mut ancestor = node.parent();
+        let mut parent = None;
+        while let Some(n) = ancestor {
+            if let Some(owner) = owners.get(&(n.start_byte(), n.end_byte())) {
+                parent = Some(owner);
+                break;
+            }
+            ancestor = n.parent();
+        }
+        let qualified = parent.map_or_else(|| name.clone(), |p| format!("{p}::{name}"));
+        owners.insert(span, qualified.clone());
+        declarations.push(Declaration {
+            path: path.to_owned(),
+            qualified,
+            entry: crate::types::OutlineEntry {
+                kind: crate::types::OutlineKind::Function,
+                name,
+                start_line: line,
+                end_line: node.end_position().row as u32 + 1,
+                signature: None,
+                signature_end: None,
+                children: Vec::new(),
+                doc: None,
+            },
+            parsed: parsed.clone(),
+            span: Some(span),
+        });
+    }
+    let mut counts = HashMap::<String, usize>::new();
+    for d in &declarations {
+        *counts.entry(d.qualified.clone()).or_default() += 1;
+    }
+    for d in declarations.iter_mut().skip(original_len) {
+        if counts.get(&d.qualified).copied().unwrap_or(0) > 1 {
+            if let Some((start, end)) = d.span {
+                if let Some(node) = parsed
+                    .tree
+                    .root_node()
+                    .descendant_for_byte_range(start, end)
+                {
+                    d.qualified = format!(
+                        "{} [{}:{}]",
+                        d.qualified,
+                        node.start_position().row + 1,
+                        node.start_position().column + 1
+                    );
+                }
+            }
+        }
+    }
+    declarations
+}
+
+/// Deferred/local bodies must never become global bare-name candidates.
+pub(super) fn bare_candidates(
+    nodes: &[Declaration],
+    index: &Index,
+    owner: &Declaration,
+    call: &Call,
+    candidates: &[usize],
+) -> Result<Vec<usize>, &'static str> {
+    let parsed = &owner.parsed;
+    let at = parsed
+        .tree
+        .root_node()
+        .descendant_for_byte_range(call.byte, call.byte + 1)
+        .ok_or("callable syntax is unavailable")?;
+    let mut ancestor = at.parent();
+    while let Some(node) = ancestor {
+        if matches!(node.kind(), "function_expression" | "generator_function")
+            && node
+                .child_by_field_name("name")
+                .is_some_and(|n| text(n, parsed) == call.name)
+        {
+            return Ok(index
+                .members
+                .get(&(owner.path.clone(), node.start_byte(), node.end_byte()))
+                .cloned()
+                .unwrap_or_default());
+        }
+        ancestor = node.parent();
+    }
+    if let Some(binding) =
+        crate::search::grok::ts_local_binding(at, &call.name, parsed.content.as_bytes())
+    {
+        if index.writes.get(&owner.path).is_some_and(|writes| {
+            writes.iter().any(|(byte, name)| {
+                binding.start_byte() < *byte && *byte < call.byte && name == &call.name
+            })
+        }) {
+            return Err("lexically bound callable is reassigned; target unresolved");
+        }
+        if binding.kind() == "variable_declarator" && binding.start_byte() > call.byte {
+            return Err("lexically bound callable is declared later; invocation unresolved");
+        }
+        let callable = if matches!(
+            binding.kind(),
+            "function_declaration" | "generator_function_declaration"
+        ) {
+            Some(binding)
+        } else {
+            binding.child_by_field_name("value").filter(|n| {
+                matches!(
+                    n.kind(),
+                    "arrow_function" | "function_expression" | "generator_function"
+                )
+            })
+        };
+        return callable
+            .map(|n| {
+                index
+                    .members
+                    .get(&(owner.path.clone(), n.start_byte(), n.end_byte()))
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .ok_or("lexically bound callable is dynamic or unindexed");
+    }
+    Ok(candidates
+        .iter()
+        .copied()
+        .filter(|id| {
+            let declaration = &nodes[*id];
+            let Some((start, end)) = declaration.span else {
+                return false;
+            };
+            let Some(node) = declaration
+                .parsed
+                .tree
+                .root_node()
+                .descendant_for_byte_range(start, end)
+            else {
+                return false;
+            };
+            if matches!(
+                node.kind(),
+                "arrow_function" | "function_expression" | "generator_function"
+            ) {
+                return false;
+            }
+            let mut parent = node.parent();
+            while let Some(p) = parent {
+                if matches!(
+                    p.kind(),
+                    "function_declaration"
+                        | "function_expression"
+                        | "generator_function"
+                        | "method_definition"
+                        | "arrow_function"
+                ) || is_class(p)
+                {
+                    return false;
+                }
+                parent = p.parent();
+            }
+            true
+        })
+        .collect())
+}
+
+#[cfg(test)]
+mod callback_tests {
+    use super::*;
+    #[test]
+    fn callback_collection_observes_remaining_node_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("callbacks.ts");
+        std::fs::write(&path, "it('same', () => {});\n".repeat(1000)).unwrap();
+        let parsed = crate::cache::OutlineCache::new()
+            .get_or_parse(&path)
+            .unwrap();
+        let declarations = declarations(&path, &parsed, 8);
+        assert_eq!(
+            declarations
+                .iter()
+                .filter(|d| d.entry.kind == crate::types::OutlineKind::Function)
+                .count(),
+            8
+        );
+    }
+}
