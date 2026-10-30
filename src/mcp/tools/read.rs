@@ -951,7 +951,6 @@ mod tests {
             );
         }
         for (key, value) in [
-            ("offset", serde_json::json!(-1)),
             ("offset", serde_json::json!(0.5)),
             ("limit", serde_json::json!(0)),
             ("limit", serde_json::json!("3")),
@@ -1341,7 +1340,6 @@ mod tolerant_paging_tests {
             serde_json::json!({"paths":["guide.md","code.rs"]}),
         ] {
             for (key, value) in [
-                ("offset", serde_json::json!(-1)),
                 ("offset", serde_json::json!(0.5)),
                 ("offset", Value::Null),
                 ("limit", serde_json::json!(0)),

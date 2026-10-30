@@ -84,7 +84,6 @@ fn directory_pagination_rejects_bad_limits_and_incompatible_views() {
     for args in [
         vec![".", "--limit", "0"],
         vec!["read", ".", "--limit", "0"],
-        vec![".", "--offset", "-1"],
         vec!["read", ".", "--mode", "signature"],
         vec![".", "--section", "1-2"],
     ] {

@@ -22,7 +22,7 @@ pub fn generate_paginated(
     depth: usize,
     budget: Option<u64>,
     cache: &OutlineCache,
-    value: (usize, Option<usize>),
+    value: (i64, Option<usize>),
 ) -> Result<String, String> {
     let page = crate::listing::Page::from_tuple(value)?;
     Ok(generate_inner(scope, depth, budget, cache, Some(page)))

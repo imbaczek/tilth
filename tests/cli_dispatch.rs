@@ -762,10 +762,8 @@ fn caller_pages_cover_ranked_results_without_overlap() {
         !empty.contains("[caller:") && empty.contains("offset 125"),
         "{empty}"
     );
-    for args in [
-        vec!["target", "--callers", "--limit", "0"],
-        vec!["target", "--offset", "-1"],
-    ] {
+    {
+        let args = ["target", "--callers", "--limit", "0"];
         assert!(!Command::new(env!("CARGO_BIN_EXE_tilth"))
             .args(args)
             .output()

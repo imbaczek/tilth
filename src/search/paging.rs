@@ -98,7 +98,7 @@ pub(crate) fn collect(
         scopes,
         context,
         glob,
-        page.offset.saturating_add(page.limit),
+        page.prefix(),
     )
 }
 
@@ -362,7 +362,14 @@ mod tests {
                 let page = Page::new(offset, 43).unwrap();
                 let result = collect("needle", kind, &scopes, None, None, page).unwrap();
                 assert_eq!(result.total_found, 450);
-                actual.extend(result.matches.iter().skip(offset).take(43).map(|m| m.line));
+                actual.extend(
+                    result
+                        .matches
+                        .iter()
+                        .skip(offset as usize)
+                        .take(43)
+                        .map(|m| m.line),
+                );
             }
             assert_eq!(actual, expected, "{kind}");
         }

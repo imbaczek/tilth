@@ -62,9 +62,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0,
                         "default": 0,
-                        "description": "Skip N ranked matches per target (zero-based), after combining scopes and deduplicating for symbol/content/regex. Callers apply the offset independently to each target and resolved scope. Applies to every search kind. Keep query, scope, context and filters unchanged between pages."
+                        "description": "Negative offsets count from the end. Skip N ranked matches per target (zero-based), after combining scopes and deduplicating for symbol/content/regex. Callers apply the offset independently to each target and resolved scope. Applies to every search kind. Keep query, scope, context and filters unchanged between pages."
                     },
                     "limit": {
                         "type": "integer",
@@ -138,9 +137,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0,
                         "default": 0,
-                        "description": "Skip N entries per path, including batches (zero-based). Units: directory children by name; declarations in auto/code and signature; headings in auto/Markdown; source lines in full/section; retained lines in stripped. Original source/hash/TOC addresses remain stable. Explicit code paging requests an uncapped declaration outline even for small files."
+                        "description": "Negative offsets count from the end. Skip N entries per path, including batches (zero-based). Units: directory children by name; declarations in auto/code and signature; headings in auto/Markdown; source lines in full/section; retained lines in stripped. Original source/hash/TOC addresses remain stable. Explicit code paging requests an uncapped declaration outline even for small files."
                     },
                     "limit": {
                         "type": "integer",
@@ -184,9 +182,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                     },
                     "offset": {
                         "type": "integer",
-                        "minimum": 0,
                         "default": 0,
-                        "description": "Skip N matching files sorted by relative path (zero-based). Directory nodes do not count. Keep scope, patterns, depth and ignore settings unchanged between pages."
+                        "description": "Negative offsets count from the end. Skip N matching files sorted by relative path (zero-based). Directory nodes do not count. Keep scope, patterns, depth and ignore settings unchanged between pages."
                     },
                     "limit": {
                         "type": "integer",
@@ -258,8 +255,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
                         "description":"Return only this relationship section plus compact target context, without expanding or recording source bodies. Omit for the existing overview."
                     },
                     "offset": {
-                        "type":"integer","minimum":0,"default":0,
-                        "description":"Skip N individual records in the selected section (zero-based). Requires section. Keep target/root/scope and source unchanged between pages."
+                        "type":"integer","default":0,
+                        "description":"Negative offsets count from the end. Skip N individual records in the selected section (zero-based). Requires section. Keep target/root/scope and source unchanged between pages."
                     },
                     "limit": {
                         "type":"integer","minimum":1,"default":50,
@@ -452,8 +449,8 @@ pub(in crate::mcp) fn tool_definitions(edit_mode: bool) -> Vec<Value> {
             } else {
                 "files by path in overview/directory view, symbol/hunk blocks by source order in file detail, or commits in git log order. Keep source/scope/search and the working tree unchanged between pages"
             };
-            tool["inputSchema"]["properties"]["offset"] = serde_json::json!({"type":"integer","minimum":0,"default":0,
-                "description":format!("Skip N {unit} (zero-based).")});
+            tool["inputSchema"]["properties"]["offset"] = serde_json::json!({"type":"integer","default":0,
+                "description":format!("Skip N {unit} (zero-based); negative offsets count from the end.")});
             tool["inputSchema"]["properties"]["limit"] = serde_json::json!({"type":"integer","minimum":1,"default":50,
                 "description":"Entries per page (default 50). If budget truncates, retry the same offset with a smaller limit or larger budget before advancing."});
         }
@@ -479,7 +476,10 @@ mod tests {
             .find(|tool| tool["name"] == "tilth_search")
             .unwrap();
         let properties = &search["inputSchema"]["properties"];
-        for (name, minimum) in [("offset", 0), ("limit", 1)] {
+        for (name, minimum) in [
+            ("offset", serde_json::Value::Null),
+            ("limit", serde_json::json!(1)),
+        ] {
             assert_eq!(properties[name]["type"], "integer");
             assert_eq!(properties[name]["minimum"], minimum);
             assert!(properties[name]["description"]
@@ -607,7 +607,7 @@ mod tests {
             let schema =
                 &defs.iter().find(|d| d["name"] == name).unwrap()["inputSchema"]["properties"];
             assert_eq!(schema["offset"]["type"], "integer");
-            assert_eq!(schema["offset"]["minimum"], 0);
+            assert!(schema["offset"]["minimum"].is_null());
             assert_eq!(schema["limit"]["type"], "integer");
             assert_eq!(schema["limit"]["minimum"], 1);
             assert_eq!(schema["limit"]["default"], 50);

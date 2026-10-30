@@ -425,7 +425,7 @@ pub fn diff_paginated(
     blast: bool,
     expand: usize,
     budget: Option<u64>,
-    value: Option<(usize, Option<usize>)>,
+    value: Option<(i64, Option<usize>)>,
     mcp: bool,
 ) -> Result<String, String> {
     let page = value.map(crate::listing::Page::from_tuple).transpose()?;

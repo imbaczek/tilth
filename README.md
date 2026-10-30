@@ -625,7 +625,7 @@ exclusively with those other path/selection fields:
 
 ### Pagination
 
-Offsets are zero-based nonnegative integers; limits are positive integers. Supplying either flag/field opts into paging, except directory reads, MCP `tilth_list`, and caller searches, which already return pages by default. Without explicit paging, other views retain their existing previews and smart-view behavior.
+Offsets are zero-based integers; negative offsets count back from the end of each selected view and clamp to its beginning. Limits are positive integers. For example, `tilth read file.txt --full --offset -20 --limit 10` shows the ten lines immediately preceding the last ten lines. Supplying either flag/field opts into paging, except directory reads, MCP `tilth_list`, and caller searches, which already return pages by default. Without explicit paging, other views retain their existing previews and smart-view behavior.
 
 | View | One page entry | Default page size |
 |------|----------------|-------------------|

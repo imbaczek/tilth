@@ -649,7 +649,7 @@ pub fn search_callers_page(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
-    page: (usize, usize),
+    page: (i64, usize),
 ) -> Result<String, TilthError> {
     let (offset, limit) = (page.0, page.1.max(1));
     let single: HashSet<String> = std::iter::once(target.to_string()).collect();
@@ -678,7 +678,10 @@ pub fn search_callers_page(
         .iter()
         .map(|c| (c.path.clone(), c.line))
         .collect();
-    let start = offset.min(total);
+    let start = crate::listing::Page::new(offset, limit)
+        .unwrap()
+        .bounds(total)
+        .0;
     let end = start.saturating_add(limit).min(total);
     let page_callers = &sorted_callers[start..end];
 
@@ -724,7 +727,7 @@ fn write_caller_bucket(
     total: usize,
     sorted_callers: &[CallerMatch],
     expand: usize,
-    page: (usize, usize),
+    page: (i64, usize),
 ) {
     let _ = writeln!(
         output,
@@ -736,7 +739,10 @@ fn write_caller_bucket(
     );
 
     let (offset, limit) = page;
-    let start = offset.min(total);
+    let start = crate::listing::Page::new(offset, limit)
+        .unwrap()
+        .bounds(total)
+        .0;
     let end = start.saturating_add(sorted_callers.len()).min(total);
     if sorted_callers.is_empty() {
         let _ = writeln!(output, "> No call sites at offset {offset}; {total} found.");
@@ -919,7 +925,7 @@ pub fn search_callers_multi_page(
     expand: usize,
     context: Option<&Path>,
     glob: Option<&str>,
-    page: (usize, usize),
+    page: (i64, usize),
 ) -> Result<String, TilthError> {
     let (offset, limit) = (page.0, page.1.max(1));
 
@@ -969,7 +975,10 @@ pub fn search_callers_multi_page(
             .collect();
 
         let all_direct_locations = callers.iter().map(|c| (c.path.clone(), c.line)).collect();
-        let start = offset.min(total);
+        let start = crate::listing::Page::new(offset, limit)
+            .unwrap()
+            .bounds(total)
+            .0;
         let end = start.saturating_add(limit).min(total);
 
         write_caller_bucket(

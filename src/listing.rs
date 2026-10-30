@@ -6,12 +6,12 @@ pub(crate) const DEFAULT_LIMIT: usize = 50;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Page {
-    pub offset: usize,
+    pub offset: i64,
     pub limit: usize,
 }
 
 impl Page {
-    pub fn new(offset: usize, limit: usize) -> Result<Self, String> {
+    pub fn new(offset: i64, limit: usize) -> Result<Self, String> {
         if limit == 0 {
             return Err("limit must be an integer >= 1".into());
         }
@@ -26,7 +26,7 @@ impl Page {
         }
     }
 
-    pub fn from_tuple(value: (usize, Option<usize>)) -> Result<Self, String> {
+    pub fn from_tuple(value: (i64, Option<usize>)) -> Result<Self, String> {
         Self::new(value.0, value.1.unwrap_or(DEFAULT_LIMIT))
     }
 
@@ -65,11 +65,31 @@ impl Page {
                     })
             })
         };
-        Self::new(parse("offset", 0)?, parse("limit", DEFAULT_LIMIT)?)
+        let offset = args.get("offset").map_or(Ok(0), |value| {
+            value
+                .as_i64()
+                .or_else(|| value.as_u64().map(|n| i64::try_from(n).unwrap_or(i64::MAX)))
+                .ok_or_else(|| "offset must be an integer".to_string())
+        })?;
+        Self::new(offset, parse("limit", DEFAULT_LIMIT)?)
+    }
+
+    pub fn prefix(self) -> usize {
+        if self.offset < 0 {
+            usize::MAX
+        } else {
+            (self.offset as usize).saturating_add(self.limit)
+        }
     }
 
     pub fn bounds(self, total: usize) -> (usize, usize) {
-        let start = self.offset.min(total);
+        let start = if self.offset < 0 {
+            total.saturating_sub(usize::try_from(self.offset.unsigned_abs()).unwrap_or(usize::MAX))
+        } else {
+            usize::try_from(self.offset)
+                .unwrap_or(usize::MAX)
+                .min(total)
+        };
         (start, start.saturating_add(self.limit).min(total))
     }
 
@@ -136,6 +156,14 @@ pub(crate) fn finish_with_reported_budget(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negative_offsets_count_from_end_and_saturate() {
+        assert_eq!(Page::new(-20, 10).unwrap().bounds(30), (10, 20));
+        assert_eq!(Page::new(-1, 10).unwrap().bounds(30), (29, 30));
+        assert_eq!(Page::new(i64::MIN, 10).unwrap().bounds(30), (0, 10));
+        assert_eq!(Page::new(-1, 10).unwrap().bounds(0), (0, 0));
+    }
 
     #[test]
     fn terminal_pages_omit_marker_but_keep_continuations_when_needed() {

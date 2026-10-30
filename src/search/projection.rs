@@ -54,7 +54,7 @@ pub(crate) fn run(
         } else if select.is_some() {
             usize::MAX
         } else {
-            page.offset.saturating_add(page.limit)
+            page.prefix()
         };
         let result = super::merge::page_raw_scopes(query, kind, scopes, context, glob, prefix)?;
         let lower_bound = matches!(result.count_estimate, CountEstimate::Observed { .. });

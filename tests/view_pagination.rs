@@ -556,7 +556,7 @@ fn mcp_read_deps_and_diff_expose_and_apply_pages() {
             .iter()
             .find(|tool| tool["name"] == name)
             .unwrap();
-        for (key, min) in [("offset", 0), ("limit", 1)] {
+        for (key, min) in [("offset", Value::Null), ("limit", json!(1))] {
             assert_eq!(tool["inputSchema"]["properties"][key]["minimum"], min);
         }
     }
@@ -566,7 +566,7 @@ fn mcp_read_deps_and_diff_expose_and_apply_pages() {
         .iter()
         .find(|tool| tool["name"] == "tilth_grok")
         .unwrap();
-    assert_eq!(grok["inputSchema"]["properties"]["offset"]["minimum"], 0);
+    assert!(grok["inputSchema"]["properties"]["offset"]["minimum"].is_null());
     assert_eq!(
         grok["inputSchema"]["properties"]["section"]["enum"],
         json!(["callers", "callees", "siblings", "tests"])
@@ -606,7 +606,6 @@ fn mcp_read_deps_and_diff_expose_and_apply_pages() {
     assert_safe_budget(&batch);
     for name in ["tilth_read", "tilth_deps", "tilth_diff"] {
         for (key, value) in [
-            ("offset", json!(-1)),
             ("offset", json!(0.5)),
             ("offset", Value::Null),
             ("limit", json!(0)),

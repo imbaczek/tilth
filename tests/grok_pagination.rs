@@ -229,14 +229,6 @@ fn cli_merges_section_flags_and_rejects_paging_without_a_section() {
             "--limit",
             "0",
         ],
-        vec![
-            "grok",
-            "target.rs:1",
-            "--section",
-            "callers",
-            "--offset",
-            "-1",
-        ],
     ] {
         assert!(!output(root.path(), &args).status.success(), "{args:?}");
     }
@@ -368,7 +360,6 @@ fn mcp_section_continuations_and_runtime_validation_work() {
         ("section", Value::Null),
         ("section", json!(7)),
         ("section", json!("body")),
-        ("offset", json!(-1)),
         ("offset", json!(0.5)),
         ("offset", Value::Null),
         ("limit", json!(0)),

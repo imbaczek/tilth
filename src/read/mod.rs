@@ -1584,7 +1584,7 @@ mod tests {
 #[cfg(test)]
 mod directory_tests {
     use super::*;
-    fn page(offset: usize, limit: usize) -> crate::listing::Page {
+    fn page(offset: i64, limit: usize) -> crate::listing::Page {
         crate::listing::Page::new(offset, limit).unwrap()
     }
     #[test]

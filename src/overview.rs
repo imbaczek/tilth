@@ -31,7 +31,7 @@ pub fn fingerprint_with_recursion(root: &Path, recursive: bool) -> String {
 /// Compute a fingerprint with a depth-ordered directory page.
 /// Offset and limit apply to directories, independently for each project root.
 #[must_use]
-pub fn fingerprint_page(root: &Path, recursive: bool, offset: usize, limit: usize) -> String {
+pub fn fingerprint_page(root: &Path, recursive: bool, offset: i64, limit: usize) -> String {
     let start = Instant::now();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         fingerprint_inner(root, recursive, offset, limit)
@@ -46,7 +46,7 @@ pub fn fingerprint_page(root: &Path, recursive: bool, offset: usize, limit: usiz
     result.unwrap_or_default()
 }
 
-fn fingerprint_inner(root: &Path, recursive: bool, offset: usize, limit: usize) -> String {
+fn fingerprint_inner(root: &Path, recursive: bool, offset: i64, limit: usize) -> String {
     let mut lines: Vec<String> = Vec::new();
     let walk = walk_files(root, recursive);
 
@@ -70,7 +70,11 @@ fn fingerprint_inner(root: &Path, recursive: bool, offset: usize, limit: usize) 
     let mut directories: Vec<_> = walk.directory_lang_counts.keys().collect();
     directories.sort_by_key(|dir| (directory_depth(dir), dir.as_str()));
     let directory_count = directories.len();
-    let page: Vec<_> = directories.into_iter().skip(offset).take(limit).collect();
+    let start = crate::listing::Page::new(offset, limit)
+        .expect("positive limit")
+        .bounds(directory_count)
+        .0;
+    let page: Vec<_> = directories.into_iter().skip(start).take(limit).collect();
 
     lines.push(format!(
         "[tilth] {lang_name} project — {total_files} source files, {directory_count} directories"
@@ -84,7 +88,7 @@ fn fingerprint_inner(root: &Path, recursive: bool, offset: usize, limit: usize) 
             "  directory page: {} shown of {directory_count} (offset {offset}, limit {limit})",
             page.len()
         ));
-        let next_offset = offset.saturating_add(page.len());
+        let next_offset = start.saturating_add(page.len());
         if !page.is_empty() && next_offset < directory_count {
             lines.push(format!(
                 "  next page: --offset {next_offset} --limit {limit}"

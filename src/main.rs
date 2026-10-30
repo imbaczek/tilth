@@ -127,9 +127,9 @@ struct SearchOptions {
     #[arg(long)]
     similarity_max_bytes: Option<std::num::NonZeroU64>,
 
-    /// Skip N entries in the selected view (zero-based): search matches, files, declarations, or lines.
-    #[arg(long)]
-    offset: Option<usize>,
+    /// Start at entry N (zero-based); negative values count back from the end.
+    #[arg(long, allow_negative_numbers = true, value_parser = parse_offset)]
+    offset: Option<i64>,
 
     /// Entries per page (default 50; search defaults to 10/100). Unit depends on the view.
     /// Output remains subject to --budget.
@@ -252,9 +252,9 @@ enum Command {
         #[arg(long)]
         budget: Option<u64>,
         /// Skip N declarations in auto/code or signature mode, headings in auto/Markdown,
-        /// source lines in full mode, or retained lines in stripped mode (zero-based, per path).
-        #[arg(long)]
-        offset: Option<usize>,
+        /// source lines in full mode, or retained lines in stripped mode (zero-based, per path). Negative values count from the end.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_offset)]
+        offset: Option<i64>,
         /// Entries per page per path (default 50); selected sections page their source lines.
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
@@ -331,9 +331,9 @@ enum Command {
         #[arg(long, default_value_t = 10000)]
         budget: u64,
 
-        /// Skip N files (overview), symbols/hunks (file detail), or commits (log), zero-based.
-        #[arg(long)]
-        offset: Option<usize>,
+        /// Skip N files, symbols/hunks, or commits (zero-based); negative values count from the end.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_offset)]
+        offset: Option<i64>,
         /// Entries per diff page (default 50). Keep the source and working tree unchanged between pages.
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
@@ -349,9 +349,9 @@ enum Command {
         /// Walk all source directories instead of stopping at depth two.
         #[arg(short, long)]
         recursive: bool,
-        /// Skip N source directories, ordered by depth then path, per project.
-        #[arg(long)]
-        offset: Option<usize>,
+        /// Skip N source directories per project; negative values count from the end.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_offset)]
+        offset: Option<i64>,
         /// Source directories per page (default 10), per project.
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
@@ -395,9 +395,9 @@ enum Command {
         /// Return only this relationship section; source bodies are not expanded.
         #[arg(long,value_parser=["callers","callees","siblings","tests"])]
         section: Option<String>,
-        /// Skip N individual records in the selected section (zero-based).
-        #[arg(long)]
-        offset: Option<usize>,
+        /// Skip N records (zero-based); negative values count from the end.
+        #[arg(long, allow_negative_numbers = true, value_parser = parse_offset)]
+        offset: Option<i64>,
         /// Records per section page (default 50). Requires --section.
         #[arg(long)]
         limit: Option<std::num::NonZeroUsize>,
@@ -984,6 +984,17 @@ fn main() {
         cli.search.budget,
     );
     emit_result(result, &query, cli.search.json, is_tty, cli.search.budget);
+}
+
+fn parse_offset(value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .or_else(|_| {
+            value
+                .parse::<u64>()
+                .map(|n| i64::try_from(n).unwrap_or(i64::MAX))
+        })
+        .map_err(|_| "offset must be an integer".to_string())
 }
 
 fn scopes_are_default(scopes: &[PathBuf]) -> bool {

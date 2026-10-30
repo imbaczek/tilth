@@ -85,7 +85,7 @@ pub fn append_cli_similarity(
     scopes: &[PathBuf],
     glob: Option<&str>,
     args: &serde_json::Value,
-    offset: usize,
+    offset: i64,
     limit: usize,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
@@ -346,7 +346,7 @@ pub fn run_expanded_scopes_with_listing(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
-    listing_page: Option<(usize, Option<usize>)>,
+    listing_page: Option<(i64, Option<usize>)>,
 ) -> Result<String, TilthError> {
     run_expanded_scopes_with_sections(
         query,
@@ -373,7 +373,7 @@ pub fn run_expanded_scopes_with_sections(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
-    listing_page: Option<(usize, Option<usize>)>,
+    listing_page: Option<(i64, Option<usize>)>,
 ) -> Result<String, TilthError> {
     if sections.len() > 20 {
         return Err(TilthError::InvalidQuery {
@@ -417,7 +417,7 @@ pub fn run_callers_paginated(
     budget_tokens: Option<u64>,
     glob: Option<&str>,
     full: bool,
-    page: (usize, Option<usize>),
+    page: (i64, Option<usize>),
 ) -> Result<String, TilthError> {
     let bloom = index::bloom::BloomFilterCache::new();
     let output = search::callers::search_callers_page(
@@ -524,7 +524,7 @@ pub fn run_grok_paginated(
     scope: &Path,
     full: bool,
     section: Option<&str>,
-    page: Option<(usize, Option<usize>)>,
+    page: Option<(i64, Option<usize>)>,
     budget: Option<u64>,
 ) -> Result<String, TilthError> {
     let invalid = |reason| TilthError::InvalidQuery {
@@ -600,7 +600,7 @@ fn run_inner_scopes(
     glob: Option<&str>,
     cache: &OutlineCache,
     cli_full: bool,
-    listing_page: Option<(usize, Option<usize>)>,
+    listing_page: Option<(i64, Option<usize>)>,
 ) -> Result<String, TilthError> {
     if scopes.is_empty() {
         return Err(TilthError::NotFound {
@@ -1267,7 +1267,7 @@ pub fn run_deps_paginated(
     scope: &Path,
     budget: Option<u64>,
     full: bool,
-    page: Option<(usize, Option<usize>)>,
+    page: Option<(i64, Option<usize>)>,
 ) -> Result<String, TilthError> {
     let Some(value) = page else {
         return run_deps_with_options(path, scope, budget, full);

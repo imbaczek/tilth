@@ -305,7 +305,6 @@ mod tests {
         );
         for (key, value) in [
             ("limit", serde_json::json!(0)),
-            ("offset", serde_json::json!(-1)),
             ("offset", serde_json::json!(1.5)),
             ("limit", serde_json::json!("2")),
             ("offset", serde_json::Value::Null),

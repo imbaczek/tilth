@@ -50,7 +50,7 @@ fn search_inner(
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let page_requested =
         kind != "callers" && (args.get("offset").is_some() || args.get("limit").is_some());
-    let offset = caller_page_argument(args, "offset", 0, 0)?;
+    let offset = crate::listing::Page::from_args(args)?.offset;
     let limit = caller_page_argument(args, "limit", if full { 100 } else { 10 }, 1)?;
     let context_path = args
         .get("context")
@@ -341,7 +341,7 @@ pub(in crate::mcp) fn projected_search(
     let kind = args.get("kind").and_then(Value::as_str).unwrap_or("symbol");
     let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
     let page = crate::listing::Page::new(
-        caller_page_argument(args, "offset", 0, 0)?,
+        crate::listing::Page::from_args(args)?.offset,
         caller_page_argument(args, "limit", if full { 100 } else { 10 }, 1)?,
     )?;
     let budget = args.get("budget").and_then(Value::as_u64);
@@ -607,7 +607,6 @@ mod tests {
         let session = Session::new();
         let bloom = Arc::new(BloomFilterCache::new());
         for (name, value) in [
-            ("offset", serde_json::json!(-1)),
             ("offset", serde_json::json!(1.5)),
             ("offset", serde_json::json!("1")),
             ("offset", Value::Null),

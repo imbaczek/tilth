@@ -243,7 +243,7 @@ Select `callers`, `callees`, `siblings`, or `tests` to fetch only that list plus
 
 ## Pagination and budget
 
-Offsets are zero-based nonnegative integers; limits are positive integers. Supplying either opts into paging; directory reads, MCP `tilth_list`, and callers already return default pages. Without explicit paging, other views retain their normal smart view/preview.
+Offsets are zero-based integers; negative offsets count back from the end of each selected view and clamp to its beginning. For example, `--full --offset -20 --limit 10` selects the ten lines before the last ten. Limits are positive integers. Supplying either opts into paging; directory reads, MCP `tilth_list`, and callers already return default pages. Without explicit paging, other views retain their normal smart view/preview.
 
 | View | Page unit | Default size |
 |------|-----------|--------------|
